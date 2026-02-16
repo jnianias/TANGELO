@@ -1,10 +1,10 @@
-# Configuration Guide for astro_utils
+# Configuration Guide for TANGIERS
 
-This document describes the environment variables used by `astro_utils` for configuring data paths and URLs.
+This document describes the environment variables used by TANGIERS for configuring data paths and URLs.
 
 ## Quick Start
 
-`astro_utils` needs to know where to look for the data that is to be used, namely MUSE data cubes, catalogues,
+TANGIERS needs to know where to look for the data that is to be used, namely MUSE data cubes, catalogues,
 sourc spectra etc. The quickest way to get started is to set the MUSE_DATA_DIR environment variable
 
 ```bash
@@ -105,8 +105,8 @@ R21_URL=<your_R21_data_url>
 from dotenv import load_dotenv
 load_dotenv()
 
-# Now import astro_utils
-from astro_utils import spectroscopy, fitting
+# Now import tangiers
+from tangiers import spectroscopy, fitting
 ```
 
 ## Data Directory Structure
@@ -159,7 +159,7 @@ Save this as `setup_astro_env.sh`:
 
 ```bash
 #!/bin/bash
-# Configuration for astro_utils
+# Configuration for TANGIERS
 
 # Base data directory (customize this)
 export MUSE_DATA_DIR="/path/to/your/data"
@@ -175,7 +175,7 @@ export R21_SPEC_URL="<your_R21_spec_url>"
 # export R21_CATALOG_DIR="/custom/path/to/catalogs"
 # export SOURCE_SPECTRA_DIR="/custom/path/to/source_spectra"
 
-echo "astro_utils environment configured:"
+echo "TANGIERS environment configured:"
 echo "  MUSE_DATA_DIR = $MUSE_DATA_DIR"
 echo "  R21_CAT_URL = $R21_CAT_URL"
 echo "  R21_SPEC_URL = $R21_SPEC_URL"

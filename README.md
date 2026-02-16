@@ -1,4 +1,6 @@
-# astro_utils
+# TANGIERS
+
+**Tools for ANalysing lensed Galaxies with IntEgRal field Spectroscopy**
 
 A Python package for astronomical spectroscopy analysis, originally designed for the MUSE catalogues presented in Richard et al. 2021 (R21): https://arxiv.org/abs/2009.09784
 
@@ -21,8 +23,8 @@ Please note that much of the documentation is, at present, machine-generated. Co
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/astro_utils.git
-cd astro_utils
+git clone https://github.com/jnianias/TANGIERS.git
+cd TANGIERS
 
 # Install in development mode
 pip install -e .
@@ -53,7 +55,7 @@ A few environment variables are required for the package to know where to look f
 ### Loading Spectra
 
 ```python
-from astro_utils import spectroscopy as spectro
+from tangiers import spectroscopy as spectro
 
 # Load R21 spectrum
 spec = spectro.load_r21_spec('A2744', '1234', 'PRIOR', 'weight_skysub')
@@ -65,7 +67,7 @@ spec = spectro.load_aper_spec('A2744', '1234', 'PRIOR', '2fwhm')
 ### Fitting Emission Lines
 
 ```python
-from astro_utils import fitting
+from tangiers import fitting
 
 # Fit a single emission line
 result = fitting.fit_line(
@@ -85,7 +87,7 @@ lya_result = fitting.fit_lya_complete(
 ### Velocity Conversions
 
 ```python
-from astro_utils import spectroscopy as spectro
+from tangiers import spectroscopy as spectro
 
 # Convert wavelength to velocity
 vel = spectro.wave2vel(observed_wavelength=6850, 
@@ -99,7 +101,7 @@ wave = spectro.vel2wave(vel=200, restLambda=1215.67, z=4.64)
 ### Plotting
 
 ```python
-from astro_utils import plotting
+from tangiers import plotting
 import matplotlib.pyplot as plt
 
 fig, ax = plt.subplots()

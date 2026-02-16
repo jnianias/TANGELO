@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name='astro_utils',
+    name='tangiers',
     version='1.0.0',
     packages=find_packages(),
     install_requires=[

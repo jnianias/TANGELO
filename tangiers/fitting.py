@@ -1644,7 +1644,7 @@ def flatten_spectrum(spectrum, return_continuum=False):
 
     Examples
     --------
-    >>> from astro_utils import fitting as aufit
+    >>> from tangiers import fitting as aufit
     >>> import numpy as np
     >>> x = np.arange(100)
     >>> spec = 10.0 + 0.05 * x + np.random.normal(0, 0.1, 100)

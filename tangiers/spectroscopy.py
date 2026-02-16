@@ -706,8 +706,8 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
     
     Examples
     --------
-    >>> from astro_utils import spectroscopy as auspec
-    >>> from astro_utils import constants as auconst
+    >>> from tangiers import spectroscopy as auspec
+    >>> from tangiers import constants as auconst
     >>> # Average optically-thin emission lines using R21 spectra
     >>> lines = ['CIII1907', 'CIII1909', 'HeII1640', 'OIII1666']
     >>> vel, flux, flux_err = auspec.avg_lines(
@@ -897,7 +897,7 @@ def stack_spectra_across_sources(table, lines, velocity_frame='systemic', velbou
     
     Examples
     --------
-    >>> from astro_utils import spectroscopy as auspec
+    >>> from tangiers import spectroscopy as auspec
     >>> # Stack low-ionization absorption lines in systemic frame
     >>> vel, flux, err, n = auspec.stack_spectra_across_sources(
     ...     table=catalog,
