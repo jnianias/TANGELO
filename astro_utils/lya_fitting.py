@@ -6,7 +6,6 @@ including functions that handle baseline selection, model comparison, and refitt
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
 
 from . import constants as const
 from . import models as mdl
@@ -15,7 +14,9 @@ from . import plotting as plot
 from .spectroscopy import generate_spec_mask
 from .fitting import check_inputs, gen_bounds
 from .lya_profile import LyaProfile
+from . import io
 from scipy.optimize import curve_fit
+from astropy.table import Table, Column
 
 w_lya = const.wavedict['LYALPHA']  # Lyman-alpha rest wavelength in Angstroms
 c = const.c # Speed of light constant
@@ -46,6 +47,115 @@ def get_reduced_chisq(y, ymodel, yerr, nparams):
     if dof <= 0:
         return np.inf
     return chisq / dof
+
+def calculate_lya_rchsq(megatab, spec_source='R21', spec_type='weight_skysub', modify_inplace=True):
+    """
+    Calculate the reduced chi-squared for Lyman-alpha fits in the megatab.
+    
+    Parameters
+    ----------
+    megatab : Astropy Table
+        Table containing the fitting results and spectra.
+    spec_source : str, optional
+        Source of the spectra to use for chi-squared calculation (default is 'R21').
+    spec_type : str, optional
+        Type of spectrum to use (default is 'weight_skysub').
+    
+    Returns
+    -------
+    astropy.table.Table
+        The megatable with reduced chi-squared values added.
+    """
+    # Split table based on number of lyman alpha peaks and baseline types
+    single_peaks = np.isnan(megatab['FLUXB'])
+    double_peaks = ~single_peaks
+    dla_baselines = ~np.isnan(megatab['TAU'])
+    lin_baselines = ~np.isnan(megatab['SLOPE'])
+    const_baselines = ~(dla_baselines | lin_baselines)
+
+    sp_const = single_peaks & const_baselines
+    sp_lin = single_peaks & lin_baselines
+    sp_dla = single_peaks & dla_baselines
+    dp_const = double_peaks & const_baselines
+    dp_lin = double_peaks & lin_baselines
+    dp_dla = double_peaks & dla_baselines
+
+    # Dictionary to map model types to the appropriate model function
+    model_mapping = {
+        'sp_const': (mdl.lya_speak, sp_const),
+        'sp_lin': (mdl.lya_speak_lin, sp_lin),
+        'sp_dla': (mdl.lya_speak_damp, sp_dla),
+        'dp_const': (mdl.lya_dpeak, dp_const),
+        'dp_lin': (mdl.lya_dpeak_lin, dp_lin),
+        'dp_dla': (mdl.lya_dpeak_damp, dp_dla)
+    }
+
+    # Initialise a column for reduced chi-squared values
+    rchsq_col = np.full(len(megatab), np.nan)
+
+    # Loop over each model type and calculate reduced chi-squared
+    for model_type, (mdl_func, mask) in model_mapping.items():
+        if not np.any(mask):
+            print(f"No entries for model type {model_type}; skipping.")
+            continue  # Skip if no entries for this model type
+
+        for i in np.where(mask)[0]:
+            row = megatab[i]
+            spectab = io.load_spec(row['CLUSTER'], row['iden'], row['idfrom'], 
+                                   spec_source=spec_source, spec_type=spec_type)
+            if spectab is None:
+                raise ValueError(f"Could not load spectrum for {row['CLUSTER']} {row['iden']} {row['idfrom']}. Cannot calculate reduced chi-squared.")
+
+            # Extract wavelength, spectrum, and error arrays
+            wave = spectab['wave']
+            spec = spectab['spec']
+            spec_err = spectab['spec_err']
+
+            # Generate fit mask
+            lya_peak = row['LPEAKR']
+            fitmask = generate_spec_mask(wave, spec, spec_err, lya_peak, 30, 'LYALPHA')
+
+            # Extract best-fit parameters
+            if 'dp' in model_type:
+                pnames = ['AMPB', 'LPEAKB', 'DISPB', 'ASYMB',
+                          'AMPR', 'LPEAKR', 'DISPR', 'ASYMR',
+                          'CONT']
+                if 'lin' in model_type:
+                    pnames.append('SLOPE')
+                elif 'dla' in model_type:
+                    pnames.extend(['TAU', 'FWHM_ABS', 'LPEAK_ABS'])
+            else:
+                pnames = ['AMPR', 'LPEAKR', 'DISPR', 'ASYMR',
+                          'CONT']
+                if 'lin' in model_type:
+                    pnames.append('SLOPE')
+                elif 'dla' in model_type:
+                    pnames.extend(['TAU', 'FWHM_ABS', 'LPEAK_ABS'])
+
+            popt = [row[p] for p in pnames]
+
+            # Raise warning if any of the parameters are NaN, as this will affect the chi-squared calculation
+            if np.any(np.isnan(popt)):
+                print(f"Warning: NaN values found in parameters for {row['CLUSTER']} {row['iden']} {row['idfrom']} with model {model_type}. This will affect the reduced chi-squared calculation.")
+                continue  # Skip this entry for chi-squared calculation
+
+            # Calculate model values
+            ymodel = mdl_func(wave[fitmask], *popt)
+
+            # Calculate reduced chi-squared
+            rchsq = get_reduced_chisq(spec[fitmask], ymodel,
+                                      spec_err[fitmask], len(popt))
+ 
+            # Store the result
+            rchsq_col[i] = rchsq
+
+    # Add the reduced chi-squared column to the table
+    if modify_inplace:
+        position = megatab.colnames.index('FLUXB_UB') + 1 if 'FLUXB_UB' in megatab.colnames else len(megatab.colnames)
+        megatab.add_column(Column(rchsq_col, name='RCHSQ'), index=position)
+    else:
+        return rchsq_col
+
 
 # Default Monte Carlo parameters for bootstrapping
 default_bootstrap_params = {
@@ -215,6 +325,12 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
                        bootstrap_params=bootstrap_params,
                        save_plots=False, plot_dir=plot_dir,
                        spec_type=spec_type)
+    
+    # Criteria for accepting the damped Lyman alpha fit -- if not met, reduced chi-squared
+    # is set to infinity so that it won't be selected as the best fit below
+    if fit_damp['param_dict']['CONT'] <= 0:
+        print("Damped Lyman alpha fit has non-positive continuum; rejecting fit.")
+        fit_damp['reduced_chisq'] = np.inf
 
     if fit_damp and fit_damp.get('reduced_chisq') and fit_damp['reduced_chisq'] < rchsq_thresh:
         print("Damped Lyman alpha baseline fit is good enough; returning result.")

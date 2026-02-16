@@ -376,14 +376,14 @@ def update_table(megatable, index, linename, params, param_errs, rchsq, flag='')
     Notes
     -----
     For Lyman alpha (linename='lya' or 'Lya'), column names are:
-        - Parameters: 'FLUXB', 'FLUXR', 'FWHMB', etc. (no suffix)
+        - Parameters 'FLUXB', 'FLUXR', 'FWHMB', etc. (no suffix)
         - Errors: 'FLUXB_ERR', 'FLUXR_ERR', etc. (no line name suffix)
         - Stats: 'RCHSQ', 'SNRB', 'SNRR' (no line name suffix)
         - Flag: 'FLAG' (no line name suffix)
         - SNRB calculated from FLUXB / FLUXB_ERR
         - SNRR calculated from FLUXR / FLUXR_ERR
     For other lines, column names include the line name:
-        - Parameters: 'FLUX_CIII', 'FWHM_CIII', etc.
+        - Parameters 'FLUX_CIII', 'FWHM_CIII', etc.
         - Errors: 'FLUX_ERR_CIII', 'FWHM_ERR_CIII', etc.
         - Stats: 'RCHSQ_CIII', 'SNR_CIII', etc.
         - Flag: 'FLAG_CIII'
@@ -460,6 +460,66 @@ def update_table(megatable, index, linename, params, param_errs, rchsq, flag='')
         
         if flag_col in megatable.colnames:
             megatable[flag_col][index] = flag
+
+
+def is_candidate(tab, wavedict, sig=3.0, n=1, return_lines=False, type='emission'):
+    """
+    Identify candidate emission line sources in a spectroscopic catalog.
+
+    This function checks for statistically significant emission line detections
+    above a specified significance threshold. A source is considered a "candidate"
+    if it has at least `n` emission/absorption lines detected above the threshold.
+
+    Parameters
+    ----------
+    tab : astropy.table.Table or astropy.table.Row
+        Catalog table or single row containing spectroscopic measurements.
+        Must contain columns for each line in wavedict with format:
+        'SNR_{linename}' for signal-to-noise ratio.
+    wavedict : dict
+        Dictionary mapping line names (str) to rest-frame wavelengths (float).
+    sig : float, optional
+        Significance threshold (in sigma) for line detection. Default is 3.0.
+    n : int, optional
+        Minimum number of significant emission lines required to classify
+        as a candidate. Default is 1.
+    return_lines : bool, optional
+        If True, returns a tuple of (boolean array, list of detected lines).
+        If False, returns only the boolean array. Default is False.
+    type : str, optional
+        Type of lines to consider: 'emission' or 'absorption'. Default is 'emission'.
+
+    Returns
+    -------
+    bool or numpy.ndarray
+        Boolean or array of booleans indicating whether each source is a candidate
+        (has >= n significant emission/absorption line detections).
+    list of lists, optional
+        If return_lines=True, returns a list where each element is a list of
+        line names detected for that source.
+
+    Notes
+    -----
+    - For emission lines, checks if SNR > sig.
+    - For absorption lines, checks if SNR < -sig.  
+    - For a single row input, returns a scalar boolean (or tuple with single-element list).
+    """
+    tv = np.zeros(len(tab['Z']) if isinstance(tab['Z'], (np.ndarray, aptb.Table.Column)) else 1).astype(int)
+    trulist = [[] for r in tv]
+    for line in wavedict:
+        if type.lower() == 'emission':
+            tv += (tab[f'SNR_{line}'] > sig).astype(int)
+            truidcs = np.where(tab[f'SNR_{line}'] > sig)
+        elif type.lower() == 'absorption':
+            tv += (tab[f'SNR_{line}'] < -sig).astype(int)
+            truidcs = np.where(tab[f'SNR_{line}'] < -sig)
+        else:
+            raise ValueError("Type must be either 'emission' or 'absorption'")
+        
+        for idx in truidcs[0]:
+            trulist[idx].append(line)
+    
+    return (tv >= n, trulist) if return_lines else tv >= n
 
 
 def is_true_emitter(tab, wavedict, sig=3.0, n=1, return_lines=False):

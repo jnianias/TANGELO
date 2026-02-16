@@ -30,8 +30,8 @@ def mask_skylines(wavelength):
     """
     Masks out regions around known sky lines to avoid contamination in fits.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     wavelength : array_like
         Wavelength array.
     lambda_obs : float
@@ -39,10 +39,10 @@ def mask_skylines(wavelength):
     continuum_buffer : float
         Buffer region around the line to include in the fit.
 
-    Returns:
-    --------
-        array_like
-            Boolean mask array indicating regions to exclude.
+    Returns
+    -------
+    array_like
+        Boolean mask array indicating regions to exclude.
     """
     sky_mask = np.ones_like(wavelength, dtype=bool)
 
@@ -55,8 +55,8 @@ def mask_otherlines(wavelength, expected_wavelength, linename):
     """
     Mask out regions around other known lines to avoid contamination in fits.
     
-    Parameters:
-    -----------
+    Parameters
+    ----------
     wavelength : array_like
         Wavelength array.
     expected_wavelength : float
@@ -64,10 +64,10 @@ def mask_otherlines(wavelength, expected_wavelength, linename):
     linename   : str
         Name of the line (needs to be in wavedict).
 
-    Returns:
-    --------
-        array_like
-            Boolean mask array indicating regions to exclude.
+    Returns
+    -------
+    array_like
+        Boolean mask array indicating regions to exclude.
     """
     # Get all other lines except the one being fitted and its doublet partner (if any)
     otherlines = [line for line in wavedict.keys() 
@@ -92,8 +92,8 @@ def generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffe
     Generates a mask for the fitting region around a specified observed wavelength,
     excluding problematic areas (zeros, nans, infs), skylines, and unrelated spectral lines.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     wavelength : array_like
         Wavelength array.
     spectrum  : array_like
@@ -107,10 +107,10 @@ def generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffe
     linename   : str
         Name of the line (needs to be in wavedict).
 
-    Returns:
-    --------
-        array_like
-            Boolean mask array indicating the fitting region.
+    Returns
+    -------
+    array_like
+        Boolean mask array indicating the fitting region.
     """
     # Fitting region +/- continuum_buffer around the line
     fit_mask = (wavelength > (lpeak_init - continuum_buffer)) & (wavelength < (lpeak_init + continuum_buffer))
@@ -149,15 +149,15 @@ def muse_lsf_fwhm_poly(lam):
     polynomial model given in pyplatefit documentation: 
     https://pyplatefit.readthedocs.io/en/latest/tutorial.html
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     lam : float
         Wavelength in Angstroms.
 
-    Returns:
-    --------
-        float
-            FWHM of the MUSE LSF at the given wavelength.
+    Returns
+    -------
+    float
+        FWHM of the MUSE LSF at the given wavelength.
     """
     return 5.19939 - 7.56746 * 1e-4 * lam + 4.93397 * 1e-8 * lam**2.
 
@@ -168,8 +168,8 @@ def wave2vel(observed_wavelength, rest_wavelength, redshift = 0):
     Convert observed wavelength to velocity in the target object's rest frame,
     accounting for systemic redshift and using the full relativistic Doppler formula.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     observed_wavelength : float
         Observed wavelength in the same units as rest_wavelength.
     rest_wavelength : float
@@ -177,10 +177,10 @@ def wave2vel(observed_wavelength, rest_wavelength, redshift = 0):
     redshift : float
         Systemic redshift of the source.
 
-    Returns:
-    --------
-        float
-            Velocity in the target object's rest frame, in km/s.
+    Returns
+    -------
+    float
+        Velocity in the target object's rest frame, in km/s.
     """
     # Speed of light in km/s
     c = 299792.458
@@ -204,8 +204,8 @@ def vel2wave(vel, restLambda, z = 0.):
     Convert velocity in the target object's rest frame to observed wavelength,
     accounting for systemic redshift and using the full relativistic Doppler formula.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     vel : float
         Velocity in the target object's rest frame, in km/s.
     restLambda : float
@@ -213,10 +213,10 @@ def vel2wave(vel, restLambda, z = 0.):
     z : float
         Systemic redshift of the source.
 
-    Returns:
-    --------
-        float
-            Observed wavelength in the same units as restLambda.
+    Returns
+    -------
+    float
+        Observed wavelength in the same units as restLambda.
     """
     # Speed of light in km/s
     c = 299792.458
@@ -244,19 +244,19 @@ def is_reasonable_dpeak(popt, perr, z = None):
     (2) be spectrally resolved, (3) have the blue peak at lower wavelength than the red peak,
     (4) have a velocity separation less than 1000 km/s.
 
-    Parameters:
-    -----------
-        popt : list
-            List of fitted parameters from the lya_dpeak function
-        perr : list
-            List of parameter uncertainties from the lya_dpeak function
-        z : float, optional
-            Redshift of the source (used for velocity separation check)
+    Parameters
+    ----------
+    popt : list
+        List of fitted parameters from the lya_dpeak function
+    perr : list
+        List of parameter uncertainties from the lya_dpeak function
+    z : float, optional
+        Redshift of the source (used for velocity separation check)
     
-    Returns:
-    --------
-        bool
-            True if the fit is reasonable, False otherwise.
+    Returns
+    -------
+    bool
+        True if the fit is reasonable, False otherwise.
     """
     # If z is not provided, get a rough estimate from the peak wavelength
     # of the red peak (popt[5])
@@ -298,29 +298,29 @@ def is_reasonable_dpeak(popt, perr, z = None):
     
     return all(conditions)
 
-def get_line_spec(row, line, width, rest = True, spec_source = 'R21', spectype = 'weight_skysub'):
+def get_line_spec(row, line, width, rest = True, spec_source = 'R21', spec_type = 'weight_skysub'):
     """
     Extract a spectrum around a given line from a row of a catalog.
 
-    Parameters:
-    -----------
-        row : astropy Table row
-            Row of the catalog
-        line : str
-            Name of the line (e.g., 'LYA', 'CIV', etc.)
-        width : float
-            Width around the line to extract (in Angstroms)
-        rest : bool
-            If True, use rest-frame wavelength for the width; if False, use observed wavelength
-        spec_source : str
-            Source of the spectrum ('R21' for Richard et al. 2021, 'APER' for aperture spectra)
-        spectype : str
-            Type of spectrum to load (either 'weight_skysub' or '2fwhm', etc.)
+    Parameters
+    ----------
+    row : astropy Table row
+        Row of the catalog
+    line : str
+        Name of the line (e.g., 'LYA', 'CIV', etc.)
+    width : float
+        Width around the line to extract (in Angstroms)
+    rest : bool
+        If True, use rest-frame wavelength for the width; if False, use observed wavelength
+    spec_source : str
+        Source of the spectrum ('R21' for Richard et al. 2021, 'APER' for aperture spectra)
+    spec_type : str
+        Type of spectrum to load (either 'weight_skysub' or '2fwhm', etc.)
 
-    Returns:
-    --------
-        tuple of np.ndarray
-            Returns wavelength array, flux array, and error array.
+    Returns
+    -------
+    tuple of np.ndarray
+        Returns wavelength array, flux array, and error array.
     """
     if line not in wavedict:
         raise ValueError(f"Line {line} not recognized. Available lines: {list(wavedict.keys())}")
@@ -343,9 +343,9 @@ def get_line_spec(row, line, width, rest = True, spec_source = 'R21', spectype =
     # Load the spectrum
     spectab = None
     if spec_source == 'R21':
-        spectab = io.load_r21_spec(row['CLUSTER'], row['iden'], row['idfrom'], spectype)
+        spectab = io.load_r21_spec(row['CLUSTER'], row['iden'], row['idfrom'], spec_type)
     elif spec_source.upper() == 'APER':
-        spectab = io.load_aper_spec(row['CLUSTER'], row['iden'], row['idfrom'], spectype)
+        spectab = io.load_aper_spec(row['CLUSTER'], row['iden'], row['idfrom'], spec_type)
 
     if spectab is None:
         print(f"No spectrum found for {row['CLUSTER']} ID{row['iden']} in {spec_source} catalog.")
@@ -373,15 +373,15 @@ def find_partner(linename, linelist=None):
     """
     Find the doublet partner of a given spectral line.
     
-    Parameters:
-    -----------
+    Parameters
+    ----------
     linename : str
         Name of the spectral line (e.g., 'CIV1548')
     linelist : list, optional
         List of line names to search for the partner. If None, uses all lines in doublets dict.
     
-    Returns:
-    --------
+    Returns
+    -------
     str or None
         Name of the partner line, or None if no partner exists
     """
@@ -412,7 +412,7 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
     
     The function modifies the table in place by updating the FLAG column for the line.
     
-    Parameters:
+    Parameters
     -----------
     megatab : astropy.table.Table
         Results table containing fitted line parameters. Must have columns:
@@ -437,7 +437,7 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
     verbose : bool, optional
         If True, print diagnostic information about each test
     
-    Returns:
+    Returns
     --------
     dict
         Dictionary of test results with keys:
@@ -609,8 +609,8 @@ def check_sky_contamination(lpeak, lpeak_err, flux, sig=5):
     """
     Check if a spectral line coincides with known sky lines.
     
-    Parameters:
-    -----------
+    Parameters
+    ----------
     lpeak : float
         Peak wavelength of the fitted line
     lpeak_err : float
@@ -620,8 +620,8 @@ def check_sky_contamination(lpeak, lpeak_err, flux, sig=5):
     sig : float, optional
         Significance threshold for sky line contamination (default: 5)
     
-    Returns:
-    --------
+    Returns
+    -------
     bool
         True if sky line contamination is detected
     """
@@ -641,7 +641,7 @@ def check_sky_contamination(lpeak, lpeak_err, flux, sig=5):
 
 
 def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60., 
-              lya=False, zelda_z=False, z=None, flags=False, spec_source='R21', spectype='weight_skysub'):
+              lya=False, zelda_z=False, z=None, flags=False, spec_source='R21', spec_type='weight_skysub'):
     """
     Average multiple spectral lines onto a common velocity scale.
     
@@ -680,7 +680,7 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
     spec_source : str, optional
         Source of the spectrum: 'R21' for Richard et al. (2021) spectra or 'APER' 
         for aperture-extracted spectra. Default is 'R21'.
-    spectype : str, optional
+    spec_type : str, optional
         Type of spectrum to load. For R21: 'weight_skysub', 'noweight', etc.
         For APER: '2fwhm', '1fwhm', etc. Default is 'weight_skysub'.
     
@@ -712,13 +712,13 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
     >>> lines = ['CIII1907', 'CIII1909', 'HeII1640', 'OIII1666']
     >>> vel, flux, flux_err = auspec.avg_lines(
     ...     catalog_row, lines, absorption=False, velbounds=[-2000, 2000],
-    ...     spec_source='R21', spectype='weight_skysub'
+    ...     spec_source='R21', spec_type='weight_skysub'
     ... )
     >>> # Average absorption lines using aperture spectra with flag checking
     >>> abs_lines = ['SiII1260', 'CII1334', 'SiIV1394']
     >>> vel, flux, flux_err = auspec.avg_lines(
     ...     catalog_row, abs_lines, absorption=True, flags=True,
-    ...     spec_source='APER', spectype='2fwhm'
+    ...     spec_source='APER', spec_type='2fwhm'
     ... )
     """
     newvelax = np.arange(velbounds[0], velbounds[1] + velstep, velstep)
@@ -728,7 +728,7 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
     
     # Load spectrum using the appropriate function
     idfrom = row['idfrom']
-    spectab = io.load_spec(clus=clus, iden=iden, idfrom=idfrom, spec_source=spec_source, spectype=spectype)
+    spectab = io.load_spec(clus=clus, iden=iden, idfrom=idfrom, spec_source=spec_source, spec_type=spec_type)
     
     if spectab is None:
         return newvelax, np.zeros(np.size(newvelax)) * np.nan, np.zeros(np.size(newvelax)) * np.nan
@@ -810,7 +810,7 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
 
 def stack_spectra_across_sources(table, lines, velocity_frame='systemic', velbounds=[-2500, 2500], 
                                   velstep=75.0, weighting='inverse_variance', absorption=False,
-                                  spec_source='R21', spectype='weight_skysub', mask=None,
+                                  spec_source='R21', spec_type='weight_skysub', mask=None,
                                   systemic_column='DELTAV_LYA', lya_column='LPEAKR', sigclip_weights=None):
     """
     Stack spectral lines across multiple sources onto a common velocity grid.
@@ -856,7 +856,7 @@ def stack_spectra_across_sources(table, lines, velocity_frame='systemic', velbou
     spec_source : str, optional
         Source of spectra: 'R21' or 'APER'. Passed to avg_lines().
         Default is 'R21'.
-    spectype : str, optional
+    spec_type : str, optional
         Type of spectrum to load (e.g., 'weight_skysub', '2fwhm').
         Passed to avg_lines(). Default is 'weight_skysub'.
     mask : numpy.ndarray or None, optional
@@ -941,7 +941,7 @@ def stack_spectra_across_sources(table, lines, velocity_frame='systemic', velbou
             velbounds=velbounds,
             velstep=velstep,
             spec_source=spec_source,
-            spectype=spectype
+            spec_type=spec_type
         )
         
         # Skip if spectrum is all NaN
@@ -1035,7 +1035,7 @@ def stack_spectra_across_sources(table, lines, velocity_frame='systemic', velbou
 
 
 def stack_entire_spectra(table, weighting = 'inverse variance', sigclip_weights=None, 
-                         spec_source='R21', spectype='weight_skysub', wave_bounds=None,
+                         spec_source='R21', spec_type='weight_skysub', wave_bounds=None,
                          wave_step=1.25):
     """
     Stack entire spectra across multiple sources onto a common (rest frame) wavelength grid.
@@ -1062,7 +1062,7 @@ def stack_entire_spectra(table, weighting = 'inverse variance', sigclip_weights=
         significance level before stacking. Default is None (no clipping).
     spec_source : str, optional
         Source of spectra: 'R21' or 'APER'. Default is 'R21'.
-    spectype : str, optional
+    spec_type : str, optional
         Type of spectrum to use from the source. Default is 'weight_skysub'.
     wave_bounds : list of float or None, optional
         Wavelength range [λ_min, λ_max] in Angstroms for the output spectrum in the rest frame.
@@ -1101,7 +1101,7 @@ def stack_entire_spectra(table, weighting = 'inverse variance', sigclip_weights=
         iden = row['iden']
         idfrom = row['idfrom']
         
-        spectab = io.load_spec(clus=clus, iden=iden, idfrom=idfrom, spec_source=spec_source, spectype=spectype)
+        spectab = io.load_spec(clus=clus, iden=iden, idfrom=idfrom, spec_source=spec_source, spec_type=spec_type)
         
         if spectab is None:
             print(f"Warning: Could not load spectrum for {clus}.{iden}. Skipping.")

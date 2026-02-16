@@ -374,8 +374,11 @@ def extract_spectra(source_cat, aper_size, cluster_name, overwrite=False, optimi
     -------
     dict
         Dictionary mapping source identifiers to their extracted spectrum file paths.
+    dict
+        Dictionary mapping source identifiers to their optimized positions (RA, DEC).
     """
     spec_paths = {}
+    positions = {}
     missing_sources = []
 
     for source in source_cat:
@@ -421,8 +424,9 @@ def extract_spectra(source_cat, aper_size, cluster_name, overwrite=False, optimi
         spectrum = cube.aperture((dec_opt, ra_opt), aper_size / 2)
         io.save_spectrum(spectrum, spec_file)
         spec_paths[full_iden] = spec_file
+        positions[full_iden] = (ra_opt, dec_opt)
 
-    return spec_paths
+    return spec_paths, positions
 
 def extract_spectrum_from_segmap(cluster, idlist, show_plot=False, save_plot=False, save_dir='./'):
     """

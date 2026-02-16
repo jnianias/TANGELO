@@ -45,7 +45,7 @@ def get_muse_psf(clus):
     return fwhmtb['PSF_FWHM'][clusind[0]]
 
 
-def make_muse_img(row, size, lcenter, width, cont=None, verbose=True):
+def make_muse_img(row, size, lcenter=None, width=None, cont=None, verbose=True):
     """
     Create a narrowband image from a MUSE data cube.
     
@@ -61,9 +61,9 @@ def make_muse_img(row, size, lcenter, width, cont=None, verbose=True):
         - 'DEC': declination in degrees
     size : float
         Size of the image cutout in arcseconds. Will be adjusted if too close to cube edge.
-    lcenter : float
+    lcenter : float, optional
         Central wavelength for the narrowband image in Angstroms.
-    width : float
+    width : float, optional
         Half-width of the wavelength window in Angstroms (image will span lcenter±width).
     cont : tuple of float, optional
         If provided, continuum will be subtracted. Should be a tuple (offset, width) where:
@@ -104,14 +104,13 @@ def make_muse_img(row, size, lcenter, width, cont=None, verbose=True):
     ...                     cont=(50.0, 10.0))
     """
     position = (row['DEC'], row['RA'])
-    wl = lcenter
     clus = row['CLUSTER']
 
     if verbose:
         print(f"Loading {clus} cube...")
 
     # Find and open the cube
-    cube_dir = io.get_muse_cube_dir()
+    cube_dir = io.get_muse_cube_dir(clus)
     cube_files = glob.glob(str(cube_dir / clus / 'cube' / '*.fits'))
     if not cube_files:
         raise FileNotFoundError(f"No FITS cube files found for cluster {clus} in {cube_dir / clus / 'cube'}")
@@ -129,6 +128,14 @@ def make_muse_img(row, size, lcenter, width, cont=None, verbose=True):
         np.nanmin([np.abs(position[1] - x) for x in [co_range[2], co_range[5]]])
     ]
     size = np.nanmin([size, np.nanmin(tightness) * 2 * 3600])
+
+    # Get wavelength range to be used to make the image
+    if lcenter is not None and width is not None:
+        wl = lcenter
+    else: # If no wavelength provided, use the entire wavelength range of the cube
+        ends = musedata.get_range(unit_wave=u.AA)[[0,3]]
+        wl = np.nanmean(ends) # central wavelength of the entire wavelength range
+        width = 0.5 * (np.nanmax(ends) - np.nanmin(ends)) # half width of the entire wavelength range
 
     # Create narrowband image
     img_line = musedata.get_image(wave=(wl - width, wl + width))
@@ -457,3 +464,33 @@ def get_segmap_peak(full_iden, cluster, seg_map=None, weight_map=None, search_si
     
     return ra_peak, dec_peak
 
+def create_circular_mask(shape, center, radius):
+    """
+    Create a circular mask for a 2D array.
+    
+    Parameters
+    ----------
+    shape : tuple
+        Shape of the 2D array (ny, nx).
+    center : tuple
+        (x, y) coordinates of the center of the circle in pixel units.
+    radius : float
+        Radius of the circle in pixel units.
+    
+    Returns
+    -------
+    numpy.ndarray
+        A boolean mask with True values inside the circle and False outside.
+    """
+    ny, nx = shape
+    x = np.arange(nx)
+    y = np.arange(ny)
+    xx, yy = np.meshgrid(x, y)
+    
+    # Calculate distance from the center for each pixel
+    distance = np.sqrt((xx - center[0])**2 + (yy - center[1])**2)
+    
+    # Create mask where distance is less than or equal to radius
+    mask = distance <= radius
+    
+    return mask

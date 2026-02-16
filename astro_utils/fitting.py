@@ -899,7 +899,7 @@ def gen_bounds(initial_guesses, linename, input_bounds={}, force_sign=None):
         'DISPR':  (0.2 * (1 + z), 1 * (1 + z)), # dispersion of red peak for Lya
         'ASYMR':  (-0.5, 0.5), # asymmetry of red peak for Lya
         'SLOPE':  (-np.inf, np.inf), # slope for linear continuum
-        'TAU':    (-50, 2000), # optical depth for Damped Lyman alpha profile
+        'TAU':    (0, 200), # optical depth for Damped Lyman alpha profile
         'FWHM_ABS':   ((spectro.vel2wave(100, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z), 
                   (spectro.vel2wave(500, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z)), # FWHM bounds
         'LPEAK_ABS': (cen_r_init - 3.33 * (1 + z), cen_r_init + 3.33 * (1 + z))
@@ -1673,3 +1673,56 @@ def flatten_spectrum(spectrum, return_continuum=False):
         return flattened, continuum_model
     else:
         return flattened
+    
+from astropy.modeling import models, fitting
+from astropy.utils.exceptions import AstropyUserWarning
+
+def fit_sersic(imgin, maskin, center, amp, reff, theta, ellip, n, bounds = {},
+                fixed = {}, psf=None):
+    """
+    Fit a 2D Sersic profile to an image using astropy's modeling framework.
+
+    Parameters
+    ----------
+    imgin : 2D array
+        Input image to fit.
+    maskin : 2D boolean array
+        Mask indicating which pixels to include in the fit (True = include).
+    center : tuple
+        (x0, y0) coordinates of the Sersic profile center.
+    amp : float
+        Amplitude of the Sersic profile.
+    reff : float
+        Effective radius of the Sersic profile.
+    theta : float
+        Position angle of the Sersic profile in radians.
+    ellip : float
+        Ellipticity of the Sersic profile (0 = circular, 1 = line).
+    n : float
+        Sersic index (controls the concentration of the profile).
+    bounds : dict, optional
+        Dictionary of parameter bounds (keys: 'amplitude', 'x_0', 'y_0', 'r_eff', 'theta', 'ellip', 'n').
+    fixed : dict, optional
+        Dictionary of parameters to fix during fitting (keys same as bounds, values are booleans).
+    psf : 2D array, optional
+        Point spread function to convolve the model with before fitting. If None, no convolution is applied.
+
+    Returns
+    -------
+    fit_mod : astropy.modeling.Model
+        The fitted Sersic model.
+    """
+
+
+    sermod = models.Sersic2D(amplitude=amp, x_0=center[0], y_0=center[1],
+                                    r_eff=reff, theta=theta, ellip=ellip, n=n,
+                                    bounds=bounds, fixed=fixed)
+
+    lmfitter = fitting.LevMarLSQFitter()
+    y, x = np.mgrid[:np.shape(imgin)[0], :np.shape(imgin)[1]]
+    with warnings.catch_warnings():
+        # Ignore model linearity warning from the fitter
+        warnings.filterwarnings('ignore', message='Model is linear in parameters',
+                                category=AstropyUserWarning)
+        fit_mod = lmfitter(sermod, x[maskin], y[maskin], imgin[maskin], maxiter=10000)
+    return fit_mod

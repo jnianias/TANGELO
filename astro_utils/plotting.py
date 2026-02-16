@@ -8,6 +8,7 @@ from . import models
 from . import io
 import copy
 import os
+
 import matplotlib
 from matplotlib.colors import PowerNorm
 
@@ -551,4 +552,141 @@ def plot_lya_peak_detection(lya_nb_img, ra, dec, ra_opt, dec_opt, cluster, full_
         plot_dir = io.get_plot_dir(cluster, full_iden) # Get directory for saving plots for this source
         plt.savefig(str(plot_dir / f"lya_peak_{full_iden}.png"), bbox_inches='tight', dpi=150)
     safe_show()
+    plt.close()
+
+def get_centmax(arr, n):
+    """
+    Get the maximum value in the central n x n region of a 2D array.
+    If the array is smaller than n x n, return the maximum of the whole array.
+
+    Parameters
+    ----------
+    arr : 2D array-like
+        The input array from which to find the central maximum.
+    n : int
+        The size of the central region to consider (n x n).
+
+    Returns
+    -------
+    float
+        The maximum value in the central n x n region, or the maximum of the whole array 
+        if the array is smaller than n x n.
+    """
+    # Check if the array is large enough to have a central n x n region
+    if np.shape(arr)[0] >= n and np.shape(arr)[1] >= n:
+        arrsh = np.shape(arr)
+        arrcent_x, arrcent_y = int(np.floor(arrsh[1]/2)), int(np.floor(arrsh[0]/2))
+        miniarr = arr[arrcent_y - int(np.floor(n/2)):arrcent_y + int(np.floor(n/2)) + 1,
+                        arrcent_x - int(np.floor(n/2)):arrcent_x + int(np.floor(n/2)) + 1]
+        return np.abs(np.nanmax(miniarr))
+    else:
+        print("Array is smaller than the specified central region. Returning the maximum of the whole array.")
+        return np.abs(np.nanmax(arr))
+    
+def sensible_colorbar(fig, ax_in, img_in, label = None):
+    """
+    Add a colorbar to a Matplotlib figure next to a given image axis.
+    This function calculates the position of the provided axis and places a colorbar
+    next to it without overlapping. It also allows for an optional label for the colorbar.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+        The Matplotlib figure object to which the colorbar will be added.
+    ax_in : matplotlib.axes.Axes
+        The Matplotlib axis object that contains the image for which the colorbar is being added.
+    img_in : matplotlib.image.AxesImage
+        The image object for which the colorbar is being created. This is typically the result of an imshow() call.
+    label : str, optional
+        The label for the colorbar. If None, no label will be set. Default is None.
+
+    Returns
+    -------
+    matplotlib.colorbar.Colorbar
+        The colorbar object that was created and added to the figure.
+    """
+    # Get the position of the image Axes and its size
+    pos = ax_in.get_position()
+    [ax_x, ax_y, ax_width, ax_height] = pos.bounds
+
+    # Define the position for the colorbar
+    cax = fig.add_axes([ax_x + ax_width + 0.01, ax_y, 0.02, ax_height])
+
+    # Add a colorbar next to the image
+    cbar = fig.colorbar(img_in, cax=cax)
+    cax.yaxis.set_ticks_position('right')
+
+    # Set a label for the colorbar
+    cbar.set_label(label)
+
+    return cbar
+
+def gen_mpdaf_img_ticks(cutout, pixscale, tickspace = 1.0):
+    """
+    Generate tick positions and labels for an MPDAF image cutout based on its size and pixel scale.
+    The ticks are generated such that they are spaced by a specified physical distance (tickspace)
+    in arcseconds, and the labels are in arcseconds relative to the center of the image.
+
+    Parameters
+    ----------
+    cutout : MPDAF Image
+        The image cutout for which to generate ticks. The size of the cutout will determine the range of the ticks.
+    pixscale : float
+        The pixel scale of the image in arcseconds per pixel. This is used to convert the desired tick spacing from arcseconds to pixels.
+    tickspace : float, optional
+        The desired spacing between major ticks in arcseconds. Default is 1.0 arcsecond.
+    """
+    halfsize = (np.shape(cutout)[0]) / 2.
+    tickspace_pix = tickspace / pixscale
+    #how many times the major tick space goes into the half size?
+    nticks = halfsize // tickspace_pix
+    upbound = nticks * tickspace_pix
+    xticks = yticks = np.arange(halfsize - upbound, halfsize + upbound + tickspace_pix, tickspace_pix)
+    xlabels = ylabels = np.round(2.*(xticks - halfsize) * pixscale)/2.
+    
+    return xticks, yticks, xlabels, ylabels
+
+import matplotlib.patches as patches
+
+def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=True,
+                  aperture=None, marker_type='X', title='contaminant source model'):
+
+    # Initialise figure and axis for plotting
+    fig, axs = plt.subplots(3,1, figsize=(6, 6), facecolor='white')
+    vmin = -0.05 * get_centmax(cutout.data, 20.)
+    vmax = get_centmax(cutout.data, 20.)
+
+    bbimg = axs[0].imshow(cutout.data, norm = PowerNorm(0.5, vmin=vmin, vmax=vmax))
+    modimg = axs[1].imshow(model, norm = PowerNorm(0.5, vmin=vmin, vmax=vmax))
+    subimg = axs[2].imshow(cutout.data.data - model, norm = PowerNorm(0.5, vmin=vmin, vmax=vmax))
+
+    cbars = [sensible_colorbar(fig, a, a.get_images()[0]) for a in axs]
+    ticks = gen_mpdaf_img_ticks(cutout, 0.2, tickspace=3.0)
+    for n, a in enumerate(axs):
+        # Plot the provided markers
+        a.scatter(*markers, s=360, color = 'red', marker=marker_type)
+
+        a.set_yticks(ticks[1])
+        a.set_xticks(ticks[0])
+        a.set_yticklabels(ticks[3])
+        a.set_xticklabels(ticks[2])
+        a.set_xlabel(r"$ \upDelta $R.A. ($''$)")
+        a.set_ylabel(r"$ \upDelta $Dec ($''$)")
+        cbars[n].set_label(r"Flux density ($10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$\,\AA$^{-1}$)")
+
+        # If an aperture was provided, plot it
+        if isinstance(aperture, tuple):
+            apcenter = aperture[0]
+            ap_radius = aperture[1]
+            circ = patches.Circle(apcenter, radius=ap_radius, facecolor='none', edgecolor='coral', linestyle='--')
+            a.add_artist(circ)
+    axs[1].set_title(f"{cluster} source {iden} {title}")
+
+    if save_plot:
+        plot_dir = io.get_plot_dir(cluster, iden)
+        if not os.path.exists(plot_dir):
+            os.makedirs(plot_dir)
+        fig.savefig(f"{plot_dir}/{cluster}_{iden}_sersic_sub.pdf", bbox_inches='tight')
+    
+    plt.show()
     plt.close()
