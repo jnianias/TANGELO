@@ -1,5 +1,5 @@
 """
-TANGIERS - Tools for ANalysing lensed Galaxies with IntEgRal field Spectroscopy
+TANGELO - Tools for ANalysing lensed Galaxies with IntEgRal field Spectroscopy
 """
 
 # Import all modules to make them easily accessible
@@ -17,7 +17,7 @@ from . import ifs
 from . import lya_profile
 from . import lya_fitting
 
-# Define what gets imported with "from tangiers import *"
+# Define what gets imported with "from tangelo import *"
 __all__ = [
     'catalogue_operations',
     'constants',

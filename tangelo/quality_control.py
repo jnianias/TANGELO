@@ -464,7 +464,8 @@ def estimate_n(z):
     else:
         return 2.0
 
-def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_coord=None, plot_result=False):
+def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_coord=None, target_iden=None,
+                                    target_clus=None, plot_result=False, aper_radius=1):
     """
     Estimate the spectrum of the most likely contaminating source by fitting a Sersic profile
     to the MUSE white light image and scaling a spectrum of the contaminant (taken from the 
@@ -480,13 +481,24 @@ def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_c
         The radius (in units of the MUSE PSF FWHM) to use for masking nearby sources when fitting the contaminant profile (default is 2).
     target_coord : astropy.coordinates.SkyCoord, optional
         The sky coordinates of the target source. If provided, this will be used to define the aperture for scaling the contaminant spectrum. If None, the target position in the image will be used
+    target_iden : str, optional
+        Identifier for the target source. Used for labeling plots and outputs.
+    target_clus : str, optional
+        Cluster identifier for the target source. Used for PSF estimation and other cluster-specific parameters.
+    plot_result : bool, optional
+        Whether to plot the fitted Sersic profile and contaminant spectrum (default is False).
+    aper_radius : float, optional
+        The radius (in units of the MUSE PSF FWHM) of the aperture around the target position to use for scaling 
+        the contaminant spectrum (default is 1).
 
-    
     """
     contaminant = nearby_sources[0] # The most likely contaminant is the closest source in normalised distance
     other_sources = nearby_sources[1:] # The other nearby sources that are not the closest contaminant
 
     maskrad = mask_radius * improc.get_muse_psf(contaminant['CLUSTER'])
+    maskrad_pix = maskrad / 0.2 # Convert mask radius to pixels (assuming MUSE pixel scale of 0.2 arcsec/pixel)
+    aperrad = aper_radius * improc.get_muse_psf(contaminant['CLUSTER'])
+    aperrad_pix = aperrad / 0.2 # Convert aperture radius to pixels
 
     # Mask all other nearby sources
     for mem in other_sources:
@@ -502,32 +514,34 @@ def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_c
     # Get initial parameters + bounds for fitting Sersic to contaminant
     ccmem_pos = SkyCoord(contaminant['RA'], contaminant['DEC'], unit='deg')
     ccmem_impos = ccmem_pos.to_pixel(WCS(img.wcs.to_header()))
-    rough_rad = np.nanmax([np.sqrt(contaminant['ISOAREAF_IMAGE'] / np.pi), 1.0])
+    rough_rad = np.nanmax([np.sqrt(contaminant['ISOAREAF_IMAGE'] / np.pi), 1.0]) # minimum radius of 1 pixel
     sersic_bounds = {
         'n': (1.0, 4.0),
         'ellip': (0, 0.2),
         'theta': (-np.pi, np.pi),
         'r_eff': (0.1, 2 * rough_rad)
     }
-    sersic_fixed = {
+    sersic_fixed = { # Dictionary that specifies which parameters to fix
         'n': False,
-        'x_0': True,
+        'x_0': True, # Always fix the center based on R21 coords as they are accurate
         'y_0': True,
         'amplitude': True,
     }
     if contaminant['z'] < 0.01:
+        # For local sources, which are likely stars, fix sersic index to 0.5 to ensure gaussian profile.
         sersic_fixed['n'] = True
         sersic_fixed['amplitude'] = False
-    initial_gs = {
+    initial_guesses = {
         'r_eff': rough_rad,
         'amplitude': 1.0,
         'theta': 0.0,
         'ellip': 0.0,
         'n': estimate_n(contaminant['z'])
     }
-    print(f"Fitting profile to the most likely contaminant...")
-    sersic = fitting.fit_sersic(img.data, ~img.mask, ccmem_impos, initial_gs['amplitude'], initial_gs['r_eff'], 
-                            initial_gs['theta'], initial_gs['ellip'], initial_gs['n'], bounds=sersic_bounds)
+
+    print(f"Fitting Sersic profile to the most likely contaminant...")
+    sersic = fitting.fit_sersic(img.data, ~img.mask, ccmem_impos, initial_guesses['amplitude'], initial_guesses['r_eff'], 
+                            initial_guesses['theta'], initial_guesses['ellip'], initial_guesses['n'], bounds=sersic_bounds)
     print(f"Fitted the following profile:\n")
     for k, par in enumerate(sersic.param_names):
         print(f"{par} \t {sersic.parameters[k]}")
@@ -535,21 +549,30 @@ def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_c
     y, x = np.mgrid[:np.shape(img.data)[0], :np.shape(img.data)[1]]
     sersic_img = sersic(x, y)
 
+    # Get the coordinate of the target in pixels
+    if target_coord is None:
+        # Set target coord to center of the image if not provided
+        target_img_coord = [img.data.shape[1] / 2, img.data.shape[0] / 2]
+    else:
+        target_img_coord = target_coord.to_pixel(WCS(img.wcs.to_header()))
+
+
     if plot_result:
-        plot.plot_2d_model(img, sersic_img, ccmem_impos, row, cluster, iden)
+        plot.plot_2d_model(img, sersic_img, markers=ccmem_impos, iden=target_iden, cluster=target_clus,
+                           aperture=(target_img_coord, aperrad_pix))
     
-    #we now need to sum the sersic profile over the aperture containing the target
-    targimpos = SkyCoord(row['RA'], row['DEC'], unit='deg').to_pixel(WCS(img.wcs.to_header()))
+    # We now need to sum the Sersic profile over the aperture containing the target
     mod_apersum = np.ma.sum(
         np.ma.masked_array(
             data=sersic_img,
             mask=~improc.create_circular_mask(
-                sersic_img, (targimpos[1], targimpos[0]), mf.get_fwhm(row['CLUSTER']) / 0.2
+                sersic_img, (target_img_coord[1], target_img_coord[0]), aperrad_pix
             )
         )
     )
-    contaminant_spec = io.load_r21_spec(row['CLUSTER'], contaminant['iden'], contaminant['idfrom'], 
-                                  spec_type='noweight_skysub')
+
+    contaminant_spec = io.load_r21_spec(target_clus, contaminant['iden'], contaminant['idfrom'],
+                                        spec_type='noweight_skysub')
     
     # Normalise the model by flux
     normrange = np.logical_and(bbcenter - bbrange < contaminant_spec['wavelength'], contaminant_spec['wavelength'] < bbcenter + bbrange)

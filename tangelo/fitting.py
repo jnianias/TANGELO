@@ -1644,7 +1644,7 @@ def flatten_spectrum(spectrum, return_continuum=False):
 
     Examples
     --------
-    >>> from tangiers import fitting as aufit
+    >>> from tangelo import fitting as aufit
     >>> import numpy as np
     >>> x = np.arange(100)
     >>> spec = 10.0 + 0.05 * x + np.random.normal(0, 0.1, 100)
@@ -1678,7 +1678,7 @@ from astropy.modeling import models, fitting
 from astropy.utils.exceptions import AstropyUserWarning
 
 def fit_sersic(imgin, maskin, center, amp, reff, theta, ellip, n, bounds = {},
-                fixed = {}, psf=None):
+                fixed = {}, maxiter=10000):
     """
     Fit a 2D Sersic profile to an image using astropy's modeling framework.
 
@@ -1704,15 +1704,14 @@ def fit_sersic(imgin, maskin, center, amp, reff, theta, ellip, n, bounds = {},
         Dictionary of parameter bounds (keys: 'amplitude', 'x_0', 'y_0', 'r_eff', 'theta', 'ellip', 'n').
     fixed : dict, optional
         Dictionary of parameters to fix during fitting (keys same as bounds, values are booleans).
-    psf : 2D array, optional
-        Point spread function to convolve the model with before fitting. If None, no convolution is applied.
+    maxiter : int, optional
+        Maximum number of iterations for the fitter (default: 10000).
 
     Returns
     -------
     fit_mod : astropy.modeling.Model
         The fitted Sersic model.
     """
-
 
     sermod = models.Sersic2D(amplitude=amp, x_0=center[0], y_0=center[1],
                                     r_eff=reff, theta=theta, ellip=ellip, n=n,
@@ -1724,5 +1723,6 @@ def fit_sersic(imgin, maskin, center, amp, reff, theta, ellip, n, bounds = {},
         # Ignore model linearity warning from the fitter
         warnings.filterwarnings('ignore', message='Model is linear in parameters',
                                 category=AstropyUserWarning)
-        fit_mod = lmfitter(sermod, x[maskin], y[maskin], imgin[maskin], maxiter=10000)
+        fit_mod = lmfitter(sermod, x[maskin], y[maskin], imgin[maskin], maxiter=maxiter)
+    
     return fit_mod

@@ -33,29 +33,53 @@ def plotline(iden, clus, idfrom, wln, ax_in, spec_source = '2fwhm', width=100, m
              # plot_sky = 'red', plot_cluslines = 'magenta', plot_bkg = 'goldenrod', plot_clusspec = 'seagreen', 
              set_ylim = 'mpl', normalise=False, label = None, return_spectrum = False, 
              plotcolor='slateblue', modcolor='maroon'):
-    """ Plot a spectrum from the R21 catalog or 2FWHM catalog with various options.
-    iden:       ID of the source in the catalog
-    clus:       Cluster name (e.g., 'A2744')
-    wln:        Central wavelength to plot around
-    ax_in:      Matplotlib axis to plot on
-    spec_source: 'R21' for R21 catalog, '2fwhm' for 2FWHM catalog
-    width:      Wavelength range around wln to plot (total width = 2*width)
-    model:      Tuple of (function, params...) to overplot a model fit
-    title:      Title for the plot (if False, no title)
-    hline:      Horizontal line value to plot (if None, no line)
-    hspan:      Horizontal span to plot (if None, no span)
-    vline:      Vertical line value to plot (if None, no line)
-    vspan:      Vertical span to plot (if None, no span)
-    # plot_sky:   Color to plot sky spectrum (if None, no sky)
-    # plot_cluslines: Color to plot cluster member lines (if None, no lines)
-    # plot_bkg:   Color to plot background spectrum (if None, no background)
-    # plot_clusspec: Color to plot cluster spectrum (if None, no cluster spectrum)
-    set_ylim:  Y-axis limits (if 'mpl', use Matplotlib defaults, if 'manual', set from data)
-    normalise:  Whether to normalise the spectrum
-    label:      Label for the spectrum (for legend)
-    return_spectrum: Whether to return the plotted spectrum data
-    plotcolor:  Color for the main spectrum plot
-    modcolor:   Color for the model fit plot
+    """
+    Plot a spectrum from the R21 catalog or 2FWHM catalog with various options.
+
+    Parameters
+    ----------
+    iden : str
+        Identifier for the source in the catalog.
+    clus : str
+        Cluster name (e.g., 'A2744').
+    idfrom : str
+        Source of the identifier (e.g., 'R21' or '2fwhm').
+    wln : float
+        Central wavelength to plot around.
+    ax_in : matplotlib.axes.Axes
+        Matplotlib axis to plot on.
+    spec_source : str, optional
+        'R21' for R21 catalog, '2fwhm' for 2FWHM catalog (default is '2fwhm').
+    width : float, optional
+        Wavelength range around wln to plot (total width = 2*width, default is 100).
+    model : tuple, optional
+        Tuple of (function, params...) to overplot a model fit.
+    title : str or bool, optional
+        Title for the plot (if False, no title).
+    hline : float, optional
+        Horizontal line value to plot (if None, no line).
+    hspan : tuple, optional
+        Horizontal span to plot (if None, no span).
+    vline : list, optional
+        Vertical line values to plot (if None, no line).
+    vspan : tuple, optional
+        Vertical span to plot (if None, no span).
+    set_ylim : str, optional
+        Y-axis limits (if 'mpl', use Matplotlib defaults, if 'manual', set from data).
+    normalise : bool, optional
+        Whether to normalise the spectrum (default is False).
+    label : str, optional
+        Label for the spectrum (for legend).
+    return_spectrum : bool, optional
+        Whether to return the plotted spectrum data (default is False).
+    plotcolor : str, optional
+        Color for the main spectrum plot (default is 'slateblue').
+    modcolor : str, optional
+        Color for the model fit plot (default is 'maroon').
+
+    Returns
+    -------
+    None or astropy Table
     """
 
     ax = ax_in
@@ -650,6 +674,34 @@ import matplotlib.patches as patches
 
 def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=True,
                   aperture=None, marker_type='X', title='contaminant source model'):
+    """
+    Plot a 2D model of a source (data, model, data-model) with optional markers and aperture.
+
+    Parameters
+    ----------
+    cutout : array-like
+        The image cutout of the source.
+    model : array-like
+        The model image to plot.
+    markers : list of tuples, optional
+        List of (x, y) coordinates for markers to overlay on the images.
+    iden : str, optional
+        Identifier for the source.
+    cluster : str, optional
+        Cluster name.
+    save_plot : bool, optional
+        Whether to save the plot to a file (default is True).
+    aperture : tuple, optional
+        Tuple of (center, radius) for an aperture to overlay on the images.
+    marker_type : str, optional
+        Marker style for the overlay markers (default is 'X').
+    title : str, optional
+        Title for the plot (default is 'contaminant source model').
+
+    Returns
+    -------
+    None
+    """
 
     # Initialise figure and axis for plotting
     fig, axs = plt.subplots(3,1, figsize=(6, 6), facecolor='white')

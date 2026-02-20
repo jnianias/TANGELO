@@ -1,4 +1,4 @@
-# Requirements for TANGIERS
+# Requirements for TANGELO
 
 numpy
 astropy

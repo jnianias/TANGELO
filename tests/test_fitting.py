@@ -1,12 +1,12 @@
 """
-Tests for the fitting utilities in tangiers.fitting module.
+Tests for the fitting utilities in tangelo.fitting module.
 To be run with pytest.
 """
 
 import pytest
-from tangiers import fitting as aufit
-from tangiers import spectroscopy as auspec
-from tangiers import catalogue_operations as aucat
+from tangelo import fitting as aufit
+from tangelo import spectroscopy as auspec
+from tangelo import catalogue_operations as aucat
 
 wavedict = auspec.wavedict
 

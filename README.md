@@ -1,6 +1,7 @@
-# TANGIERS
 
-**Tools for ANalysing lensed Galaxies with IntEgRal field Spectroscopy**
+# TANGELO
+
+**Tools for Analysing leNsed Galaxies with intEgral fieLd spectrOscopy**
 
 A Python package for astronomical spectroscopy analysis, originally designed for the MUSE catalogues presented in Richard et al. 2021 (R21): https://arxiv.org/abs/2009.09784
 
@@ -23,8 +24,8 @@ Please note that much of the documentation is, at present, machine-generated. Co
 
 ```bash
 # Clone the repository
-git clone https://github.com/jnianias/TANGIERS.git
-cd TANGIERS
+git clone https://github.com/jnianias/TANGELO.git
+cd TANGELO
 
 # Install in development mode
 pip install -e .
@@ -55,7 +56,7 @@ A few environment variables are required for the package to know where to look f
 ### Loading Spectra
 
 ```python
-from tangiers import spectroscopy as spectro
+from tangelo import spectroscopy as spectro
 
 # Load R21 spectrum
 spec = spectro.load_r21_spec('A2744', '1234', 'PRIOR', 'weight_skysub')
@@ -67,7 +68,7 @@ spec = spectro.load_aper_spec('A2744', '1234', 'PRIOR', '2fwhm')
 ### Fitting Emission Lines
 
 ```python
-from tangiers import fitting
+from tangelo import fitting
 
 # Fit a single emission line
 result = fitting.fit_line(
@@ -87,7 +88,7 @@ lya_result = fitting.fit_lya_complete(
 ### Velocity Conversions
 
 ```python
-from tangiers import spectroscopy as spectro
+from tangelo import spectroscopy as spectro
 
 # Convert wavelength to velocity
 vel = spectro.wave2vel(observed_wavelength=6850, 
@@ -101,7 +102,7 @@ wave = spectro.vel2wave(vel=200, restLambda=1215.67, z=4.64)
 ### Plotting
 
 ```python
-from tangiers import plotting
+from tangelo import plotting
 import matplotlib.pyplot as plt
 
 fig, ax = plt.subplots()

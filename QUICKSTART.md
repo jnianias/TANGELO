@@ -73,7 +73,7 @@ load_dotenv()
 ## Check Your Setup
 
 ```python
-from tangiers import spectroscopy as spectro
+from tangelo import spectroscopy as spectro
 
 # Where will data be stored?
 print(spectro.get_data_dir())
@@ -150,7 +150,7 @@ export MUSE_DATA_DIR="$HOME/my_muse_data"
 
 # 2. Run Python
 python3
->>> from tangiers import spectroscopy as spectro
+>>> from tangelo import spectroscopy as spectro
 >>> spec = spectro.load_r21_spec('A2744', '1234', 'E', 'weight_skysub')
 >>> # First time: downloads file to $HOME/my_muse_data/A2744/spectra/R21/
 >>> # Next time: uses cached file
