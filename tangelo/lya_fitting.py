@@ -445,24 +445,6 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
     param_names = ['AMPB', 'LPEAKB', 'DISPB', 'ASYMB',
                    'AMPR', 'LPEAKR', 'DISPR', 'ASYMR',
                    'CONT']
-    
-    # Append baseline parameters if needed
-    if baseline == 'lin':
-        slope_init = initial_guesses['SLOPE'] # If not present, this will throw an error as desired
-        param_names.append('SLOPE')
-        cont_init = [*cont_init, slope_init]
-    elif baseline == 'damp':
-        tau_init = initial_guesses['TAU'] # If not present, this will throw an error as desired
-        fwhm_init = initial_guesses['FWHM_ABS'] # If not present, this will throw an error as desired
-        lpeak_abs_init = initial_guesses['LPEAK_ABS'] # If not present, this will throw an error as desired
-        param_names.extend(['TAU', 'FWHM_ABS', 'LPEAK_ABS'])
-        cont_init = [*cont_init, tau_init, fwhm_init, lpeak_abs_init]
-
-    # Define initial parameters for the double-peaked model
-    p0 = [amp_b_init, cen_b_init, wid_b_init, asy_b_init,
-            amp_r_init, cen_r_init, wid_r_init, asy_r_init,
-            *cont_init]  # baseline
-    
     # Update initial guesses dictionary with the parameters we will actually use in the fit
     initial_guesses = {
         'AMPB': amp_b_init,
@@ -476,6 +458,27 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
         'CONT': cont_init[0]
     }
     
+    # Append baseline parameters if needed
+    if baseline == 'lin':
+        slope_init = initial_guesses['SLOPE'] # If not present, this will throw an error as desired
+        param_names.append('SLOPE')
+        cont_init = [*cont_init, slope_init]
+        initial_guesses['SLOPE'] = slope_init
+    elif baseline == 'damp':
+        tau_init = initial_guesses['TAU'] # If not present, this will throw an error as desired
+        fwhm_init = initial_guesses['FWHM_ABS'] # If not present, this will throw an error as desired
+        lpeak_abs_init = initial_guesses['LPEAK_ABS'] # If not present, this will throw an error as desired
+        param_names.extend(['TAU', 'FWHM_ABS', 'LPEAK_ABS'])
+        cont_init = [*cont_init, tau_init, fwhm_init, lpeak_abs_init]
+        initial_guesses['TAU'] = tau_init
+        initial_guesses['FWHM_ABS'] = fwhm_init
+        initial_guesses['LPEAK_ABS'] = lpeak_abs_init
+
+    # Define initial parameters for the double-peaked model
+    p0 = [amp_b_init, cen_b_init, wid_b_init, asy_b_init,
+            amp_r_init, cen_r_init, wid_r_init, asy_r_init,
+            *cont_init]  # baseline
+
     # Define bounds for the parameters
     dpeak_bounds = gen_bounds(initial_guesses, 'LYALPHA', input_bounds=bounds, force_sign='positive')
     
