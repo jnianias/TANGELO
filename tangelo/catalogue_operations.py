@@ -267,7 +267,7 @@ def get_line_table(iden, clus, exclude_lya=True):
     return line_table
     
 
-def insert_fit_results(megatab, clus, iden, lya_results, other_results, avgmu, flags):
+def insert_fit_results(megatab, clus, iden, lya_results, other_results):
     """
     Insert fitting results into the megatab for a given source.
 
@@ -286,25 +286,22 @@ def insert_fit_results(megatab, clus, iden, lya_results, other_results, avgmu, f
         Tuple of dictionaries (params, errors, _, reduced_chisq) from the Lya fitting.
     other_results : dict
         Dictionary of tuples (params, errors, _, rchsq) from other line fittings, keyed by line name.
-    avgmu : float
-        Average magnification value to update.
-    flags : dict
-        Dictionary of flags for each line.
 
     Example
     -------
-    >>> insert_fit_results(megatab, 'A2744', 'E1234', lya_results, other_results, 2.1, flags)
+    >>> insert_fit_results(megatab, 'A2744', 'E1234', lya_results, other_results)
     # Updates megatab in place
     """
     # Find the index of the row to update
-    row_index = np.where((megatab['CLUSTER'] == clus) & (megatab['iden'] == iden[1:]))[0]
+    row_index = np.where((megatab['CLUSTER'] == clus) & (megatab['iden'] == iden))[0]
     if len(row_index) == 0:
-        print(f"Source {iden} in cluster {clus} not found in megatab.")
-        return
+        raise ValueError(f"No matching row found in megatab for cluster {clus} and identifier {iden}")
     row_index = row_index[0]  # Get the single index value
 
     # Insert Lya results
-    lya_params, lya_errors, _, reduced_chisq = lya_results
+    lya_params = lya_results['param_dict']
+    lya_errors = lya_results['error_dict']
+    reduced_chisq = lya_results['reduced_chisq']
     for key in lya_params.keys():
         if key in megatab.colnames:
             megatab[key][row_index] = lya_params[key]
@@ -328,24 +325,24 @@ def insert_fit_results(megatab, clus, iden, lya_results, other_results, avgmu, f
             megatab[colname + '_ERR'][row_index]    = np.nan
 
     # Insert other line results
-    for line_name, (params, errors, _, rchsq) in other_results.items():
+    for line_name, fit_results in other_results.items():
+        params = fit_results['param_dict']
+        errors = fit_results['error_dict']
+        reduced_chisq = fit_results['reduced_chisq']
         for key in params.keys():
             colname = f"{key}_{line_name}"
             errcolname = f"{key}_ERR_{line_name}"
             if colname in megatab.colnames:
                 megatab[colname][row_index] = params[key]
                 megatab[errcolname][row_index] = errors[key]
-        megatab[f'RCHSQ_{line_name}'][row_index] = rchsq
+        megatab[f'RCHSQ_{line_name}'][row_index] = reduced_chisq
         megatab[f'SNR_{line_name}'][row_index] = params['FLUX'] / errors['FLUX']
-        # Re-insert any flags that were carried over from group members
-        if line_name in flags:
-            megatab[f'FLAG_{line_name}'][row_index] = 'c'
-            
-    # Update the magnification
-    megatab['MU'][row_index] = avgmu
 
     # Finally, update the identifier with the 'S' prefix to indicate stacked spectrum
     megatab['iden'][row_index] = iden
+
+    # Print confirmation message
+    print(f"\nInserted fit results for {iden} in {clus} into megatab at index {row_index}\n")
 
 
 def update_table(megatable, index, linename, params, param_errs, rchsq, flag=''):

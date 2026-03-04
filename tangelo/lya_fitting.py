@@ -251,8 +251,12 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
         Spectrum array.
     spec_err : array-like
         Spectrum error array.
-    row : dict-like
-        The row of the megatab containing the fitting results to use as priors.
+    initial_guesses : dict or Astropy Table row
+        Initial guesses for the fitting parameters.
+    iden : str
+        Identifier for the object being fitted.
+    cluster : str
+        Cluster name for the object being fitted.
     width : float, optional
         The width (in Angstroms) around the Lya peak to use for fitting.
     bounds : dict, optional
@@ -431,7 +435,8 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
         raise KeyError(f"\nMissing required initial guess parameter: {e}. Cannot proceed with fitting.")
 
     amp_b_init = initial_guesses.get('AMPB', 0.1 * initial_guesses['AMPR'])
-    cen_b_init = initial_guesses.get('LPEAKB', initial_guesses['LPEAKR'] - 5.0)
+    default_br_sep = -2 * (1 + z_init)  # Default separation of blue peak from red peak in Angstroms, scaled by redshift
+    cen_b_init = initial_guesses.get('LPEAKB', initial_guesses['LPEAKR'] + default_br_sep)
     wid_b_init = initial_guesses.get('DISPB', initial_guesses['DISPR'])
     asy_b_init = -1 * initial_guesses['ASYMR']
     cont_init  = [initial_guesses.get('CONT', 0.0)] # This needs to be a list for appending later
@@ -457,6 +462,19 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
     p0 = [amp_b_init, cen_b_init, wid_b_init, asy_b_init,
             amp_r_init, cen_r_init, wid_r_init, asy_r_init,
             *cont_init]  # baseline
+    
+    # Update initial guesses dictionary with the parameters we will actually use in the fit
+    initial_guesses = {
+        'AMPB': amp_b_init,
+        'LPEAKB': cen_b_init,
+        'DISPB': wid_b_init,
+        'ASYMB': asy_b_init,
+        'AMPR': amp_r_init,
+        'LPEAKR': cen_r_init,
+        'DISPR': wid_r_init,
+        'ASYMR': asy_r_init,
+        'CONT': cont_init[0]
+    }
     
     # Define bounds for the parameters
     dpeak_bounds = gen_bounds(initial_guesses, 'LYALPHA', input_bounds=bounds, force_sign='positive')
@@ -655,195 +673,78 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
 
     return fit_result
 
+def refit_lya_line(wave, spec, spec_err, tabrow, baseline='auto', width=50, plot_result=True,
+                   use_bootstrap=True, bootstrap_params=default_bootstrap_params, rchsq_thresh=2.0,
+                   save_plots=True, plot_dir=None, spec_type='aper'):
+    """
+    Re-fit a Lyman alpha line using the parameters from a given table row as initial guesses, and optionally 
+    trying multiple baseline types.
 
-# def fit_lya_line_old(wave, spec, spec_err, initial_guesses, bounds='auto', width=50,
-#                  plot_result=False, save_plots=False, plot_dir='./', ax_in=None, spec_type='aper'):
-#     """
-#     Fit the Lyman alpha line with a constant baseline using specified initial parameters.
+    Parameters
+    ----------
+    wave : array-like
+        Wavelength array.
+    spec : array-like
+        Spectrum array.
+    spec_err : array-like
+        Spectrum error array.
+    tabrow : Astropy Table row
+        The row of the megatab containing the fitting results to use as priors.
+    baseline : str, optional
+        Baseline type to use for fitting ('const', 'lin', 'damp', or 'auto' to try all).
+    width : float, optional
+        Width around the line center to consider for fitting (default is 50).
+    plot_result : bool, optional
+        Whether to plot the fitting result (default is True).
+    use_bootstrap : bool, optional
+        Whether to use bootstrap resampling for error estimation (default is True).
+    bootstrap_params : dict, optional
+        Parameters for bootstrap error estimation (default is default_bootstrap_params).
+    rchsq_thresh : float, optional
+        Reduced chi-squared threshold for accepting a fit when baseline='auto' (default is 2.0).
+    save_plots : bool, optional
+        Whether to save the plots to disk (default is True).
+    plot_dir : str, optional
+        Directory to save plots if save_plots is True (default is None, which means current directory).
+    spec_type : str, optional
+        Type of spectrum being fitted (for labeling purposes, default is 'aper').
 
-#     Parameters
-#     ----------
-#     wave : array-like
-#         Wavelength array.
-#     spec : array-like
-#         Spectrum array.
-#     spec_err : array-like
-#         Spectrum error array.
-#     initial_guesses : dict
-#         Dictionary of initial guesses for the fit parameters.
-#     bounds : tuple or 'auto', optional
-#         Bounds for parameters. If 'auto', default bounds are used based on initial guesses.
-#     width : float, optional
-#         Width around the line center to consider for fitting (default is 50).
-#     spec_type : str, optional
-#         Type of spectrum being fitted (for labeling purposes, default: 'aper').
+    Returns
+    -------
+    fit_result : dict
+        Dictionary containing fit parameters, errors, model, reduced chi-squared, and baseline type.
+        Keys include: 'param_dict', 'error_dict', 'model', 'reduced_chisq', 'baseline', 
+        'fit_mask', 'wl_fit', 'spec_fit', 'err_fit', 'popt', 'pcov', 'method'.
+        Empty dict {} if fit failed.
+    """
+    iden = tabrow['iden']
+    cluster = tabrow['CLUSTER']
 
-#     Returns
-#     -------
-#     fit_result : dict
-#         Dictionary containing fit parameters, errors, model, and reduced chi-squared.
-#         Keys include: 'param_dict', 'error_dict', 'model', 'reduced_chisq', 
-#         'fit_mask', 'wl_fit', 'spec_fit', 'err_fit', 'popt', 'pcov'.
-#         Empty dict {} if fit failed.
-#     """
-#     # Figure out which function to use based on baseline type
-#     mdl_func = mdl.lya_dpeak
-    
-#     # Extract initial guesses from the dictionary first for mask generation
-#     lpeak_init = initial_guesses.get('LPEAKR', initial_guesses.get('LPEAK', 1216))
-    
-#     # Get mask for sky lines and bad values
-#     fitmask = generate_spec_mask(wave, spec, spec_err,
-#                                  lpeak_init, width, 'LYALPHA')
-#     # Make sure there are enough good points to fit
-#     if fitmask.sum() < 10:
-#         print("Not enough good points to fit Lya.")
-#         return {}
-    
-#     # Extract initial guesses from the dictionary
-#     p0 = [
-#         initial_guesses.get('AMPB', 0.1 * initial_guesses['AMPR']),
-#         initial_guesses.get('LPEAKB', initial_guesses['LPEAKR'] - 5.0),
-#         initial_guesses.get('DISPB', initial_guesses['DISPR']),
-#         initial_guesses.get('ASYMB', -1 * initial_guesses['ASYMR']),
-#         initial_guesses['AMPR'],
-#         initial_guesses['LPEAKR'],
-#         initial_guesses['DISPR'],
-#         initial_guesses['ASYMR'],
-#         initial_guesses.get('CONT', 0.0)
-#     ]
+    # Extract initial guesses from the table row
+    initial_guesses = {}
+    for param in ['AMPB', 'LPEAKB', 'DISPB', 'ASYMB',
+                  'AMPR', 'LPEAKR', 'DISPR', 'ASYMR',
+                  'CONT', 'SLOPE', 'TAU', 'FWHM_ABS', 'LPEAK_ABS']:
+        if param in tabrow.colnames and not np.isnan(tabrow[param]):
+            initial_guesses[param] = tabrow[param]
 
-#     # Make a list of parameter names for reference in the order used by the model
-#     param_names = ['AMPB', 'LPEAKB', 'DISPB', 'ASYMB',
-#                    'AMPR', 'LPEAKR', 'DISPR', 'ASYMR',
-#                    'CONT']
-    
-#     # Define default bounds if 'auto' is specified
-#     if bounds == 'auto':
-#         bounds = (
-#             [0, p0[1] - 15, 0.625, -0.5, 
-#              0, p0[5] - 5,  0.625, -0.5, 
-#              -50],  # lower bounds
-#             [10000, p0[1] + 10, 6, 0.1, 
-#              10000, p0[5] + 10, 6, 0.5, 
-#              2000]   # upper bounds
-#         )
-
-#     # Make sure that initial guesses are within bounds
-#     p0, bounds = check_inputs(p0, bounds)
-
-#     # Initialise fit results dictionaries
-#     fit_results = {k: np.nan for k in initial_guesses.keys()}
-#     err_results = {k: np.nan for k in initial_guesses.keys()}
-    
-#     # Try double-peaked fit first with a few attempts at different initial guesses
-#     popt_double, perr_double, pcov_double, rchsq_double = None, None, None, np.inf
-#     best_mdl_func = mdl_func
-
-#     for shift in [0, -5, 5, -10, 10]: # Perform five initial fits, moving the blue peak initial guess each time
-#         p0[1] = p0[1] + shift
+    # Depending on baseline type, call the fitting function
+    if baseline == 'auto':
+        fit_result = fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden,
+                                        cluster, bounds={}, 
+                                        width=width, plot_result=plot_result,
+                                        use_bootstrap=use_bootstrap, bootstrap_params=bootstrap_params,
+                                        rchsq_thresh=rchsq_thresh,
+                                        save_plots=save_plots, plot_dir=plot_dir,
+                                        spec_type=spec_type)
+    else:
+        fit_result = fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
+                                    bounds={}, 
+                                    width=width, baseline=baseline,
+                                    plot_result=plot_result,
+                                    use_bootstrap=use_bootstrap,
+                                    bootstrap_params=bootstrap_params,
+                                    save_plots=save_plots, plot_dir=plot_dir,
+                                    spec_type=spec_type)
         
-#         # Make sure the initial guesses are always within bounds
-#         p0, bounds = check_inputs(p0, bounds)
-#         try:
-#             popt, pcov = curve_fit(mdl_func, wave[fitmask], spec[fitmask],
-#                                    p0=p0, sigma=spec_err[fitmask],
-#                                    bounds=bounds, absolute_sigma=True,
-#                                    max_nfev = 100000, method = 'trf')
-#             perr = np.sqrt(np.diag(pcov))
-#             if spectro.is_reasonable_dpeak(popt, perr):
-#                 popt_double  = popt
-#                 perr_double  = perr
-#                 pcov_double  = pcov
-#                 rchsq_double = get_reduced_chisq(spec[fitmask], 
-#                                                mdl_func(wave[fitmask], *popt), 
-#                                                spec_err[fitmask], 
-#                                                len(popt))
-#                 break  # Exit the loop if a good fit is found
-#         except (RuntimeError, ValueError) as e:
-#             print(f"Fit attempt with blue peak shift {shift} failed: {e}")
-#             continue
-    
-#     # If a successful fit was found, fill the fit_results and err_results dictionaries, 
-#     # otherwise move to single-peaked fit
-#     if popt_double is not None and perr_double is not None:
-#         for i, name in enumerate(param_names):
-#             fit_results[name] = popt_double[i]
-#             err_results[name] = perr_double[i]
-#         print("Double-peaked fit successful.")
-        
-#         # If plotting is requested, do it here
-#         if plot_result:
-#             plot.plot_lya_fit(wave[fitmask], spec[fitmask], spec_err[fitmask], popt_double, best_mdl_func,
-#                              save_plots=save_plots, plot_dir=plot_dir, ax_in=ax_in, spec_type=spec_type)
-
-#         # Build and return fit_result dictionary
-#         return {
-#             'param_dict': fit_results,
-#             'error_dict': err_results,
-#             'model': mdl_func,
-#             'reduced_chisq': rchsq_double,
-#             'fit_mask': fitmask,
-#             'wl_fit': wave[fitmask],
-#             'spec_fit': spec[fitmask],
-#             'err_fit': spec_err[fitmask],
-#             'popt': popt_double,
-#             'pcov': pcov_double,
-#             'method': 'double-peaked'
-#         }
-    
-#     print("Double-peaked fit failed; trying single-peaked fit...")
-
-#     # Now perform a single-peaked fit
-#     p0_single = [p0[4], p0[5], p0[6], p0[7], p0[8]]  # baseline
-#     bounds_single = (
-#         [0,     p0[5] - 5, 1.25, -0.5,  bounds[0][8]],  # lower bounds
-#         [10000, p0[5] + 5, 50,    0.5,  bounds[1][8]]   # upper bounds
-#     )
-
-#     mdl_func_single = mdl.lya_speak
-    
-#     # Ensure initial guesses are within bounds
-#     p0_single, bounds_single = check_inputs(p0_single, bounds_single)
-
-#     try:
-#         popt, pcov = curve_fit(mdl_func_single, wave[fitmask], spec[fitmask],
-#                                 p0=p0_single, sigma=spec_err[fitmask],
-#                                 bounds=bounds_single, absolute_sigma=True,
-#                                 max_nfev = 100000, method = 'trf')
-#         popt_single  = popt
-#         perr_single = np.sqrt(np.diag(pcov))
-#         pcov_single = pcov
-#         rchsq_single = get_reduced_chisq(spec[fitmask], 
-#                                         mdl_func_single(wave[fitmask], *popt), 
-#                                         spec_err[fitmask], 
-#                                         len(popt))
-
-#         for i, name in enumerate(param_names[4:]):  # only the single-peak params
-#             fit_results[name] = popt_single[i]
-#             err_results[name] = perr_single[i]
-#         print("Single-peaked fit successful.")
-
-#         # If plotting is requested, do it here
-#         if plot_result:
-#             plot.plot_lya_fit(wave[fitmask], spec[fitmask], spec_err[fitmask], popt_single, mdl_func_single,
-#                              save_plots=save_plots, plot_dir=plot_dir, ax_in=ax_in, spec_type=spec_type)
-        
-#         # Build and return fit_result dictionary
-#         return {
-#             'param_dict': fit_results,
-#             'error_dict': err_results,
-#             'model': mdl_func_single,
-#             'reduced_chisq': rchsq_single,
-#             'fit_mask': fitmask,
-#             'wl_fit': wave[fitmask],
-#             'spec_fit': spec[fitmask],
-#             'err_fit': spec_err[fitmask],
-#             'popt': popt_single,
-#             'pcov': pcov_single,
-#             'method': 'single-peaked'
-#         }
-#     except (RuntimeError, ValueError) as e:
-#         print(f"Single-peaked fit also failed: {e}")
-#         return {}
-    
+    return fit_result

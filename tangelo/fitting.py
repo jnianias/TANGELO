@@ -1049,7 +1049,8 @@ def check_inputs(p0, bounds):
                     val = lower * 1.1 if lower != 0 else lower + 0.1
             else:
                 val = (lower + upper) / 2.0
-            print(f"WARNING: {i}-th initial guess {original_val} is outside bounds ({lower:.5f}, {upper:.5f}); adjusting to {val:.3e}")
+            print(f"WARNING: {i}-th initial guess {original_val} is outside bounds ({lower:.5f}, {upper:.5f}); "
+                  f"adjusting to {val:.3e}")
             
         p0_checked.append(val)
     
@@ -1475,7 +1476,7 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
 
 
 def refit_other_line(wave, spec, spec_err, row, line_tab_row = None, width=25, 
-                     ax_in=None, line_name = None, 
+                     ax_in=None, line_name = None,
                      bootstrap_params: Optional[BootstrapParams] = None):
     """
     Refit a non-Lyman alpha emission line based on prior fitting results.
@@ -1676,9 +1677,16 @@ def flatten_spectrum(spectrum, return_continuum=False):
     
 from astropy.modeling import models, fitting
 from astropy.utils.exceptions import AstropyUserWarning
+from astropy.stats import sigma_clip
+
+class BadDataError(Exception):
+    """Custom exception to indicate that the input data is not suitable for fitting."""
+    pass
 
 def fit_sersic(imgin, maskin, center, amp, reff, theta, ellip, n, bounds = {},
-                fixed = {}, maxiter=10000):
+                fixed = {}, maxiter=10000, outlier_removal=False, 
+                outlier_kwargs={'niter': 3, 'sigma_upper': 3.0},
+                return_initial_model=False):
     """
     Fit a 2D Sersic profile to an image using astropy's modeling framework.
 
@@ -1706,23 +1714,42 @@ def fit_sersic(imgin, maskin, center, amp, reff, theta, ellip, n, bounds = {},
         Dictionary of parameters to fix during fitting (keys same as bounds, values are booleans).
     maxiter : int, optional
         Maximum number of iterations for the fitter (default: 10000).
+    outlier_removal : bool, optional
+        Whether to perform outlier removal during fitting (default: False).
+    outlier_kwargs : dict, optional
+        Dictionary of keyword arguments to pass to the outlier removal function (default: {'niter': 3, 'sigma_upper': 3.0}).
 
     Returns
     -------
     fit_mod : astropy.modeling.Model
         The fitted Sersic model.
     """
-
     sermod = models.Sersic2D(amplitude=amp, x_0=center[0], y_0=center[1],
                                     r_eff=reff, theta=theta, ellip=ellip, n=n,
                                     bounds=bounds, fixed=fixed)
 
-    lmfitter = fitting.LevMarLSQFitter()
+    fitter = fitting.LevMarLSQFitter()
+
+    if outlier_removal:
+        fitter = fitting.FittingWithOutlierRemoval(fitter, sigma_clip, **outlier_kwargs)
+
+    # check for non-finite values in the input image and mask them out
+    finite_mask = np.isfinite(imgin)
+    maskin = maskin & finite_mask
+    # If fewer than 10 valid pixels remain after masking, abandon the fit and raise an error
+    if np.sum(maskin) < 10:
+        raise BadDataError("Fewer than 10 valid pixels to fit after applying mask and removing non-finite values.")
+
     y, x = np.mgrid[:np.shape(imgin)[0], :np.shape(imgin)[1]]
     with warnings.catch_warnings():
         # Ignore model linearity warning from the fitter
         warnings.filterwarnings('ignore', message='Model is linear in parameters',
                                 category=AstropyUserWarning)
-        fit_mod = lmfitter(sermod, x[maskin], y[maskin], imgin[maskin], maxiter=maxiter)
+        fit_mod = fitter(sermod, x[maskin], y[maskin], imgin[maskin], maxiter=maxiter)
     
-    return fit_mod
+    if return_initial_model:
+        initial_mod = models.Sersic2D(amplitude=amp, x_0=center[0], y_0=center[1],
+                                      r_eff=reff, theta=theta, ellip=ellip, n=n)
+        return fit_mod, initial_mod
+    else:
+        return fit_mod

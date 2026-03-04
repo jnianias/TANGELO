@@ -8,6 +8,7 @@ from . import models
 from . import io
 import copy
 import os
+from pathlib import Path
 
 import matplotlib
 from matplotlib.colors import PowerNorm
@@ -27,6 +28,64 @@ def safe_show():
         plt.show()
     else:
         pass  # Do nothing in non-GUI backends
+
+
+def plot_muse_spectrum(wave, spec, spec_err=None, ax=None, label=None, color='slateblue', alpha=0.8, step='mid',
+                       y_label=r'f$_{\lambda}$ $[10^{-20}$ erg s$^{-1}$ cm$^{-2}$ \AA$^{-1}]$', x_label=r'$\lambda$ [\AA]',
+                       save_plot=False, save_dir='./', plot_name='spectrum_plot.png'):
+    """
+    Plot a MUSE spectrum with optional error bars
+
+    Parameters
+    ----------
+    wave : array-like
+        Wavelength array in Angstroms or km/s if velocity=True.
+    spec : array-like
+        Flux array corresponding to the wavelengths.
+    spec_err : array-like, optional
+        Error array for the flux values. If provided, shaded error region will be plotted.
+    ax : matplotlib.axes.Axes, optional
+        Matplotlib axis to plot on. If None, a new figure and axis will be created.
+    label : str, optional
+        Label for the spectrum (for legend).
+    color : str, optional
+        Color for the spectrum line (default is 'slateblue').
+    alpha : float, optional
+        Transparency level for the spectrum line (default is 0.8).
+    step : str, optional
+        Step style for plotting the spectrum (default is 'mid').
+    y_label : str, optional
+        Label for the y-axis (default is r'f$_{\lambda}$ $[10^{-20}$ erg s$^{-1}$ cm$^{-2}$ \AA$^{-1}]$').
+    x_label : str, optional
+        Label for the x-axis (default is r'$\lambda$ [\AA]').
+    
+    Returns
+    -------
+    None
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5), facecolor='w')
+    
+    ax.plot(wave, spec, drawstyle=f'steps-{step}', color=color, alpha=alpha, label=label)
+    
+    if spec_err is not None:
+        ax.fill_between(wave, spec - spec_err, spec + spec_err,
+                        color=color, alpha=0.3, step=step, edgecolor='none')
+    
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    
+    if label:
+        ax.legend()
+
+    if save_plot:
+        if not Path(save_dir).exists():
+            os.makedirs(save_dir)
+        plt.savefig(Path(save_dir) / plot_name, dpi=300)
+    
+    if ax is None:
+        safe_show()
+        plt.close()
 
 def plotline(iden, clus, idfrom, wln, ax_in, spec_source = '2fwhm', width=100, model=None, title = False,
              hline = None, hspan = None, vline = None, vspan = None,
@@ -104,15 +163,10 @@ def plotline(iden, clus, idfrom, wln, ax_in, spec_source = '2fwhm', width=100, m
         return None
 
     # Plot the spectrum
-    ax.plot(spectab['wave'][region], spectab['spec'][region], drawstyle='steps-mid', color=plotcolor, 
-            alpha=0.8, label=label)
-    ax.fill_between(spectab['wave'][region], spectab['spec'][region] - spectab['spec_err'][region],
-                spectab['spec'][region] + spectab['spec_err'][region], edgecolor='none',
-                facecolor=plotcolor, alpha=0.3, step='mid')
+    plot_muse_spectrum(spectab['wave'][region], spectab['spec'][region], spec_err=spectab['spec_err'][region],
+                       ax=ax, label=label, color=plotcolor, alpha=0.8, step='mid')
     
     # Axis labels and title
-    ax.set_ylabel(r'f$_{\lambda}$ ($10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$\,\AA$^{-1}$)')
-    ax.set_xlabel(r'$\lambda$ (\AA)')
     if isinstance(title, str):
         ax.set_title(f'{clus}  ID{iden}' + ' ' + title)
 
@@ -136,28 +190,6 @@ def plotline(iden, clus, idfrom, wln, ax_in, spec_source = '2fwhm', width=100, m
             modplot /= normfac
         ax.plot(highreswl, modplot, linestyle = '--', color=modcolor, alpha=0.3, label='fit')
     
-    # # Plot cluster member lines
-    # if plot_cluslines:
-    #     for ln, wl in cluster_lines[row['CLUSTER']].items():
-    #         wlz = wl * (cluster_zs[row['CLUSTER']] + 1)
-    #         if np.logical_and(spectab['wave'][region][0] < wlz, wlz < spectab['wave'][region][-1]):
-    #             ax.axvline(wlz, linestyle=':', color='magenta')
-    # # Plot the background spectrum
-    # if plot_bkg:
-    #     bkgspec = tb(fits.open(f'{clus}_background_spectrum.fits')[1].data)[region]
-    #     ax.plot(bkgspec['wavelength'], 1000 * bkgspec['sky_spec'], color=plot_bkg, alpha=0.5, drawstyle='steps-mid')
-    # # Plot the cluster spectrum
-    # if plot_clusspec:
-    #     clusspec = tb(fits.open(f'{clus}_cluster_spectrum.fits')[1].data)[region]
-    #     clusspec_norm = clusspec['sky_spec'] * np.nanmedian(spectab['spec'][region]) / np.nanmedian(clusspec['sky_spec'])
-    #     ax.plot(clusspec['wavelength'], clusspec_norm, color=plot_clusspec, alpha=0.5, drawstyle='steps-mid')
-    # # Plot the sky spectrum
-    # if plot_sky:
-    #     skytab = get_skytab([spectab['wave'][0], spectab['wave'][-1]])
-    #     sky = np.histogram(skytab['lambda'].data,
-    #                            bins = np.size(spectab['wave'].data),
-    #                            weights = skytab['flux'].data)[0]
-    #     ax.step(spectab['wave'][region], sky[region], where='mid', color=plot_sky, alpha = 0.2)
     if set_ylim == 'manual':
         ax.set_ylim(np.min([0., np.nanmin(spectab['spec'][region])]), np.max(spectab['spec'][region]) * 1.1)
 
@@ -381,10 +413,10 @@ def plot_lya_fit_result(fit_result, iden, cluster, save_plots=False, plot_dir='.
     plt.title(f"{cluster} {iden} " + r"Lyman-$\alpha$ Fit")
     plt.legend()
     
-    if save_plots:
-        plt.savefig(f"{plot_dir}/LYALPHA_fit_{spec_type}.png", dpi=300)
+    # if save_plots:
+    #     plt.savefig(f"{plot_dir}/LYALPHA_fit_{spec_type}.png", dpi=300)
     
-    safe_show()
+    # safe_show()
 
     # Save plot if requested
     if save_plots:
@@ -673,7 +705,7 @@ def gen_mpdaf_img_ticks(cutout, pixscale, tickspace = 1.0):
 import matplotlib.patches as patches
 
 def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=True,
-                  aperture=None, marker_type='X', title='contaminant source model'):
+                  aperture=None, marker_type='x', title='contaminant source model'):
     """
     Plot a 2D model of a source (data, model, data-model) with optional markers and aperture.
 
@@ -694,7 +726,7 @@ def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=
     aperture : tuple, optional
         Tuple of (center, radius) for an aperture to overlay on the images.
     marker_type : str, optional
-        Marker style for the overlay markers (default is 'X').
+        Marker style for the overlay markers (default is 'x').
     title : str, optional
         Title for the plot (default is 'contaminant source model').
 
@@ -703,20 +735,35 @@ def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=
     None
     """
 
-    # Initialise figure and axis for plotting
-    fig, axs = plt.subplots(3,1, figsize=(6, 6), facecolor='white')
+    # Initialise figure and axis for plotting (horizontal layout)
+
+    fig, axs = plt.subplots(1, 3, figsize=(24, 6), facecolor='white')
+    # Ensure axs is a flat array for consistent indexing
+    if isinstance(axs, np.ndarray):
+        axs = axs.flatten()
     vmin = -0.05 * get_centmax(cutout.data, 20.)
     vmax = get_centmax(cutout.data, 20.)
 
-    bbimg = axs[0].imshow(cutout.data, norm = PowerNorm(0.5, vmin=vmin, vmax=vmax))
-    modimg = axs[1].imshow(model, norm = PowerNorm(0.5, vmin=vmin, vmax=vmax))
-    subimg = axs[2].imshow(cutout.data.data - model, norm = PowerNorm(0.5, vmin=vmin, vmax=vmax))
+    bbimg = axs[0].imshow(cutout.data, norm=PowerNorm(0.5, vmin=vmin, vmax=vmax))
+    modimg = axs[1].imshow(model, norm=PowerNorm(0.5, vmin=vmin, vmax=vmax))
+    subimg = axs[2].imshow(cutout.data.data - model, norm=PowerNorm(0.5, vmin=vmin, vmax=vmax))
 
-    cbars = [sensible_colorbar(fig, a, a.get_images()[0]) for a in axs]
+    # Adjust colorbar placement for horizontal layout
+    cbars = []
+    for a in axs:
+        pos = a.get_position()
+        # Place colorbar to the right of each subplot
+        cax = fig.add_axes([pos.x1 + 0.01, pos.y0, 0.015, pos.height])
+        cbar = fig.colorbar(a.get_images()[0], cax=cax)
+        cax.yaxis.set_ticks_position('right')
+        cbar.set_label(r"Flux density ($10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$\,\AA$^{-1}$)")
+        cbars.append(cbar)
+
     ticks = gen_mpdaf_img_ticks(cutout, 0.2, tickspace=3.0)
     for n, a in enumerate(axs):
         # Plot the provided markers
-        a.scatter(*markers, s=360, color = 'red', marker=marker_type)
+        if markers:
+            a.scatter(*markers, s=250, color='red', marker=marker_type)
 
         a.set_yticks(ticks[1])
         a.set_xticks(ticks[0])
@@ -724,7 +771,6 @@ def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=
         a.set_xticklabels(ticks[2])
         a.set_xlabel(r"$ \upDelta $R.A. ($''$)")
         a.set_ylabel(r"$ \upDelta $Dec ($''$)")
-        cbars[n].set_label(r"Flux density ($10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$\,\AA$^{-1}$)")
 
         # If an aperture was provided, plot it
         if isinstance(aperture, tuple):
@@ -738,7 +784,8 @@ def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=
         plot_dir = io.get_plot_dir(cluster, iden)
         if not os.path.exists(plot_dir):
             os.makedirs(plot_dir)
-        fig.savefig(f"{plot_dir}/{cluster}_{iden}_sersic_sub.pdf", bbox_inches='tight')
+        print(f'Saving 2D model plot to {plot_dir}/{cluster}_{iden}_sersic_sub.pdf')
+        fig.savefig(f"{plot_dir}/{cluster}_{iden}_sersic_sub.pdf")
     
-    plt.show()
+    safe_show()
     plt.close()

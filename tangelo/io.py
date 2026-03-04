@@ -257,7 +257,7 @@ def get_aper_spectra_dir(cluster):
         raise FileNotFoundError(f"Aperture spectra directory does not exist: {spectra_dir}")
     return spectra_dir
 
-def get_misc_dir(cluster):
+def get_misc_dir(cluster) -> Path:
     """
     Get the directory where miscellaneous data files are stored for a given cluster.
 
@@ -275,6 +275,7 @@ def get_misc_dir(cluster):
     misc_dir = data_dir / cluster.upper() / 'misc'
     if not misc_dir.exists(): # Raise an error if the directory does not exist (the user should have created it)
         raise FileNotFoundError(f"Miscellaneous data directory does not exist: {misc_dir}")
+    
     return misc_dir
 
 def get_muse_cube_dir(cluster):
@@ -404,12 +405,20 @@ def load_r21_spec(clus, iden, idfrom, spec_type):
         The loaded spectrum table, or None if loading failed.
     """
     # Generate the full identifier
-    if iden[0].isdigit():
-        identifier = (idfrom[0] + str(iden)).replace('E', 'X')
-    elif iden[0].isalpha():
-        identifier = iden
+    if isinstance(iden, str):
+        if iden[0].isdigit():
+            identifier = (idfrom[0] + str(iden)).replace('E', 'X')
+        elif iden[0].isalpha():
+            identifier = iden
+        else:
+            raise ValueError("iden must start with a letter or digit")
     else:
-        raise ValueError("iden must start with a letter or digit")
+        # Try to convert to int
+        iden = int(iden)
+        if isinstance(iden, int):
+            identifier = f"{idfrom[0]}{iden}".replace('E', 'X')
+        else:
+            raise ValueError("iden must be an int or str")
 
     print(f"Loading R21 spectrum for {clus} object {identifier}...")
 
@@ -497,12 +506,20 @@ def load_aper_spec(clus, iden, idfrom, spec_type = '2fwhm'):
         The loaded spectrum table, or None if loading failed.
     """
     # Generate the full identifier
-    if iden[0].isdigit():
-        identifier = (idfrom[0] + str(iden)).replace('E', 'X')
-    elif iden[0].isalpha():
-        identifier = iden
+    if isinstance(iden, str):
+        if iden[0].isdigit():
+            identifier = (idfrom[0] + str(iden)).replace('E', 'X')
+        elif iden[0].isalpha():
+            identifier = iden
+        else:
+            raise ValueError("iden must start with a letter or digit")
     else:
-        raise ValueError("iden must start with a letter or digit")
+        # Try to convert to int
+        iden = int(iden)
+        if isinstance(iden, int):
+            identifier = f"{idfrom[0]}{iden}".replace('E', 'X')
+        else:
+            raise ValueError("iden must be an int or str")
 
     print(f"Loading aperture spectrum for {clus} object {identifier}...")
 
@@ -689,43 +706,34 @@ def get_plot_dir(cluster, iden):
         plot_dir.mkdir(parents=True, exist_ok=True)
     return plot_dir
 
+from mpdaf.obj import Image
 
-def load_flagged_megatab(filepath):
+def load_bb_image(clus, bbcenter, bbwidth):
     """
-    Load the megatable, either from a flagged running file or from the base file.
+    Load a broadband image cutout for a given cluster and specified center and width.
 
     Parameters
-    -----------
-    filepath: str or Path
-        The file path for the megatable PRIOR to flagging
-        e.g. '/path/to/megatable/lae_megatab_1fwhm.fits'
+    ----------
+    clus : str
+        Cluster name (e.g., 'A2744', 'MACS0416', etc.)
+    bbcenter : float
+        The central wavelength of the spectral range used to make the broadband image in Angstroms.
+    bbwidth : float
+        The half-width of the spectral range used to make the broadband image in Angstroms.
 
     Returns
-    --------
-    megatab: astropy.table.Table
-        The loaded megatable.
-    checkpoint: float
-        The checkpoint value loaded from the file or -1 if not found.
+    -------
+    mpdaf.obj.Image
+        The loaded broadband image as an MPDAF Image object.
     """
-    base_filename = filepath
-    running_filename = base_filename.replace('.fits', '_flag_run.fits')
-    base_path = Path(base_filename)
-    running_path = Path(running_filename)
+    # Construct the filename based on the cluster and broadband parameters
+    bb_filename = f"{clus}_bb_image_{bbcenter}A_{bbwidth}A.fits"
+    bb_path = get_misc_dir(clus) / bb_filename
 
-    if running_path.exists():
-        print(f"Loading megatable from running file: {running_filename}")
-        megatab = aptb.Table.read(running_filename)
-        checkpoint = megatab.meta.get('checkpoint', -1)
-    elif base_path.exists():
-        print(f"Loading megatable from base file: {base_filename}")
-        megatab = aptb.Table.read(base_filename)
-        checkpoint = -1
-    else:
-        raise FileNotFoundError(f"Neither {running_filename} nor {base_filename} exists.")
-    
-    # Make sure that columns are not masked (if they are, fill with NaN)
-    for col in megatab.colnames:
-        if isinstance(megatab[col], aptb.MaskedColumn) and 'f' in megatab[col].dtype.name:
-            megatab[col] = megatab[col].filled(np.nan)
-    
-    return megatab, checkpoint
+    if not bb_path.exists():
+        raise FileNotFoundError(f"Broadband image file not found: {bb_path}")
+
+    try:
+        return Image(str(bb_path))
+    except Exception as e:
+        raise FileNotFoundError(f"Error loading broadband image: {e}")

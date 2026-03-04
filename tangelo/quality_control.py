@@ -6,6 +6,8 @@ from . import io
 from . import image_processing as improc
 from . import plotting as plot
 from . import fitting
+from . import spectroscopy
+
 import astropy.table as aptb
 import astropy.units as u
 import numpy as np
@@ -304,43 +306,77 @@ def megatable_qc(megatab, features='default', return_report=False,
         return qc_megatab
     
 
-def normalised_distance(distance, brightness, exponent=0.5, magnitude=True):
+def contamination_score(distance_arcsec, apsum, iso_area_px, psf_fwhm_arcsec,
+                        hst_pixel_scale=0.03):
     """
-    Calculate the normalised distance to an object, taking into account its brightness.
+    Estimate the contamination score for a candidate foreground source: a proxy for how much
+    flux the source deposits at the target's position. Sources are ranked in descending order
+    of this score; the highest score is the most likely contaminant.
+
+    The model assumes an exponential (Sérsic n=1) surface brightness profile convolved with the
+    MUSE PSF. The effective scale radius is derived from the isophotal area measured by
+    SExtractor, which is available for all R21 catalogue sources regardless of whether elliptical
+    morphology parameters could be measured. Using the same method for all sources avoids biasing
+    the ranking towards particular source types.
 
     Parameters
     ----------
-    distance : astropy.units.Quantity
-        The angular distance to the object
-    brightness : float
-        The brightness of the object.
-    exponent : float, optional
-        The exponent to use for flux scaling (default is 0.5, which scales approximately with radius).
-    magnitude : bool, optional
-        Whether the brightness is given in magnitudes (default is True). If False, brightness is assumed 
-        to be in linear flux units.
+    distance_arcsec : float
+        Angular separation between the candidate source and the target, in arcseconds.
+    apsum : float
+        Total (absolute) flux measured within an aperture around the candidate source in the
+        MUSE white-light image. Used as a proxy for source brightness.
+    iso_area_px : float
+        Isophotal area of the source in HST pixels (``ISOAREAF_IMAGE`` from the R21 catalogue).
+        Floored at 1 pixel before use to avoid zero effective radii.
+    psf_fwhm_arcsec : float
+        FWHM of the MUSE PSF in arcseconds, used to set a minimum effective scale radius so
+        that unresolved (stellar) sources are correctly handled.
+    hst_pixel_scale : float, optional
+        HST pixel scale in arcseconds per pixel (default is 0.03"/px, matching the drizzled
+        pixel scale used in the R21 catalogues).
 
     Returns
     -------
     float
-        The normalised distance.
+        Contamination score. Higher values indicate a more likely contaminant.
     """
-    dist_arcsec = distance.to(u.arcsec)
-    if magnitude:
-        flux = 10**(-0.4 * brightness) # Convert magnitude to linear flux
-    else:
-        flux = brightness # Assume linear flux units
-
-    norm_dist = dist_arcsec.value / flux**(exponent)
-
-    return norm_dist
+    psf_sigma = psf_fwhm_arcsec / 2.355
+    # Effective radius from isophotal area, floored at 1 px to avoid zero
+    r_e = np.sqrt(max(iso_area_px, 1) / np.pi) * hst_pixel_scale  # arcsec
+    sigma_eff = np.sqrt(r_e**2 + psf_sigma**2)
+    score = apsum * np.exp(-distance_arcsec / sigma_eff) / sigma_eff
+    return score
 
 def find_nearby_sources(row, maxdist=5.0 * u.arcsec, flux_filter='HST_F814W'):
+    """
+    Find nearby sources from the R21 catalogue that could potentially contaminate the target spectrum based on
+    their proximity and brightness.
+    
+    Parameters
+    ----------
+    row : astropy.table.Row
+        The row from the megatable corresponding to the target source.
+    maxdist : astropy.units.Quantity, optional
+        The maximum distance to consider for nearby sources (default is 5 arcseconds).
+    flux_filter : str, optional
+        The filter to use for flux measurements (default is 'HST_F814W').
+
+    Returns
+    -------
+    astropy.table.Table
+        Table of nearby sources with their coordinates, magnitudes, and distances from the target.
+
+    """
 
     # First perform a preliminary check to see whether any sources in the R21 catalogue
     # are within maxdist of the target coordinates. This prevents us from having to load
     # the data cube to create an image if there are no nearby sources.
     clus = row['CLUSTER'] # Get cluster name from the input row
+
+    # If maxdist is just an integer or float, convert it to arcseconds
+    if not isinstance(maxdist, u.Quantity):
+        maxdist = maxdist * u.arcsec
 
     # Load the R21 cluster catalogue which contains foreground sources
     ortab = io.load_r21_catalogue(clus)
@@ -351,7 +387,9 @@ def find_nearby_sources(row, maxdist=5.0 * u.arcsec, flux_filter='HST_F814W'):
     target_dec = row['DEC']
     target_coord = SkyCoord(target_ra, target_dec, unit='deg')
 
-    ctab = aptb.Table() # Initialize empty table to hold close sources
+    ctab = aptb.Table([[] for _ in ortab.colnames],
+                      names=ortab.colnames,
+                      dtype=[ortab[col].dtype for col in ortab.colnames]) # Initialize empty table to hold close sources
 
     for crowidx, crow in enumerate(ortab):
         # Get galaxy coordinates and redshift
@@ -360,9 +398,8 @@ def find_nearby_sources(row, maxdist=5.0 * u.arcsec, flux_filter='HST_F814W'):
         galaxy_coord = SkyCoord(galaxy_ra, galaxy_dec, unit='deg')
         galaxy_z = crow['z']
 
-        # Calculate distance and normalised distance
+        # Calculate distance
         distance = target_coord.separation(galaxy_coord)
-        normdist = normalised_distance(distance, crow[f"MAG_ISO_{flux_filter}"])
         if distance.to(u.arcsec) > maxdist or galaxy_z > 2.9 or crow['zconf'] < 2:
             continue # Skip if too far, high redshift, or low confidence (indicating poor SNR)
         ortab['DIST'][crowidx] = distance.to(u.arcsec).value
@@ -372,29 +409,43 @@ def find_nearby_sources(row, maxdist=5.0 * u.arcsec, flux_filter='HST_F814W'):
 
     return ctab
 
-def find_strongest_contaminant(row, nearby_sources, image_size=5*u.arcsec, mask_radius=2):
+def find_strongest_contaminant(row, nearby_sources, image_size=5*u.arcsec, mask_radius=2, bbcenter=6000, bbrange=1000):
     """
     Find the likely strongest contaminant of the target source among a list of nearby sources
-    by creating a white light image from the MUSE cube surrrounding the target and identifying
-    the source with the smallest flux-normalised distance to the target in the image.
+    by creating a MUSE white-light image around the target and ranking candidates by their
+    estimated flux contribution at the target's position.
+
+    Each candidate is scored using an exponential (Sérsic n=1) surface brightness profile
+    convolved with the MUSE PSF, with an effective scale radius derived from the source's
+    isophotal area (``ISOAREAF_IMAGE``) measured in the R21 HST catalogue. This quantity is
+    available for all sources, avoiding the bias that would arise from using elliptical
+    morphology parameters (``A_WORLD``/``B_WORLD``) which are missing for many bright galaxies.
+    See :func:`contamination_score` for the full scoring formula.
 
     Parameters
     ----------
     row : astropy.table.Row
         The row from the megatable corresponding to the target source.
     nearby_sources : astropy.table.Table
-        Table of nearby sources with their coordinates, magnitudes, and distances from the target.
+        Table of nearby sources from the R21 catalogue, as returned by :func:`find_nearby_sources`.
+        Must contain ``RA``, ``DEC``, and ``ISOAREAF_IMAGE`` columns.
     image_size : astropy.units.Quantity, optional
         The size of the MUSE white light image cutout to create around the target (default is 5 arcseconds).
     mask_radius : float, optional
-        The radius (in units of the MUSE PSF FWHM) to use for masking nearby sources when fitting the contaminant 
-        profile (default is 2).
-    
+        The radius (in units of the MUSE PSF FWHM) to use for the aperture when measuring source
+        flux in the image (default is 2).
+    bbcenter : float, optional
+        The central wavelength for making the image for assessing the nearby sources (default is 6000 Å).
+    bbrange : float, optional
+        The half-width of the wavelength range used to make the image (default is 1000 Å).
+
     Returns
     -------
     astropy.table.Table
-        The input nearby_sources table with additional columns for normalised distance, brightness SNR, and image 
-        positions, sorted by normalised distance.
+        The input nearby_sources table with additional columns ``CONTAMSCORE`` (contamination score,
+        higher is more likely to contaminate), ``BRIGHTSNR`` (aperture SNR in the MUSE image),
+        ``IMPOS_X``, and ``IMPOS_Y`` (pixel positions in the cutout image), sorted by descending
+        contamination score.
     MPDAF.obj.Image
         The MUSE white light image cutout used for assessing the nearby sources.
     """
@@ -402,70 +453,118 @@ def find_strongest_contaminant(row, nearby_sources, image_size=5*u.arcsec, mask_
     iden = row['iden']
     idfrom = row['idfrom']
 
-    # Load the MUSE cube and create a white light image cutout of the given size
-    img = improc.make_muse_img(row, image_size * 2, verbose=False)
-    img_fwhm = improc.get_muse_psf(clus)
-    maskrad = mask_radius * img_fwhm
+    # Check to see whether a broadband MUSE image of the cluster already exists
+    try:
+        bb_image = io.load_bb_image(clus, bbcenter, bbrange)
+        img = bb_image.subimage(center=(row['DEC'], row['RA']), size=image_size.value * 2)
+    except FileNotFoundError:
+        print(f"No existing broadband image found for {clus} at {bbcenter}±{bbrange} Å. "
+              f"Creating new image cutout for contamination assessment.")
+        # Load the MUSE cube and create a white light image cutout of the given size
+        img = improc.make_muse_img(row, image_size.value * 2, lcenter=bbcenter, width=bbrange, verbose=False)
+    
+    img_fwhm = improc.get_muse_psf(clus) # Get the MUSE PSF FWHM for the cluster to use in scoring and aperture size
+    maskrad = mask_radius * img_fwhm # Set the aperture radius for measuring source brightness in the MUSE image based on the PSF size
 
     # Use the white light image to assess the brightness and proximity of nearby sources.
-    normdists = []
+    contamscores = []
     brightsnrs = []
     image_positions = []
     for crow in nearby_sources:
-        # Get source position
+        # Get source position in sky and image coordinates
         galaxy_ra = crow['RA']
         galaxy_dec = crow['DEC']
         cpos = SkyCoord(galaxy_ra, galaxy_dec, unit='deg')
         cimpos = cpos.to_pixel(WCS(img.wcs.to_header()))
         image_positions.append(cimpos)
 
-        # Get source flux and calculate brightness SNR in the image
-        cimcirc = improc.create_circular_mask(np.shape(img.data), cimpos[::-1], maskrad / 0.2)
-        distance = np.sqrt((row['RA'] - galaxy_ra)**2 + (row['DEC'] - galaxy_dec)**2) * 3600.
+        # Measure aperture flux and SNR in the MUSE image
+        cimcirc = improc.create_circular_mask(np.shape(img.data.data), cimpos[::-1], maskrad / 0.2)
+        distance = np.sqrt((row['RA'] - galaxy_ra)**2 + (row['DEC'] - galaxy_dec)**2) * 3600.  # arcsec
         apsum = np.abs(np.nansum(img.data.data[cimcirc]))
         aperr = np.sqrt(np.nansum(img.var.data[cimcirc]))
         apsnr = apsum / aperr
-        brightsnrs.append(apsnr) # Store the brightness SNR for later use in masking and flagging
-        
-        if distance <= img_fwhm and apsnr > 10.:
-            # For very close and bright sources, assign a negative normalised distance as they are
-            # highly likely to contaminate the target spectrum.
-            normdists.append(-1. / np.sqrt(apsum))
-        else:
-            normdists.append(distance / np.sqrt(apsum))
+        brightsnrs.append(apsnr)  # Store the brightness SNR for later use in masking and flagging
 
-    # Add columns for normalised distance, brightness SNR, and image positions to the nearby sources table
-    nearby_sources.add_column(Column(normdists, name='BRIGHTDIST'))
+        # Score the candidate using an exponential surface brightness profile convolved with the PSF,
+        # with effective radius derived from the isophotal area in the HST catalogue.
+        score = contamination_score(distance, apsum, crow['ISOAREAF_IMAGE'], img_fwhm)
+        contamscores.append(score)
+
+    # Add columns for contamination score, brightness SNR, and image positions to the nearby sources table
+    nearby_sources.add_column(Column(contamscores, name='CONTAMSCORE'))
     nearby_sources.add_column(Column(brightsnrs, name='BRIGHTSNR'))
     nearby_sources.add_column(Column([pos[0] for pos in image_positions], name='IMPOS_X'))
     nearby_sources.add_column(Column([pos[1] for pos in image_positions], name='IMPOS_Y'))
-    # Sort the nearby sources by normalised distance to find the most likely contaminant (smallest normalised distance)
-    nearby_sources.sort(keys='BRIGHTDIST', reverse=False)
+    # Sort descending: highest contamination score = most likely contaminant
+    nearby_sources.sort(keys='CONTAMSCORE', reverse=True)
 
     return nearby_sources, img
+    
+def get_initial_sersic_params(contaminant, img, ccmem_impos, rough_rad):
+    # Get initial parameters + bounds for fitting Sersic to contaminant
 
-def estimate_n(z):
-    """
-    Estimate the Sersic index 'n' based on the redshift 'z'. This helps to fit gaussian-like profiles
-    for nearby sources which are likely to be foreground stars.
+    # sersic_fixed = { # Dictionary that specifies which parameters to fix
+    #     # 'n': False,
+    #     # 'x_0': True, # Always fix the center based on R21 coords as they are accurate
+    #     # 'y_0': True,
+    #     # 'amplitude': True,
+    # }
 
-    Parameters
-    ----------
-    z : float
-        Redshift of the source.
-
-    Returns
-    -------
-    n : float
-        Estimated Sersic index.
-    """
-    if z < 0.01:
-        return 0.5
+    # Get initial guess for position and amplitude based on the position and value of the maximum 
+    # within a small circle around the R21 position
+    tight_mask = improc.create_circular_mask(np.shape(img.data.data), ccmem_impos, 3)
+    local_max = np.nanmax(img.data.data[tight_mask])
+    amp_guess = np.abs(local_max) / 2  # Start with a guess of half the maximum pixel value in the region as the amplitude
+    local_peak = np.where((img.data.data == local_max) & tight_mask)
+    if len(local_peak[0]) == 0:
+        x0_guess, y0_guess = ccmem_impos[0], ccmem_impos[1] # If no valid local maximum is found, fall back to the R21 position
     else:
-        return 2.0
+        x0_guess  = np.where((img.data.data == local_max) & tight_mask)[1][0] # Get x position of the maximum pixel value
+        y0_guess = np.where((img.data.data == local_max) & tight_mask)[0][0] # Get y position of the maximum pixel value
 
-def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_coord=None, target_iden=None,
-                                    target_clus=None, plot_result=False, aper_radius=1):
+    # If ellipticity information is available, use it to inform the initial guesses for ellip and theta
+    if contaminant['A_WORLD'] > 0 and contaminant['B_WORLD'] > 0:
+        ellip_guess = np.nanmax([1 - (contaminant['B_WORLD'] / contaminant['A_WORLD']), 0.1]) # Floor ellipticity at 0.1 to avoid perfectly circular profiles which can cause fitting issues
+        ellip_guess = np.nanmin([ellip_guess, 0.5]) # Cap ellipticity at 0.5 to avoid extremely elongated profiles which can also cause fitting issues
+        theta_guess = -np.radians(contaminant['THETA_J2000'])
+    else:
+        ellip_guess = 0.1 # Default to a slightly elliptical profile if no information is available
+        theta_guess = 0.0
+
+    initial_guesses = {
+        'r_eff': rough_rad / 10,
+        'amplitude': amp_guess,
+        'x_0': x0_guess,
+        'y_0': y0_guess,
+        'theta': theta_guess,
+        'ellip': ellip_guess,
+        'n': 1
+    }
+
+    pos_bounds = ((initial_guesses['x_0'] - 2.5, initial_guesses['x_0'] + 2.5), 
+                  (initial_guesses['y_0'] - 2.5, initial_guesses['y_0'] + 2.5)) # Allow position to vary within a 5x5 pixel
+        # box around the initial position
+    sersic_bounds = {
+        'amplitude': (0, 10 * np.nanmax(img.data.data)), # Amplitude must be positive, upper bound is arbitrary but should be well above the brightest sources in the image
+        'x_0': pos_bounds[0],
+        'y_0': pos_bounds[1],
+        'n': (0.5, 4.0),
+        'ellip': (0, 0.7), # Allow for some ellipticity but not extreme values
+        'theta': (-np.pi / 2, np.pi / 2),
+        'r_eff': (0.1, rough_rad * 2)
+    }
+
+    if contaminant['z'] < 0.01:
+        # Local sources are often stars, so adjust initial guess and bounds for n=0.5
+        initial_guesses['n'] = 0.5
+        sersic_bounds['n'] = (0.3, 1.0)
+
+    return initial_guesses, sersic_bounds
+
+def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_iden, mask_radius=2, 
+                                    target_coord=None, plot_result=False, aper_radius=1, outlier_removal=True,
+                                    outlier_kwargs={'niter': 3, 'sigma_upper': 3.0}, bbcenter=6000, bbwidth=1000):
     """
     Estimate the spectrum of the most likely contaminating source by fitting a Sersic profile
     to the MUSE white light image and scaling a spectrum of the contaminant (taken from the 
@@ -477,27 +576,44 @@ def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_c
         Table of nearby sources sorted by normalised distance, with columns for brightness SNR and image positions.
     img : MPDAF.obj.Image
         The MUSE white light image cutout containing the target and nearby sources.
+    target_clus : str
+        Cluster identifier for the target source. Used for PSF estimation and other cluster-specific parameters.
     mask_radius : float, optional
         The radius (in units of the MUSE PSF FWHM) to use for masking nearby sources when fitting the contaminant profile (default is 2).
     target_coord : astropy.coordinates.SkyCoord, optional
         The sky coordinates of the target source. If provided, this will be used to define the aperture for scaling the contaminant spectrum. If None, the target position in the image will be used
     target_iden : str, optional
         Identifier for the target source. Used for labeling plots and outputs.
-    target_clus : str, optional
-        Cluster identifier for the target source. Used for PSF estimation and other cluster-specific parameters.
     plot_result : bool, optional
         Whether to plot the fitted Sersic profile and contaminant spectrum (default is False).
     aper_radius : float, optional
         The radius (in units of the MUSE PSF FWHM) of the aperture around the target position to use for scaling 
         the contaminant spectrum (default is 1).
+    outlier_removal : bool, optional
+        Whether to perform outlier removal on the image data before fitting the Sersic profile (default is True).
+    outlier_kwargs : dict, optional
+        Dictionary of keyword arguments to pass to the outlier removal function (default: {'niter': 3, 'sigma_upper': 3.0}).
+    bbcenter : float, optional
+        The central wavelength for the broadband normalization (default is 6000). This should be the same as the bbcenter 
+        used for creating the MUSE white light image to ensure consistent flux scaling.
+    bbwidth : float, optional
+        The width of the broadband normalization (default is 1000). This should be the same as the bbrange used for 
+        creating the MUSE white light image to ensure consistent flux scaling.
+
+    Returns
+    -------
+    contaminant_spec : astropy.table.Table
+        The estimated spectrum of the contaminant, scaled to match the flux of the fitted Sersic profile within
+        the aperture around the target.
 
     """
     contaminant = nearby_sources[0] # The most likely contaminant is the closest source in normalised distance
     other_sources = nearby_sources[1:] # The other nearby sources that are not the closest contaminant
 
-    maskrad = mask_radius * improc.get_muse_psf(contaminant['CLUSTER'])
+    img_fwhm = improc.get_muse_psf(target_clus)
+    maskrad = mask_radius * img_fwhm
     maskrad_pix = maskrad / 0.2 # Convert mask radius to pixels (assuming MUSE pixel scale of 0.2 arcsec/pixel)
-    aperrad = aper_radius * improc.get_muse_psf(contaminant['CLUSTER'])
+    aperrad = aper_radius * img_fwhm
     aperrad_pix = aperrad / 0.2 # Convert aperture radius to pixels
 
     # Mask all other nearby sources
@@ -507,41 +623,31 @@ def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_c
             # Only mask if the source isn't too far from the selected contaminant -- otherwise may mask the
             # contaminant itself.
             img.mask_region((mem['DEC'], mem['RA']), maskrad)
-    if contaminant['BRIGHTDIST'] < 0.:
+
+    # Warn if the top-ranked contaminant is unresolved from the target (separation < 1 PSF FWHM)
+    if contaminant['DIST'] < img_fwhm and contaminant['BRIGHTSNR'] > 10.:
         print(f"Warning: The closest source is within the FWHM of the PSF and has a high SNR.")
         print(f"Spectra of contaminant and target may not be reliably separated.")
 
-    # Get initial parameters + bounds for fitting Sersic to contaminant
+    # Get the position of the contaminant in pixel coordinates and an estimate of its effective 
+    # radius based on the isophotal area. 
     ccmem_pos = SkyCoord(contaminant['RA'], contaminant['DEC'], unit='deg')
     ccmem_impos = ccmem_pos.to_pixel(WCS(img.wcs.to_header()))
     rough_rad = np.nanmax([np.sqrt(contaminant['ISOAREAF_IMAGE'] / np.pi), 1.0]) # minimum radius of 1 pixel
-    sersic_bounds = {
-        'n': (1.0, 4.0),
-        'ellip': (0, 0.2),
-        'theta': (-np.pi, np.pi),
-        'r_eff': (0.1, 2 * rough_rad)
-    }
-    sersic_fixed = { # Dictionary that specifies which parameters to fix
-        'n': False,
-        'x_0': True, # Always fix the center based on R21 coords as they are accurate
-        'y_0': True,
-        'amplitude': True,
-    }
-    if contaminant['z'] < 0.01:
-        # For local sources, which are likely stars, fix sersic index to 0.5 to ensure gaussian profile.
-        sersic_fixed['n'] = True
-        sersic_fixed['amplitude'] = False
-    initial_guesses = {
-        'r_eff': rough_rad,
-        'amplitude': 1.0,
-        'theta': 0.0,
-        'ellip': 0.0,
-        'n': estimate_n(contaminant['z'])
-    }
+
+    initial_guesses, sersic_bounds = get_initial_sersic_params(contaminant, img, ccmem_impos, rough_rad)
 
     print(f"Fitting Sersic profile to the most likely contaminant...")
-    sersic = fitting.fit_sersic(img.data, ~img.mask, ccmem_impos, initial_guesses['amplitude'], initial_guesses['r_eff'], 
-                            initial_guesses['theta'], initial_guesses['ellip'], initial_guesses['n'], bounds=sersic_bounds)
+    sersic = fitting.fit_sersic(img.data, ~img.mask, (initial_guesses['x_0'], initial_guesses['y_0']),
+                                initial_guesses['amplitude'], 
+                                initial_guesses['r_eff'], initial_guesses['theta'], initial_guesses['ellip'], 
+                                initial_guesses['n'], bounds=sersic_bounds, outlier_removal=outlier_removal, 
+                                outlier_kwargs=outlier_kwargs)
+    
+    # If we used outlier removal, sersic is a tuple, so we need to take the first element
+    if isinstance(sersic, tuple):
+        sersic = sersic[0]
+    
     print(f"Fitted the following profile:\n")
     for k, par in enumerate(sersic.param_names):
         print(f"{par} \t {sersic.parameters[k]}")
@@ -556,44 +662,189 @@ def estimate_contaminating_spectrum(nearby_sources, img, mask_radius=2, target_c
     else:
         target_img_coord = target_coord.to_pixel(WCS(img.wcs.to_header()))
 
-
+    # Show figure with data, model, and residual of Sersic model if desired
     if plot_result:
+        print(f"Generating figure of fitted Sersic profile and contaminant spectrum...")
         plot.plot_2d_model(img, sersic_img, markers=ccmem_impos, iden=target_iden, cluster=target_clus,
-                           aperture=(target_img_coord, aperrad_pix))
+                           aperture=(target_img_coord, aperrad_pix), save_plot=True)
     
     # We now need to sum the Sersic profile over the aperture containing the target
-    mod_apersum = np.ma.sum(
-        np.ma.masked_array(
-            data=sersic_img,
-            mask=~improc.create_circular_mask(
-                sersic_img, (target_img_coord[1], target_img_coord[0]), aperrad_pix
-            )
-        )
-    )
+    aper_mask = improc.create_circular_mask(np.shape(img.data), target_img_coord, aperrad_pix)
+    mod_apersum = np.nansum(sersic_img[aper_mask])
 
+    # Get the spectrum of the contaminant made by R21 with weighting and sky subtraction
     contaminant_spec = io.load_r21_spec(target_clus, contaminant['iden'], contaminant['idfrom'],
-                                        spec_type='noweight_skysub')
+                                        spec_type='weight_skysub')
     
-    # Normalise the model by flux
-    normrange = np.logical_and(bbcenter - bbrange < contaminant_spec['wavelength'], contaminant_spec['wavelength'] < bbcenter + bbrange)
+    # Normalise the model by flux over a specified wavelength range
+    normrange = (bbcenter - bbwidth < contaminant_spec['wave']) & (contaminant_spec['wave'] < bbcenter + bbwidth)
     contaminant_spec['spec'] /= np.nanmean(contaminant_spec['spec'][normrange])
     contaminant_spec['spec'] *= mod_apersum
 
-    fig, ax = plt.subplots(figsize = (24,4), facecolor='w')
-    ax.step(contaminant_spec['wavelength'], contaminant_spec['spec'], where='mid')
-    ax.errorbar(contaminant_spec['wavelength'], contaminant_spec['spec'], 
-                yerr = 0., linestyle='', color='gray',
-                capsize=0.)
-    ax.set_xlabel(r"Wavelength ($\AA$)")
-    ax.set_ylabel(r"Flux density ($10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$\,\AA$^{-1}$)")
-    ax.set_title(f"Possible contaminant spectrum (ID: {contaminant['idfrom'][0]}{contaminant['iden']})")
-    plt.show()
+    plot.plot_muse_spectrum(contaminant_spec['wave'], contaminant_spec['spec'], contaminant_spec['spec_err'],
+                            save_plot=True, save_dir=io.get_plot_dir(cluster=target_clus, iden=target_iden),
+                            plot_name='contaminant_spectrum.png')
+    
+    # Save the contaminant spectrum for later use in checking for contaminant lines in the target spectrum
+    contaminant_spec.write(io.get_misc_dir(cluster=target_clus) / f"{target_iden}_contaminant_spec.fits", overwrite=True)
+
+    return contaminant_spec
+
+from . import constants, models
+from scipy.optimize import curve_fit
+
+wavedict = constants.wavedict
+
+def bound(sign):
+    """
+    Get the bounds for fitting a gaussian to the contaminant spectrum based on the sign of the line in the target spectrum.
+
+    Parameters
+    ----------
+    sign : int
+        The sign of the line in the target spectrum (positive for emission, negative for absorption).
+
+    Returns    
+    -------
+    tuple
+        The lower and upper bounds for the amplitude of the gaussian fit to the contaminant spectrum.
+    """
+    if sign == +1:
+        return 0, np.inf
+    if sign == -1:
+        return -np.inf, 0
+
+def check_contamination(row, contaminating_spec, target_spec, save_plot=True):
+    """
+    Check whether any lines in the target spectrum that are significant (SNR > 3) could potentially be caused by 
+    contamination from the contaminant spectrum by fitting a gaussian to the contaminant spectrum at the same 
+    wavelength and checking whether there is a significant feature with the same sign in the contaminant spectrum.
+
+    Parameters
+    ----------
+    row : astropy.table.Row
+        The row from the megatable corresponding to the target source.
+    contaminating_spec : astropy.table.Table
+        The estimated spectrum of the contaminant source, with columns 'wave', 'spec', and 'spec_err'.
+    target_spec : astropy.table.Table
+        The spectrum of the target source, with columns 'wave', 'spec', and 'spec_err'.
+    save_plot : bool, optional
+        Whether to save the plots of the line fits (default is True).
+
+    Returns
+    -------
+    list
+        A list of contaminated lines.
+    """
+    iden = row['iden']
+    cluster = row['CLUSTER']
+
+    # Initialise list to store contaminated lines
+    contaminated_lines = []
+    
+    print(f"Attempting to match lines in target spectrum with contaminant...")
+    fig = plt.figure(figsize=(13,30), facecolor='w')
+    counter = 0
+    for col in row.colnames:
+        if 'SNR_' not in col:
+            continue
+        if not np.abs(row[col]) > 3.0:
+            continue # Only check lines that are significant in the target spectrum
+
+        lname = col.split('_')[1] # Get line name from column name
+        print(f"Checking the {lname} line...")
+
+        # Initialize fit properties for the target line from the megatable
+        fitprops = {
+            'LPEAK': 0.,
+            'FWHM': 0.,
+            'FLUX': 0.,
+            'SNR': 0.,
+            'CONT': 0.,
+            'SLOPE': 0.
+        }
+        for p in fitprops.keys():
+            fitprops[p] = row[f"{p}_{lname}"]
+        sign = np.sign(fitprops['SNR']) # Get the sign of the line based on the SNR (positive for emission, negative for absorption)
+        # Define a wavelength region around the line peak to check for contamination in the contaminant spectrum
+        linereg = np.logical_and(fitprops['LPEAK'] - 100 < contaminating_spec['wave'], 
+                                    contaminating_spec['wave'] < fitprops['LPEAK'] + 100)
+        
+        axnew = fig.add_subplot(10,5,counter+1)
+        counter += 1 # Counter to keep track of subplot index
+
+        targ_wl = target_spec['wave'][linereg]
+        targ_flux = target_spec['spec'][linereg]
+        targ_specerr = target_spec['spec_err'][linereg]
+
+        # Make a plot of the line from the target spectrum
+        plot.plot_muse_spectrum(targ_wl, targ_flux, targ_specerr, ax=axnew, label=lname, 
+                                color='navy', alpha=0.5)
+
+        # Extract the contaminant spectrum in the defined wavelength region around the line peak
+        ccmem_wl = contaminating_spec['wave'][linereg]
+        ccmem_flux = contaminating_spec['spec'][linereg]
+        ccmem_specerr = contaminating_spec['spec_err'][linereg]
+
+        # The relevant noise for estimating the significance of features in the contaminant spectrum is the error 
+        # on the target spectrum itself, as we are trying to determine whether any features in the contaminant 
+        # spectrum are significant enough to be mistaken for the line in the target spectrum.
+        ccmem_specerr = targ_specerr
+
+        # Make a plot of the contaminant spectrum in the same wavelength region
+        plot.plot_muse_spectrum(ccmem_wl, ccmem_flux, ccmem_specerr, ax=axnew, label='Contaminant',
+                                color='teal', alpha=0.5)
+        if np.nanmax(ccmem_flux / ccmem_specerr) < 3.0:
+            # This checks whether there are any spectral channels in which the contaminant spectrum contributes
+            # a statistically significant flux. If not, we skip this line.
+            print(f"Contaminant spectrum is insignificant, skipping fit.")
+            continue
+
+        # Now fit a similar model (same lpeak) to the contaminant spectrum to see if there is a significant feature at 
+        # the same wavelength.
+        local_median = np.nanmedian(ccmem_flux)
+        targz = row['z']
+        velaxis = spectroscopy.wave2vel(ccmem_wl, wavedict[lname], redshift=targz)
+        fit_reg = np.logical_and(-2000. < velaxis, velaxis < 2000.) * (~np.isnan(ccmem_flux)) * (~np.isnan(ccmem_specerr))
+        fit, fitcov = curve_fit(lambda x,f,w,c,s: models.gaussian(x,f,fitprops['LPEAK'],w,c,s),
+                                ccmem_wl[fit_reg], ccmem_flux[fit_reg], sigma = ccmem_specerr[fit_reg], 
+                                absolute_sigma=True, p0 = [fitprops['FLUX'], fitprops['FWHM'], local_median, 0.],
+                                bounds=[[bound(sign)[0], 2.0, -np.inf, -np.inf], 
+                                        [bound(sign)[1], 5 * fitprops['FWHM'], np.inf, np.inf]],
+                                max_nfev=10000)
+        
+        # Checks to make sure the fit is (i) significant and (ii) has the right sign to potentially be the 
+        # cause of the putative line in the target spec.
+        checks = {
+            'significant': np.abs(fit[0] / np.sqrt(np.abs(fitcov[0,0]))) > 3.0,
+            'right sign': np.sign(fit[0]) == sign
+        }
+        if all(list(checks.values())):
+            print(f"Found a significant fit at the same wavelength in the contaminant spec.")
+            contaminated_lines.append(lname)
+        
+        # Plot the fit to the contaminant spectrum
+        highreswl = np.arange(np.nanmin(ccmem_wl), np.nanmax(ccmem_wl), 0.05)
+        modplot = models.gaussian(highreswl, fit[0], fitprops['LPEAK'], fit[1], fit[2], fit[3])
+        axnew.plot(highreswl, modplot, linestyle = '--', color='maroon', alpha=0.4)
+        
+        axnew.legend()
+    
+    if save_plot:
+        plot_dir = io.get_plot_dir(cluster=cluster, iden=iden)
+        fig.savefig(f"{plot_dir}/{row['iden']}_contaminants.pdf", bbox_inches='tight')
+    plot.safe_show()
     plt.close()
 
+    return contaminated_lines
 
+from astropy.io import fits
+from pathlib import Path
 
-def flag_contamination_overhauled(megatab, maxdist=5.0 * u.arcsec, flux_filter='HST_F814W',
-                                  spec_source='APER', spec_type='1fwhm_opt', save_checkpoint=True):
+def flag_contamination(megatab, maxdist=5.0 * u.arcsec, imgbuff=1.0 * u.arcsec, flux_filter='HST_F814W',
+                        spec_source='APER', spec_type='1fwhm_opt', bbcenter=6000, bbwidth=1000,
+                        save_contamination_plots=True, use_existing_contaminant_spectra=False, plot_model=True,
+                        save_bb_images=False, outlier_removal=True, outlier_kwargs={'niter': 3, 'sigma_upper': 3.0}):
     """
     Flag likely cases of contaminated emission/absorption lines using the spectrum of the most likely
     contaminating source based on proximity and brightness and comparing its spectrum with target
@@ -603,144 +854,140 @@ def flag_contamination_overhauled(megatab, maxdist=5.0 * u.arcsec, flux_filter='
     ----------    
     megatab : astropy.table.Table
         The megatable containing the target sources and their fit results.
+    maxdist : astropy.units.Quantity or float, optional
+        The maximum distance to consider for nearby sources that could be contaminants (default is 5 arcseconds).
+        If a float is provided, it will be assumed to be in arcseconds.
+    imgbuff : astropy.units.Quantity or float, optional
+        The buffer distance around the target source to consider when making the image for assessing nearby sources 
+        (default is 1 arcsecond). If a float is provided, it will be assumed to be in arcseconds.
     flux_filter : str, optional
         The filter to use for flux measurements (default: 'HST_F814W').
     spec_source : str, optional
         The source of the spectrum (default: 'APER').
     spec_type : str, optional
         The type of the spectrum (default: '1fwhm_opt').
-    save_checkpoint : bool, optional
-        Whether to save a checkpoint of the megatable after flagging each source (default: True).
+    bbcenter : float, optional
+        The central wavelength used to make the image for assessing the nearby sources (default is 6000).
+    bbwidth : float, optional
+        The half-width of the wavelength range used to make the image for assessing the nearby sources (default is 1000).
+    use_existing_contaminant_spectra : bool, optional
+        Whether to use existing contaminant spectra if they have already been estimated and saved (default: False). 
+        If True, the function will look for saved contaminant spectra and use them if available, rather than re-estimating 
+        the contaminant spectrum from the MUSE image.
+    plot_model : bool, optional
+        Whether to plot the fitted Sersic profile for the contaminant and the contaminant spectrum (default: True).
+    save_contamination_plots : bool, optional
+        Whether to save plots of the contamination checks for each source (default: True)
+    save_bb_images : bool, optional
+        Whether to save broad-band images used for contamination assessment (default: False).
+    outlier_removal : bool, optional
+        Whether to perform outlier removal when fitting the Sersic profile to the contaminant in the MUSE image 
+        (default: True).
+    outlier_kwargs : dict, optional
+        Dictionary of keyword arguments to pass to the outlier removal function (default: {'niter': 3, 'sigma_upper': 3.0}).
 
     Returns
     -------
         None
 
     """
+    # Convert maxdist and imgbuff to astropy quantities if they are provided as floats
+    if isinstance(maxdist, (int, float)):
+        maxdist = maxdist * u.arcsec
+    if isinstance(imgbuff, (int, float)):
+        imgbuff = imgbuff * u.arcsec
+
+    # Make sure that FLAG columns are of datatype string
+    for col in megatab.colnames:
+        if 'FLAG_' in col and megatab[col].dtype != 'str':
+            megatab[col] = megatab[col].astype(str)
+
+    # Rearrange the table by cluster to minimise number of times we need to load MUSE cubes
+    # (the cubes persist in memory as we loop through sources in the same cluster, so we only need to load each cube once)
+    megatab.sort('CLUSTER')
+
     for rowidx, row in enumerate(megatab):
         clus = row['CLUSTER']
         iden = row['iden']
         idfrom = row['idfrom']
 
-        # Get nearby sources from the catalogues
-        nearby_sources = find_nearby_sources(row, maxdist=maxdist, flux_filter=flux_filter)
+        print("\n" + "="*80)
+        print(f"Checking for contamination in {clus} object {iden}...")
 
-        if len(nearby_sources) == 0:
-            print(f"No nearby sources found for {clus} object {iden}. Skipping contamination check.")
-            continue
-        
-        # Find the likely strongest contaminant based on a white light image made from the MUSE cube
-        nearby_sources, img = find_strongest_contaminant(row, nearby_sources, image_size=maxdist)
-        contaminating_spec = estimate_contaminating_spectrum(nearby_sources, img)
+        # If requested, generate a broadband image for the cluster and save to disc. This removes the need to 
+        # constantly re-load the MUSE cube to generate images
+        if save_bb_images:
+            bb_image_path = io.get_misc_dir(cluster=clus) / f"{clus}_bb_image_{bbcenter}A_{bbwidth}A.fits"
+            if not bb_image_path.exists():
+                print(f"Generating broadband image for {clus} at {bbcenter}±{bbwidth} Å and saving to {bb_image_path}...")
+                _ = improc.make_bb_image(clus, bbcenter, bbwidth, save=True)
+
+        # Check to see if a contaminant spectrum has already been estimated and saved for this target, and load it if desired
+        contaminant_spec_path = io.get_misc_dir(cluster=clus) / f"{iden}_contaminant_spec.fits"
+        if use_existing_contaminant_spectra and contaminant_spec_path.exists():
+            print(f"Loading existing contaminant spectrum for {clus} object {iden} from {contaminant_spec_path}")
+            contaminant_spec_hdul = fits.open(contaminant_spec_path)
+            contaminating_spec = aptb.Table(contaminant_spec_hdul[1].data)
+        else:
+            # Find the likely strongest contaminant based on a white light image made from the MUSE cube
+            # Get nearby sources from the catalogues
+            print(f"Finding nearby sources within {maxdist}...")
+            nearby_sources = find_nearby_sources(row, maxdist=maxdist, flux_filter=flux_filter)
+
+            if len(nearby_sources) == 0:
+                print(f"No nearby sources found for {clus} object {iden}. Skipping contamination check.")
+                continue
+
+            print(f"Found {len(nearby_sources)} nearby sources. Assessing the most likely contaminant...")
+            nearby_sources_sorted, img = find_strongest_contaminant(row, nearby_sources, image_size=maxdist, 
+                                                                    bbcenter=bbcenter, bbrange=bbwidth)
+            
+            print(f"Estimating the contaminant spectrum for {clus} object {iden}...")
+            try:
+                # Estimate contaminant spectrum over an aperture of radius 1fwhm
+                contaminating_spec = estimate_contaminating_spectrum(nearby_sources_sorted, img, clus, iden, 
+                                                                     bbcenter=bbcenter, bbwidth=bbwidth, 
+                                                                     plot_result=plot_model,
+                                                                     outlier_removal=outlier_removal, 
+                                                                     outlier_kwargs=outlier_kwargs)
+            except fitting.BadDataError as e:
+                # If the Sersic fitting fails due to bad data (e.g. all pixels masked), we catch the error and 
+                # skip the contamination check for this source, rather than crashing the entire script.
+                print(f"Error estimating contaminant spectrum: {e}")
+                continue
+
+        # If N_fwhm > 1, scale the contaminant up by appropriate factor
+        N_fwhm = float(spec_type.split('fwhm')[0])
+        if N_fwhm > 1:
+            print(f"Scaling contaminant spectrum by factor of {N_fwhm} to match the aperture size of the target spectrum...")
+            contaminating_spec['spec'] *= N_fwhm
+            contaminating_spec['spec_err'] *= N_fwhm
 
         # Load the target spectrum and to obtain error bars for the contaminant spectrum. This
         # step is vital, as uncertainties in the actual target spectrum are needed to determine
         # whether the contaminant spectrum contributes statistically significant features.
         target_spec = io.load_spec(clus, iden, idfrom, spec_source=spec_source, spec_type=spec_type)
 
-        check_contamination(megatab, row, rowidx, contaminating_spec, target_spec)
-
-
-
-
-
-
-def check_contamination(megatab, maxdist=5.0, imgbuff=2.0, bbrange=100, maskrad=1.0, 
-                       skiplist=[], save_checkpoint=True):
-    """
-    
-    """
-
-    for rowidx, row in enumerate(megatab):
-        iden = row['iden']
-        cluster = row['CLUSTER']
-
-        if rowidx in skiplist:
-            print(f"{iden} from cluster {cluster} in skiplist. Skipping.")
+        # If the contaminating spectrum doesn't contribute statistically significant flux
+        # to the target, skip the contamination check to save time.
+        if np.nanmax(contaminating_spec['spec'] / target_spec['spec_err']) < 3.0:
+            print(f"Contaminant spectrum does not contribute statistically significant flux to the target spectrum. "
+                  f"Skipping contamination check.")
             continue
 
-        print(f"Searching for possible contaminants for {cluster} object {iden}.")
+        print(f"Checking for contaminated lines...")
+        contaminated_lines = check_contamination(row, contaminating_spec, target_spec, save_plot=save_contamination_plots)
 
-        ccmems = find_closest_cluster_member(row, maxdist = maxdist * u.arcsec, return_all = True)
-        print(f"Found {len(ccmems)} candidates.")
-        if not ccmems:
-            print(f"No potential contaminants within {maxdist} arcseconds! Moving to next object.")
+        if len(contaminated_lines) == 0:
+            print(f"No contaminated lines found for {clus} object {iden}.")
             continue
-        ccmem = ccmems[0]
-        print(f"Found closest source at z = {ccmem['z']:.3f}")
 
-        fig, axs = plt.subplots(1,2,figsize = (11,4), facecolor='w')
-        ax = axs[0]
-        whtimg = mf.make_muse_img(row, 2 * (maxdist + imgbuff), bbcenter, bbrange)
-        #add brightnesses based on our pseudo-broadband image:
-        
-        print(f"Attempting to match lines in target spectrum with contaminant...")
-        fig = plt.figure(figsize=(13,30), facecolor='w')
-        counter = 0
-        for col in row.colnames:
-            if 'SNR_' not in col:
-                continue
-            if not np.abs(row[col]) > 3.0:
-                continue
-            lname = col.split('_')[1]
-            print(f"Checking the {lname} line...")
-            fitprops = {
-                'LPEAK': 0.,
-                'FWHM': 0.,
-                'FLUX': 0.,
-                'SNR': 0.,
-                'CONT': 0.,
-                'SLOPE': 0.
-            }
-            for p in fitprops.keys():
-                fitprops[p] = row[f"{p}_{lname}"]
-            sign = np.sign(fitprops['SNR'])
-            linereg = np.logical_and(fitprops['LPEAK'] - 100 < ccmem_spec['wavelength'], 
-                                     ccmem_spec['wavelength'] < fitprops['LPEAK'] + 100)
-            axnew = fig.add_subplot(10,5,counter+1)
-            counter += 1
-            ccmem_wl = ccmem_spec['wavelength'][linereg]
-            ccmem_flux = ccmem_spec['spec'][linereg]
-            ccmem_specerr = ccmem_spec['error'][linereg]
-            targspec = mf.plotline(row['iden'], row['CLUSTER'], fitprops['LPEAK'], axnew, spec_source = 'R21', plot_cluslines=False,
-                           plot_bkg=False, plot_sky=False, plot_clusspec=False, normalise=False, label='putative '+lname,
-                           model = [mf.gauss, fitprops['FLUX'], fitprops['LPEAK'], fitprops['FWHM'], fitprops['CONT'], fitprops['SLOPE']],
-                           return_spectrum = True)
-            ccmem_specerr = targspec['spec_err']
-            axnew.step(ccmem_wl, ccmem_flux, alpha=0.7, where='mid', color='teal', label='contaminant spectrum')
-            axnew.errorbar(ccmem_wl, ccmem_flux, alpha=0.5, yerr = ccmem_specerr, color='teal')
-            if np.nanmax(ccmem_flux / ccmem_specerr) < 3.0:
-                print(f"Contaminant spectrum is insignificant, skipping fit.")
-                continue
-            #now fit a similar model (same lpeak) to the contaminant spectrum:
-            local_median = np.nanmedian(ccmem_flux)
-            targz = row['z']
-            velaxis = mf.wave2vel(ccmem_wl, fitprops['LPEAK'] / (1 + targz), z=targz)
-            fit_reg = np.logical_and(-2000. < velaxis, velaxis < 2000.) * (~np.isnan(ccmem_flux)) * (~np.isnan(ccmem_specerr))
-            fit, fitcov = curve_fit(lambda x,f,w,c,s: mf.gauss(x,f,fitprops['LPEAK'],w,c,s),
-                                   ccmem_wl[fit_reg], ccmem_flux[fit_reg], sigma = ccmem_specerr[fit_reg], 
-                                   absolute_sigma=True, p0 = [fitprops['FLUX'], fitprops['FWHM'], local_median, 0.],
-                                   bounds=[[bound(sign)[0], 2.4, -inf, -inf], [bound(sign)[1], 5 * fitprops['FWHM'], inf, inf]],
-                                   max_nfev=10000)
-            checks = {
-                'significant': np.abs(fit[0] / np.sqrt(np.abs(fitcov[0,0]))) > 3.0,
-                'right sign': np.sign(fit[0]) == sign
-            }
-            highreswl = np.arange(np.nanmin(ccmem_wl), np.nanmax(ccmem_wl), 0.05)
-            modplot = mf.gauss(highreswl, fit[0], fitprops['LPEAK'], fit[1], fit[2], fit[3])
-            axnew.plot(highreswl, modplot, linestyle = '--', color='maroon', alpha=0.4)
-            if all(list(checks.values())):
-                print(f"Found a significant fit at the same wavelength in the contaminant spec.")
-                megatab[f"FLAG_{lname}"][i] = 'c'
-            axnew.legend()
-#         fig.savefig(f"../plots/{row['CLUSTER']}/{row['CLUSTER']}/{row['idfrom'][0]}{row['iden']}_contaminants.pdf", bbox_inches='tight')
-        plt.show()
-        plt.close()
+        print(f"Found {len(contaminated_lines)} contaminated lines. Entering flags into megatable...")
 
-        if save_checkpoint:
-            megatab.write(f"contaminant_flag_checkpoint.fits", overwrite=True)
-            # File path to save the float value
-            file_path = "./.contaminant_checkpoint.txt"
-            # Save the float value to a text file
-            with open(file_path, 'w') as file:
-                file.write(str(rowidx))
+        # Enter contaminated flags into the megatable
+        for line in contaminated_lines:
+            flag_col = f"FLAG_{line}"
+            if flag_col in megatab.colnames:
+                megatab[flag_col][rowidx] = 'c' # 'c' for contaminated
+            else:
+                print(f"Warning: {flag_col} not found in megatable. Cannot enter contamination flag for {line} line.")
