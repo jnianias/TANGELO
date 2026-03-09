@@ -341,11 +341,7 @@ def get_line_spec(row, line, width, rest = True, spec_source = 'R21', spec_type 
         return None, None, None
     
     # Load the spectrum
-    spectab = None
-    if spec_source == 'R21':
-        spectab = io.load_r21_spec(row['CLUSTER'], row['iden'], row['idfrom'], spec_type)
-    elif spec_source.upper() == 'APER':
-        spectab = io.load_aper_spec(row['CLUSTER'], row['iden'], row['idfrom'], spec_type)
+    spectab = io.load_spec(row['CLUSTER'], row['iden'], row['idfrom'], spec_source=spec_source, spec_type=spec_type)
 
     if spectab is None:
         print(f"No spectrum found for {row['CLUSTER']} ID{row['iden']} in {spec_source} catalog.")

@@ -1526,7 +1526,7 @@ def refit_other_line(wave, spec, spec_err, row, line_tab_row = None, width=25,
 
     Examples
     --------
-    >>> param_dict, error_dict, model, reduced_chisq, flag = refit_other_line(wave, spec, spec_err, row)
+    >>> refit_other_line(wave, spec, spec_err, row, line_tab_row=line_tab_row, width=25, ax_in=ax)
     """
     # Validate inputs
     if line_tab_row is None and line_name is None:
@@ -1607,8 +1607,7 @@ def refit_other_line(wave, spec, spec_err, row, line_tab_row = None, width=25,
     # Handle fit failure
     if 'param_dict' not in fit_result:
         print(f"Fit failed for {primary_line} in {row['CLUSTER']} {row['iden']}.")
-        nandict = {param: np.nan for param in initial_guesses.keys()}
-        return nandict, nandict, None, np.nan, ''
+        return {}
     
     # Extract and return results
     return fit_result
