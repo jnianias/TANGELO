@@ -257,7 +257,7 @@ def get_aper_spectra_dir(cluster):
         raise FileNotFoundError(f"Aperture spectra directory does not exist: {spectra_dir}")
     return spectra_dir
 
-def get_misc_dir(cluster):
+def get_misc_dir(cluster) -> Path:
     """
     Get the directory where miscellaneous data files are stored for a given cluster.
 
@@ -275,6 +275,7 @@ def get_misc_dir(cluster):
     misc_dir = data_dir / cluster.upper() / 'misc'
     if not misc_dir.exists(): # Raise an error if the directory does not exist (the user should have created it)
         raise FileNotFoundError(f"Miscellaneous data directory does not exist: {misc_dir}")
+    
     return misc_dir
 
 def get_muse_cube_dir(cluster):
@@ -354,7 +355,7 @@ def load_r21_catalogue(cluster, type='source'):
     except Exception as e:
         raise FileNotFoundError(f"Failed to load R21 catalog for {cluster}: {e}")
 
-def load_spec(clus, iden, idfrom, spec_source = 'R21', spectype = 'weight_skysub'):
+def load_spec(clus, iden, idfrom, spec_source = 'R21', spec_type = 'weight_skysub'):
     """
     Loads a spectrum from the specified source.
 
@@ -368,7 +369,7 @@ def load_spec(clus, iden, idfrom, spec_source = 'R21', spectype = 'weight_skysub
         Detection type of the source (i.e., 'MUSELET', 'PRIOR', or 'EXTERNAL')
     spec_source : str
         Source of the spectrum ('R21' for Richard et al. 2021, 'APER' for aperture spectra)
-    spectype : str
+    spec_type : str
         Type of spectrum to load (either 'weight_skysub' or '2fwhm', etc.)
 
     Returns
@@ -377,13 +378,13 @@ def load_spec(clus, iden, idfrom, spec_source = 'R21', spectype = 'weight_skysub
         The loaded spectrum table, or None if loading failed.
     """
     if spec_source == 'R21':
-        return load_r21_spec(clus, iden, idfrom, spectype)
+        return load_r21_spec(clus, iden, idfrom, spec_type)
     elif spec_source == 'APER':
-        return load_aper_spec(clus, iden, idfrom, spectype)
+        return load_aper_spec(clus, iden, idfrom, spec_type)
     else:
         raise ValueError(f"spec_source {spec_source} not recognized. Use 'R21' or 'APER'.")
 
-def load_r21_spec(clus, iden, idfrom, spectype):
+def load_r21_spec(clus, iden, idfrom, spec_type):
     """
     Loads a spectrum from the Richard et al. (2021) catalog.
 
@@ -395,7 +396,7 @@ def load_r21_spec(clus, iden, idfrom, spectype):
         Identifier number of the object (e.g., 1234)
     idfrom : str
         Prefix letter of the identifier (e.g., 'X' for X1234)
-    spectype : str
+    spec_type : str
         Type of spectrum to load
 
     Returns
@@ -404,12 +405,20 @@ def load_r21_spec(clus, iden, idfrom, spectype):
         The loaded spectrum table, or None if loading failed.
     """
     # Generate the full identifier
-    if iden[0].isdigit():
-        identifier = (idfrom[0] + str(iden)).replace('E', 'X')
-    elif iden[0].isalpha():
-        identifier = iden
+    if isinstance(iden, str):
+        if iden[0].isdigit():
+            identifier = (idfrom[0] + str(iden)).replace('E', 'X')
+        elif iden[0].isalpha():
+            identifier = iden
+        else:
+            raise ValueError("iden must start with a letter or digit")
     else:
-        raise ValueError("iden must start with a letter or digit")
+        # Try to convert to int
+        iden = int(iden)
+        if isinstance(iden, int):
+            identifier = f"{idfrom[0]}{iden}".replace('E', 'X')
+        else:
+            raise ValueError("iden must be an int or str")
 
     print(f"Loading R21 spectrum for {clus} object {identifier}...")
 
@@ -417,18 +426,18 @@ def load_r21_spec(clus, iden, idfrom, spectype):
     cluster_dir = get_r21_spectra_dir(clus)
 
     # Locate the file
-    locfile = glob.glob(f"{cluster_dir}/spec_{identifier}_{spectype}.fits")
+    locfile = glob.glob(f"{cluster_dir}/spec_{identifier}_{spec_type}.fits")
     if len(locfile) == 0: # If the file is not found, attempt to download it
-        print(f"File not found. Downloading from {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spectype}.fits")
+        print(f"File not found. Downloading from {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spec_type}.fits")
         os.makedirs(cluster_dir, exist_ok=True)
         if clus == 'BULLET':
-            os.system(f"wget --no-check-certificate {get_spectra_url()}Bullet_final_catalog/spectra/spec_{identifier}_{spectype}.fits"
+            os.system(f"wget --no-check-certificate {get_spectra_url()}Bullet_final_catalog/spectra/spec_{identifier}_{spec_type}.fits"
                     + f" -P {cluster_dir}")
         else:
-            os.system(f"wget --no-check-certificate {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spectype}.fits"
+            os.system(f"wget --no-check-certificate {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spec_type}.fits"
                     + f" -P {cluster_dir}")
         print(f"Download complete.")
-        locfile = glob.glob(f"{cluster_dir}/spec_{identifier}_{spectype}.fits")
+        locfile = glob.glob(f"{cluster_dir}/spec_{identifier}_{spec_type}.fits")
     
     # If still not found, return None
     if len(locfile) == 0:
@@ -463,10 +472,10 @@ def load_r21_spec(clus, iden, idfrom, spectype):
             print(f"Could not remove corrupted file: {e}")
         # Re-download
         if clus == 'BULLET':
-            os.system(f"wget --no-check-certificate {get_spectra_url()}Bullet_final_catalog/spectra/spec_{identifier}_{spectype}.fits"
+            os.system(f"wget --no-check-certificate {get_spectra_url()}Bullet_final_catalog/spectra/spec_{identifier}_{spec_type}.fits"
                     + f" -P {cluster_dir}")
         else:
-            os.system(f"wget --no-check-certificate {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spectype}.fits"
+            os.system(f"wget --no-check-certificate {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spec_type}.fits"
                     + f" -P {cluster_dir}")
         print("Re-download complete.")
         # Try loading again
@@ -476,7 +485,7 @@ def load_r21_spec(clus, iden, idfrom, spectype):
             return None
     return result
 
-def load_aper_spec(clus, iden, idfrom, spectype = '2fwhm'):
+def load_aper_spec(clus, iden, idfrom, spec_type = '2fwhm'):
     """
     Loads a spectrum from the aperture spectra files.
 
@@ -488,7 +497,7 @@ def load_aper_spec(clus, iden, idfrom, spectype = '2fwhm'):
         Identifier string of the object (e.g., 'X1234')
     idfrom : str
         Prefix letter of the identifier (e.g., 'E' for E1234) - not used for aperture spectra
-    spectype : str
+    spec_type : str
         Type of spectrum to load ('2fwhm', '1fwhm', etc.)
 
     Returns
@@ -497,12 +506,20 @@ def load_aper_spec(clus, iden, idfrom, spectype = '2fwhm'):
         The loaded spectrum table, or None if loading failed.
     """
     # Generate the full identifier
-    if iden[0].isdigit():
-        identifier = (idfrom[0] + str(iden)).replace('E', 'X')
-    elif iden[0].isalpha():
-        identifier = iden
+    if isinstance(iden, str):
+        if iden[0].isdigit():
+            identifier = (idfrom[0] + str(iden)).replace('E', 'X')
+        elif iden[0].isalpha():
+            identifier = iden
+        else:
+            raise ValueError("iden must start with a letter or digit")
     else:
-        raise ValueError("iden must start with a letter or digit")
+        # Try to convert to int
+        iden = int(iden)
+        if isinstance(iden, int):
+            identifier = f"{idfrom[0]}{iden}".replace('E', 'X')
+        else:
+            raise ValueError("iden must be an int or str")
 
     print(f"Loading aperture spectrum for {clus} object {identifier}...")
 
@@ -510,7 +527,7 @@ def load_aper_spec(clus, iden, idfrom, spectype = '2fwhm'):
     cluster_dir = get_aper_spectra_dir(clus)
     
     # Locate the file
-    locfile = glob.glob(f"{cluster_dir}/{identifier}_{spectype}.fits")
+    locfile = glob.glob(f"{cluster_dir}/{identifier}_{spec_type}.fits")
     if len(locfile) == 0:
         print(f"File not found!")
         return None
@@ -688,3 +705,35 @@ def get_plot_dir(cluster, iden):
     if not plot_dir.exists(): # Create the directory if it does not exist
         plot_dir.mkdir(parents=True, exist_ok=True)
     return plot_dir
+
+from mpdaf.obj import Image
+
+def load_bb_image(clus, bbcenter, bbwidth):
+    """
+    Load a broadband image cutout for a given cluster and specified center and width.
+
+    Parameters
+    ----------
+    clus : str
+        Cluster name (e.g., 'A2744', 'MACS0416', etc.)
+    bbcenter : float
+        The central wavelength of the spectral range used to make the broadband image in Angstroms.
+    bbwidth : float
+        The half-width of the spectral range used to make the broadband image in Angstroms.
+
+    Returns
+    -------
+    mpdaf.obj.Image
+        The loaded broadband image as an MPDAF Image object.
+    """
+    # Construct the filename based on the cluster and broadband parameters
+    bb_filename = f"{clus}_bb_image_{bbcenter}A_{bbwidth}A.fits"
+    bb_path = get_misc_dir(clus) / bb_filename
+
+    if not bb_path.exists():
+        raise FileNotFoundError(f"Broadband image file not found: {bb_path}")
+
+    try:
+        return Image(str(bb_path))
+    except Exception as e:
+        raise FileNotFoundError(f"Error loading broadband image: {e}")

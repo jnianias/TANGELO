@@ -1,4 +1,4 @@
-# Requirements for astro_utils
+# Requirements for TANGELO
 
 numpy
 astropy

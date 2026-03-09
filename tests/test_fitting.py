@@ -1,12 +1,12 @@
 """
-Tests for the fitting utilities in astro_utils.fitting module.
+Tests for the fitting utilities in tangelo.fitting module.
 To be run with pytest.
 """
 
 import pytest
-from astro_utils import fitting as aufit
-from astro_utils import spectroscopy as auspec
-from astro_utils import catalogue_operations as aucat
+from tangelo import fitting as aufit
+from tangelo import spectroscopy as auspec
+from tangelo import catalogue_operations as aucat
 
 wavedict = auspec.wavedict
 

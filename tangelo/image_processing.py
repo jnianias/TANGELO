@@ -45,7 +45,7 @@ def get_muse_psf(clus):
     return fwhmtb['PSF_FWHM'][clusind[0]]
 
 
-def make_muse_img(row, size, lcenter, width, cont=None, verbose=True):
+def make_muse_img(row, size, lcenter=None, width=None, cont=None, verbose=True):
     """
     Create a narrowband image from a MUSE data cube.
     
@@ -61,9 +61,9 @@ def make_muse_img(row, size, lcenter, width, cont=None, verbose=True):
         - 'DEC': declination in degrees
     size : float
         Size of the image cutout in arcseconds. Will be adjusted if too close to cube edge.
-    lcenter : float
+    lcenter : float, optional
         Central wavelength for the narrowband image in Angstroms.
-    width : float
+    width : float, optional
         Half-width of the wavelength window in Angstroms (image will span lcenter±width).
     cont : tuple of float, optional
         If provided, continuum will be subtracted. Should be a tuple (offset, width) where:
@@ -104,17 +104,16 @@ def make_muse_img(row, size, lcenter, width, cont=None, verbose=True):
     ...                     cont=(50.0, 10.0))
     """
     position = (row['DEC'], row['RA'])
-    wl = lcenter
     clus = row['CLUSTER']
 
     if verbose:
         print(f"Loading {clus} cube...")
 
     # Find and open the cube
-    cube_dir = io.get_muse_cube_dir()
-    cube_files = glob.glob(str(cube_dir / clus / 'cube' / '*.fits'))
+    cube_dir = io.get_muse_cube_dir(clus)
+    cube_files = glob.glob(str(cube_dir / '*.fits'))
     if not cube_files:
-        raise FileNotFoundError(f"No FITS cube files found for cluster {clus} in {cube_dir / clus / 'cube'}")
+        raise FileNotFoundError(f"No FITS cube files found for cluster {clus} in {cube_dir}")
     
     musedata = Cube(cube_files[0])
 
@@ -130,8 +129,16 @@ def make_muse_img(row, size, lcenter, width, cont=None, verbose=True):
     ]
     size = np.nanmin([size, np.nanmin(tightness) * 2 * 3600])
 
+    # Get wavelength range to be used to make the image
+    if lcenter is not None and width is not None:
+        wl = lcenter
+    else: # If no wavelength provided, use the entire wavelength range of the cube
+        ends = musedata.get_range(unit_wave=u.AA)[[0,3]]
+        wl = np.nanmean(ends) # central wavelength of the entire wavelength range
+        width = 0.5 * (np.nanmax(ends) - np.nanmin(ends)) # half width of the entire wavelength range
+
     # Create narrowband image
-    img_line = musedata.get_image(wave=(wl - width, wl + width))
+    img_line = musedata.get_image(wave=(wl - width, wl + width), unit_wave=u.AA)
     img_line = img_line.subimage(position, size, unit_size=u.arcsec)
 
     # Optionally subtract continuum from adjacent regions
@@ -457,3 +464,80 @@ def get_segmap_peak(full_iden, cluster, seg_map=None, weight_map=None, search_si
     
     return ra_peak, dec_peak
 
+def create_circular_mask(shape, center, radius):
+    """
+    Create a circular mask for a 2D array.
+    
+    Parameters
+    ----------
+    shape : tuple
+        Shape of the 2D array (ny, nx).
+    center : tuple
+        (x, y) coordinates of the center of the circle in pixel units.
+    radius : float
+        Radius of the circle in pixel units.
+    
+    Returns
+    -------
+    numpy.ndarray
+        A boolean mask with True values inside the circle and False outside.
+    """
+    ny, nx = shape
+    x = np.arange(nx)
+    y = np.arange(ny)
+    xx, yy = np.meshgrid(x, y)
+    
+    # Calculate distance from the center for each pixel
+    distance = np.sqrt((xx - center[0])**2 + (yy - center[1])**2)
+    
+    # Create mask where distance is less than or equal to radius
+    mask = distance <= radius
+    
+    return mask
+
+def make_bb_image(cluster, bbcenter, bbwidth, save=False):
+    """
+    Create a broad-band image from a MUSE data cube by summing over a specified wavelength range.
+    
+    Parameters
+    ----------
+    cluster : str
+        Name of the cluster.
+    bbcenter : float
+        Central wavelength for the broad-band image in Angstroms.
+    bbwidth : float
+        Half-width of the wavelength range for the broad-band image in Angstroms.
+    save : bool, optional
+        If True, saves the broad-band image to a FITS file in the output directory.
+        Default is False.
+    
+    Returns
+    -------
+    mpdaf.obj.Image
+        Broad-band image created by summing over the specified wavelength range.
+    
+    Raises
+    ------
+    FileNotFoundError
+        If no FITS cube files are found for the specified cluster.
+    """
+    # Find and open the cube
+    cube_dir = io.get_muse_cube_dir(cluster)
+    cube_files = glob.glob(str(cube_dir / '*.fits'))
+    if not cube_files:
+        raise FileNotFoundError(f"No FITS cube files found for cluster {cluster} in {cube_dir}")
+    
+    musedata = Cube(cube_files[0])
+    musedata.data = np.nan_to_num(musedata.data, nan=0.0) # Replace NaNs with zeros to avoid issues when summing 
+                                                          # over wavelength range
+    
+    # Create broad-band image by summing over the specified wavelength range
+    img_bb = musedata.get_image(wave=(bbcenter - bbwidth, bbcenter + bbwidth), unit_wave=u.AA)
+
+    if save:
+        misc_dir = io.get_misc_dir(cluster)
+        output_file = misc_dir / f'{cluster}_bb_image_{int(bbcenter)}A_{int(bbwidth)}A.fits'
+        img_bb.write(str(output_file))
+        print(f"Broad-band image of {cluster} saved to {output_file}")
+    
+    return img_bb

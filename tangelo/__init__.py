@@ -1,5 +1,5 @@
 """
-Astro Utils - Astronomy utilities package
+TANGELO - Tools for ANalysing lensed Galaxies with IntEgRal field Spectroscopy
 """
 
 # Import all modules to make them easily accessible
@@ -17,7 +17,7 @@ from . import ifs
 from . import lya_profile
 from . import lya_fitting
 
-# Define what gets imported with "from astro_utils import *"
+# Define what gets imported with "from tangelo import *"
 __all__ = [
     'catalogue_operations',
     'constants',

@@ -899,7 +899,7 @@ def gen_bounds(initial_guesses, linename, input_bounds={}, force_sign=None):
         'DISPR':  (0.2 * (1 + z), 1 * (1 + z)), # dispersion of red peak for Lya
         'ASYMR':  (-0.5, 0.5), # asymmetry of red peak for Lya
         'SLOPE':  (-np.inf, np.inf), # slope for linear continuum
-        'TAU':    (-50, 2000), # optical depth for Damped Lyman alpha profile
+        'TAU':    (0, 200), # optical depth for Damped Lyman alpha profile
         'FWHM_ABS':   ((spectro.vel2wave(100, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z), 
                   (spectro.vel2wave(500, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z)), # FWHM bounds
         'LPEAK_ABS': (cen_r_init - 3.33 * (1 + z), cen_r_init + 3.33 * (1 + z))
@@ -1049,7 +1049,8 @@ def check_inputs(p0, bounds):
                     val = lower * 1.1 if lower != 0 else lower + 0.1
             else:
                 val = (lower + upper) / 2.0
-            print(f"WARNING: {i}-th initial guess {original_val} is outside bounds ({lower:.5f}, {upper:.5f}); adjusting to {val:.3e}")
+            print(f"WARNING: {i}-th initial guess {original_val} is outside bounds ({lower:.5f}, {upper:.5f}); "
+                  f"adjusting to {val:.3e}")
             
         p0_checked.append(val)
     
@@ -1475,7 +1476,7 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
 
 
 def refit_other_line(wave, spec, spec_err, row, line_tab_row = None, width=25, 
-                     ax_in=None, line_name = None, 
+                     ax_in=None, line_name = None,
                      bootstrap_params: Optional[BootstrapParams] = None):
     """
     Refit a non-Lyman alpha emission line based on prior fitting results.
@@ -1525,7 +1526,7 @@ def refit_other_line(wave, spec, spec_err, row, line_tab_row = None, width=25,
 
     Examples
     --------
-    >>> param_dict, error_dict, model, reduced_chisq, flag = refit_other_line(wave, spec, spec_err, row)
+    >>> refit_other_line(wave, spec, spec_err, row, line_tab_row=line_tab_row, width=25, ax_in=ax)
     """
     # Validate inputs
     if line_tab_row is None and line_name is None:
@@ -1606,8 +1607,7 @@ def refit_other_line(wave, spec, spec_err, row, line_tab_row = None, width=25,
     # Handle fit failure
     if 'param_dict' not in fit_result:
         print(f"Fit failed for {primary_line} in {row['CLUSTER']} {row['iden']}.")
-        nandict = {param: np.nan for param in initial_guesses.keys()}
-        return nandict, nandict, None, np.nan, ''
+        return {}
     
     # Extract and return results
     return fit_result
@@ -1644,7 +1644,7 @@ def flatten_spectrum(spectrum, return_continuum=False):
 
     Examples
     --------
-    >>> from astro_utils import fitting as aufit
+    >>> from tangelo import fitting as aufit
     >>> import numpy as np
     >>> x = np.arange(100)
     >>> spec = 10.0 + 0.05 * x + np.random.normal(0, 0.1, 100)
@@ -1673,3 +1673,82 @@ def flatten_spectrum(spectrum, return_continuum=False):
         return flattened, continuum_model
     else:
         return flattened
+    
+from astropy.modeling import models, fitting
+from astropy.utils.exceptions import AstropyUserWarning
+from astropy.stats import sigma_clip
+
+class BadDataError(Exception):
+    """Custom exception to indicate that the input data is not suitable for fitting."""
+    pass
+
+def fit_sersic(imgin, maskin, center, amp, reff, theta, ellip, n, bounds = {},
+                fixed = {}, maxiter=10000, outlier_removal=False, 
+                outlier_kwargs={'niter': 3, 'sigma_upper': 3.0},
+                return_initial_model=False):
+    """
+    Fit a 2D Sersic profile to an image using astropy's modeling framework.
+
+    Parameters
+    ----------
+    imgin : 2D array
+        Input image to fit.
+    maskin : 2D boolean array
+        Mask indicating which pixels to include in the fit (True = include).
+    center : tuple
+        (x0, y0) coordinates of the Sersic profile center.
+    amp : float
+        Amplitude of the Sersic profile.
+    reff : float
+        Effective radius of the Sersic profile.
+    theta : float
+        Position angle of the Sersic profile in radians.
+    ellip : float
+        Ellipticity of the Sersic profile (0 = circular, 1 = line).
+    n : float
+        Sersic index (controls the concentration of the profile).
+    bounds : dict, optional
+        Dictionary of parameter bounds (keys: 'amplitude', 'x_0', 'y_0', 'r_eff', 'theta', 'ellip', 'n').
+    fixed : dict, optional
+        Dictionary of parameters to fix during fitting (keys same as bounds, values are booleans).
+    maxiter : int, optional
+        Maximum number of iterations for the fitter (default: 10000).
+    outlier_removal : bool, optional
+        Whether to perform outlier removal during fitting (default: False).
+    outlier_kwargs : dict, optional
+        Dictionary of keyword arguments to pass to the outlier removal function (default: {'niter': 3, 'sigma_upper': 3.0}).
+
+    Returns
+    -------
+    fit_mod : astropy.modeling.Model
+        The fitted Sersic model.
+    """
+    sermod = models.Sersic2D(amplitude=amp, x_0=center[0], y_0=center[1],
+                                    r_eff=reff, theta=theta, ellip=ellip, n=n,
+                                    bounds=bounds, fixed=fixed)
+
+    fitter = fitting.LevMarLSQFitter()
+
+    if outlier_removal:
+        fitter = fitting.FittingWithOutlierRemoval(fitter, sigma_clip, **outlier_kwargs)
+
+    # check for non-finite values in the input image and mask them out
+    finite_mask = np.isfinite(imgin)
+    maskin = maskin & finite_mask
+    # If fewer than 10 valid pixels remain after masking, abandon the fit and raise an error
+    if np.sum(maskin) < 10:
+        raise BadDataError("Fewer than 10 valid pixels to fit after applying mask and removing non-finite values.")
+
+    y, x = np.mgrid[:np.shape(imgin)[0], :np.shape(imgin)[1]]
+    with warnings.catch_warnings():
+        # Ignore model linearity warning from the fitter
+        warnings.filterwarnings('ignore', message='Model is linear in parameters',
+                                category=AstropyUserWarning)
+        fit_mod = fitter(sermod, x[maskin], y[maskin], imgin[maskin], maxiter=maxiter)
+    
+    if return_initial_model:
+        initial_mod = models.Sersic2D(amplitude=amp, x_0=center[0], y_0=center[1],
+                                      r_eff=reff, theta=theta, ellip=ellip, n=n)
+        return fit_mod, initial_mod
+    else:
+        return fit_mod

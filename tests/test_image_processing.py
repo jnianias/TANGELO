@@ -1,6 +1,6 @@
 
 """
-Tests for the image processing utilities in astro_utils.image_processing module.
+Tests for the image processing utilities in tangelo.image_processing module.
 To be run with pytest.
 """
 
@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 from astropy.io import fits
-from astro_utils import image_processing as imp
-from astro_utils import io
+from tangelo import image_processing as imp
+from tangelo import io
 import pytest
 
 def test_get_segmap_peak_composite():

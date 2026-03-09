@@ -1,5 +1,5 @@
 #!/bin/bash
-# Setup script for astro_utils environment variables
+# Setup script for TANGELO environment variables
 # 
 # Usage:
 #   1. Copy this file: cp setup_env.sh.example setup_env.sh
@@ -38,7 +38,7 @@ export R21_URL="https://cral-perso.univ-lyon1.fr/labo/perso/johan.richard/MUSE_d
 # ============================================================
 
 echo "================================================"
-echo "astro_utils environment configured"
+echo "TANGELO environment configured"
 echo "================================================"
 echo "ASTRO_DATA_DIR     = $ASTRO_DATA_DIR"
 echo "R21_URL            = $R21_URL"
