@@ -165,9 +165,11 @@ default_bootstrap_params = {
     'errfunc': '84-16'  # Use 68% confidence interval for errors
 }
 
-def fit_lya_line(wave, spec, spec_err, initial_guesses, iden, cluster, baseline='auto', width=50,
-                 bounds={}, plot_result=False, bootstrap_params=default_bootstrap_params,
-                use_bootstrap=True, rchsq_thresh=2.0, save_plots=False, plot_dir='./', spec_type='aper'):
+def fit_lya_line(wave, spec, spec_err, initial_guesses, iden, cluster, 
+                 baseline='auto', width=50, bounds={}, plot_result=False, 
+                 bootstrap_params=default_bootstrap_params, use_bootstrap=True, 
+                 rchsq_thresh=2.0, save_plots=False, plot_dir='./', 
+                 spec_type='APER', convolve_model=False):
     """
     Master function to fit a Lyman alpha profile to the provided spectrum. Can handle different baseline types,
     and automatically selects between single and double-peaked profiles unless specified otherwise, can use Monte
@@ -202,7 +204,9 @@ def fit_lya_line(wave, spec, spec_err, initial_guesses, iden, cluster, baseline=
     plot_dir : str, optional
         Directory to save plots if save_plots is True.
     spec_type : str, optional
-        Type of spectrum being fitted (for labeling purposes, default: 'aper').
+        Type of spectrum being fitted (for labeling purposes, default: 'APER').
+    convolve_model : bool, optional
+        Whether to convolve the model with the instrumental resolution (default: False).
     
     Returns
     -------
@@ -220,7 +224,7 @@ def fit_lya_line(wave, spec, spec_err, initial_guesses, iden, cluster, baseline=
                                         use_bootstrap=use_bootstrap, bootstrap_params=bootstrap_params,
                                         rchsq_thresh=rchsq_thresh,
                                         save_plots=save_plots, plot_dir=plot_dir,
-                                        spec_type=spec_type)
+                                        spec_type=spec_type, convolve_model=convolve_model)
         return fit_result
     else:
         # Fit with specified baseline type
@@ -231,7 +235,7 @@ def fit_lya_line(wave, spec, spec_err, initial_guesses, iden, cluster, baseline=
                                     use_bootstrap=use_bootstrap,
                                     bootstrap_params=bootstrap_params,
                                     save_plots=save_plots, plot_dir=plot_dir,
-                                    spec_type=spec_type)
+                                    spec_type=spec_type, convolve_model=convolve_model)
         return fit_result
 
 
@@ -239,7 +243,7 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
                      width=50, bounds={}, plot_result=True, use_bootstrap=True,
                      bootstrap_params=default_bootstrap_params,
                      rchsq_thresh=2.0, save_plots = False, plot_dir = './',
-                     spec_type='aper'):
+                     spec_type='APER', convolve_model=False):
     """
     Fit the Lyman alpha line using multiple baseline types and select the best fit
     
@@ -272,7 +276,9 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
     plot_dir : str, optional
         Directory to save plots if save_plots is True.
     spec_type : str, optional
-        Type of spectrum being fitted (for labeling purposes, default: 'aper').
+        Type of spectrum being fitted (for labeling purposes, default: 'APER').
+    convolve_model : bool, optional
+        Whether to convolve the model with the instrumental resolution (default: False).
 
     Returns
     -------
@@ -289,14 +295,14 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
                         plot_result=False, use_bootstrap=use_bootstrap, 
                         bootstrap_params=bootstrap_params,
                         save_plots=False, plot_dir=plot_dir,
-                        spec_type=spec_type)
+                        spec_type=spec_type, convolve_model=convolve_model)
     
     # Check the reduced chi-squared of the fit -- if it's good enough, return it
     if fit_const and fit_const.get('reduced_chisq') and fit_const['reduced_chisq'] < rchsq_thresh:
         print("Constant baseline fit is good enough; returning result.")
         if plot_result:
             plot.plot_lya_fit_result(fit_const, iden, cluster, save_plots=save_plots, 
-                               plot_dir=plot_dir, spec_type=spec_type)
+                               plot_dir=plot_dir, spec_type=spec_type, convolve_model=convolve_model)
         return fit_const
     
     # If not, try a linear baseline
@@ -308,13 +314,13 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
                       plot_result=False, use_bootstrap=use_bootstrap, 
                       bootstrap_params=bootstrap_params,
                       save_plots=False, plot_dir=plot_dir,
-                      spec_type=spec_type)
+                      spec_type=spec_type, convolve_model=convolve_model)
 
     if fit_lin and fit_lin.get('reduced_chisq') and fit_lin['reduced_chisq'] < rchsq_thresh:
         print("Linear baseline fit is good enough; returning result.")
         if plot_result:
             plot.plot_lya_fit_result(fit_lin, iden, cluster, save_plots=save_plots, 
-                                    plot_dir=plot_dir, spec_type=spec_type)
+                                    plot_dir=plot_dir, spec_type=spec_type, convolve_model=convolve_model)
         return fit_lin
     
     # If still not good enough, try a damped Lyman alpha baseline
@@ -328,7 +334,7 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
                        plot_result=False, use_bootstrap=use_bootstrap, 
                        bootstrap_params=bootstrap_params,
                        save_plots=False, plot_dir=plot_dir,
-                       spec_type=spec_type)
+                       spec_type=spec_type, convolve_model=convolve_model)
     
     # Criteria for accepting the damped Lyman alpha fit -- if not met, reduced chi-squared
     # is set to infinity so that it won't be selected as the best fit below
@@ -340,7 +346,7 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
         print("Damped Lyman alpha baseline fit is good enough; returning result.")
         if plot_result:
             plot.plot_lya_fit_result(fit_damp, iden, cluster, save_plots=save_plots, 
-                               plot_dir=plot_dir, spec_type=spec_type)
+                               plot_dir=plot_dir, spec_type=spec_type, convolve_model=convolve_model)
         return fit_damp
     
     # If none of the fits were good enough, return the one with the lowest reduced chi-squared
@@ -354,14 +360,14 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
     # Plot the best fit if requested
     if plot_result and best_fit:
         plot.plot_lya_fit_result(best_fit, iden, cluster, save_plots=save_plots, 
-                           plot_dir=plot_dir, spec_type=spec_type)
+                           plot_dir=plot_dir, spec_type=spec_type, convolve_model=convolve_model)
     
     return best_fit
 
 def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster, 
             bounds={}, width=50, baseline='const', plot_result=True, use_bootstrap=True, 
             bootstrap_params=default_bootstrap_params,
-            save_plots=False, plot_dir='./', spec_type='aper'):
+            save_plots=False, plot_dir='./', spec_type='APER', convolve_model=False):
     """
     Fit the Lyman alpha line with specified baseline type using provided initial parameters.
     
@@ -396,8 +402,11 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
     plot_dir : str, optional
         Directory to save plots if save_plots is True.
     spec_type : str, optional
-        Type of spectrum being fitted (for labeling purposes, default: 'aper').
+        Type of spectrum being fitted (for labeling purposes, default: 'APER').
+    convolve_model : bool, optional
+        Whether to convolve the model with the instrumental resolution (default: False).
     
+
     Returns
     -------
     fit_result : dict
@@ -482,6 +491,18 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
     mdl_func = mdl.lya_dpeak_lin if baseline == 'lin' else \
                mdl.lya_dpeak_damp if baseline == 'damp' else \
                mdl.lya_dpeak
+    
+    if convolve_model:
+        lsf_fwhm = spectro.muse_lsf_fwhm_poly(initial_guesses['LPEAKR'])
+        print(f"Convolving model with Gaussian kernel of FWHM = {lsf_fwhm:.2f} Å"
+              f" to match instrumental resolution.")
+        # Get the name of the convolved model function based on mdl_func
+        mdl_func_name = mdl_func.__name__
+        conv_func_name = f"convolved_{mdl_func_name}"
+        if hasattr(mdl, conv_func_name):
+            mdl_func = getattr(mdl, conv_func_name)(lsf_fwhm)
+        else:
+            raise AttributeError(f"Model function {conv_func_name} not found in models module. Cannot convolve model.")
 
     # Get mask for sky lines and bad values
     fitmask = generate_spec_mask(wave, spec, spec_err,

@@ -44,6 +44,58 @@ def get_muse_psf(clus):
         raise ValueError(f"Cluster {clus} not found in PSF data file.")
     return fwhmtb['PSF_FWHM'][clusind[0]]
 
+def make_continuum_image(cube, wl, offset, width):
+    """
+    Create a continuum image from a MUSE data cube by averaging over two wavelength ranges adjacent to the line of interest.
+    
+    Parameters
+    ----------
+    cube : mpdaf.obj.Cube
+        MUSE data cube object.
+    wl : float
+        Central wavelength of the line of interest in Angstroms.
+    offset : float
+        Wavelength offset from the line center for the continuum regions in Angstroms.
+    width : float
+        Half-width of the wavelength range for the continuum regions in Angstroms.
+    
+    Returns
+    -------
+    mpdaf.obj.Image
+        Continuum image created by averaging over the two adjacent wavelength ranges.
+    
+    Notes
+    -----
+    The function assumes that the line of interest is centered at a wavelength `wl` which is provided as an argument.
+    The continuum is estimated from two regions: [wl - offset - width, wl - offset + width] and [wl + offset - width, wl + offset + width].
+    """
+    cont_range_low = (wl - offset - width, wl - offset + width)
+    cont_range_high = (wl + offset - width, wl + offset + width)
+
+    # Generate masks that select wavelength bins within the continuum ranges
+    cube_wave = cube.wave.coord() # Get the wavelength axis of the cube in Angstroms
+    cont_mask_low = (cube_wave >= cont_range_low[0]) & (cube_wave <= cont_range_low[1])
+    cont_mask_high = (cube_wave >= cont_range_high[0]) & (cube_wave <= cont_range_high[1])
+    n_bins_low = np.sum(cont_mask_low)
+    n_bins_high = np.sum(cont_mask_high)
+    n_bins_total = n_bins_low + n_bins_high
+    # Raise a warning if there are no bins in one of the continuum ranges, and adjust the weights accordingly
+    if n_bins_low == 0:
+        print(f"Warning: No wavelength bins found in lower continuum range {cont_range_low}. Using only upper continuum range.")
+        n_bins_total = n_bins_high
+    if n_bins_high == 0:
+        print(f"Warning: No wavelength bins found in upper continuum range {cont_range_high}. Using only lower continuum range.")
+        n_bins_total = n_bins_low
+    if n_bins_total == 0:
+        raise ValueError(f"No wavelength bins found in either continuum range. Cannot create continuum image.")
+    
+    # Average over the selected wavelength bins to create the continuum image
+    cont_image_low = cube.get_image(wave=cont_range_low, unit_wave=u.AA, sum=True) if n_bins_low > 0 else 0
+    cont_image_high = cube.get_image(wave=cont_range_high, unit_wave=u.AA, sum=True) if n_bins_high > 0 else 0
+
+    cont_image = (cont_image_low + cont_image_high) / n_bins_total
+    return cont_image
+
 
 def make_muse_img(row, size, lcenter=None, width=None, cont=None, verbose=True):
     """
@@ -68,7 +120,7 @@ def make_muse_img(row, size, lcenter=None, width=None, cont=None, verbose=True):
     cont : tuple of float, optional
         If provided, continuum will be subtracted. Should be a tuple (offset, width) where:
         - offset: wavelength offset from lcenter for continuum regions (in Angstroms)
-        - width: width of the continuum regions (in Angstroms)
+        - width: half-width of the continuum regions (in Angstroms)
         Continuum is estimated from regions at lcenter±(offset±width).
         Default is None (no continuum subtraction).
     verbose : bool, optional
@@ -144,11 +196,11 @@ def make_muse_img(row, size, lcenter=None, width=None, cont=None, verbose=True):
     # Optionally subtract continuum from adjacent regions
     if cont:
         try:
-            img_cont_u = musedata.subcube(position, size, lbda=(wl + cont[0], wl + cont[1])).mean(axis=0)
-            img_cont_l = musedata.subcube(position, size, lbda=(wl - cont[1], wl - cont[0])).mean(axis=0)
+            img_cont = make_continuum_image(musedata, wl, cont[0], cont[1])
+            img_cont = img_cont.subimage(position, size, unit_size=u.arcsec)
             if verbose:
                 print("Continuum subtracted.")
-            return img_line - 0.5 * (img_cont_u + img_cont_l)
+            return img_line - img_cont
         except Exception as e:
             if verbose:
                 print(f"Warning: Continuum subtraction failed: {e}")

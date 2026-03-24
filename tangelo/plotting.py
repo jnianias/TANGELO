@@ -230,7 +230,7 @@ def lya_mod_plot(row, axin, eml=False):
         - 'SLOPE': Linear slope parameter
         For damped baseline (if 'TAU' is not NaN):
         - 'TAU': Damping parameter
-        - 'FWHM': Full width at half maximum for damped profile
+        - 'FWHM_ABS': Full width at half maximum for damped profile
         - 'LPEAK_ABS': Peak wavelength of absorption component
         If eml=True, also requires:
         - 'DELTAV_LYA': Velocity offset for emission lines (km/s)
@@ -288,11 +288,11 @@ def lya_mod_plot(row, axin, eml=False):
             # Double-peak with damped baseline
             hiresmod = models.lya_dpeak_damp(hireswl, row['AMPB'], row['LPEAKB'], row['DISPB'], row['ASYMB'],
                                             row['AMPR'], row['LPEAKR'], row['DISPR'], row['ASYMR'], 
-                                            row['CONT'], row['TAU'], row['FWHM'], row['LPEAK_ABS'])
+                                            row['CONT'], row['TAU'], row['FWHM_ABS'], row['LPEAK_ABS'])
         else:
             # Single-peak with damped baseline
             hiresmod = models.lya_speak_damp(hireswl, row['AMPR'], row['LPEAKR'], row['DISPR'], row['ASYMR'], 
-                                            row['CONT'], row['TAU'], row['FWHM'], row['LPEAK_ABS'])
+                                            row['CONT'], row['TAU'], row['FWHM_ABS'], row['LPEAK_ABS'])
     else:
         # Use constant baseline models (original behavior)
         if row['SNRB'] > 3.0:
