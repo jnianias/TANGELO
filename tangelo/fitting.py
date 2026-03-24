@@ -674,6 +674,7 @@ def fit_mc(f, x, y, yerr, p0, bounds=None, niter=500, errfunc='mad',
         poptlist = []
         valid_iters = 0
         total_iters = 0
+        failed_iters = 0
         max_total_iters = 2 * niter
         
         while valid_iters < niter and total_iters < max_total_iters:
@@ -695,10 +696,13 @@ def fit_mc(f, x, y, yerr, p0, bounds=None, niter=500, errfunc='mad',
 
                 poptlist.append(popt_i)
                 valid_iters += 1
-            except RuntimeError:
-                print(f"Iteration {valid_iters} failed to converge; skipping.")
+            except (RuntimeError, ValueError):
+                failed_iters += 1
                 continue
         
+        if failed_iters > 0:
+            print(f"MC iterations: {valid_iters} successful, {failed_iters} failed (convergence/value errors).")
+
         # Warn if we hit the max iteration limit
         if total_iters >= max_total_iters and valid_iters < niter:
             print(f"Warning: Reached maximum iteration limit ({max_total_iters}). "
@@ -707,11 +711,11 @@ def fit_mc(f, x, y, yerr, p0, bounds=None, niter=500, errfunc='mad',
         if not poptlist:
             raise RuntimeError("All MC iterations failed to converge")
 
-        return (avgfunc(poptlist, errfunc), poptlist) if return_sample else avgfunc(poptlist, errfunc)
+        return (avgfunc(poptlist, errfunc, sig_clip=sig_clip), poptlist) if return_sample else avgfunc(poptlist, errfunc, sig_clip=sig_clip)
 
     except Exception as e:
         print(f"Error in fit_mc: {type(e).__name__}: {str(e)}")
-        traceback.print_exc()
+        print(traceback.format_exc())
         return None
     
 
@@ -1142,13 +1146,15 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     errors : array-like
         Flux density uncertainties.
     linename : str
-        Name of the line (must be in wavedict).
+        Name of the line (must be in wavedict or "STACK" to fit a single gaussian to a stacked line). If 
+        "STACK", the wavelength axis is assumed to be in velocity space and the line will be fit as a single Gaussian.
     initial_guesses : dict
         Dictionary of initial guesses for parameters (LPEAK required, others optional).
     bounds : dict, optional
         Dictionary of parameter bounds.
     continuum_buffer : float, optional
-        Buffer region around the line to include in the fit (default: 25).
+        Buffer region around the line to include in the fit (default: 25 Angstrom). Should be 
+        given appropriate value if fitting in velocity space
     plot_result : bool, optional
         If True, plot the fitting result (default: True).
     ax_in : matplotlib axis, optional
@@ -1188,14 +1194,15 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     if linename == 'LYALPHA':
         raise ValueError("Use specialized Lyman-alpha fitting function.")
 
+    lpeak_key = 'LPEAK' if linename != 'STACK' else 'VPEAK'
     # Get initial guess for flux (this is required to set up the fitting region)
-    lpeak_init      = initial_guesses['LPEAK']
+    lpeak_init      = initial_guesses[lpeak_key]
 
     # Determine whether to fit as a single line or doublet
-    method = which_fit_method(linename)
+    method = which_fit_method(linename) if linename != 'STACK' else 'single'
 
     # Rest wavelength of the line
-    rest_wavelength = wavedict[linename]
+    rest_wavelength = wavedict[linename] if linename != 'STACK' else np.nan
     rest_wavelength_second = np.nan
     if method == 'doublet':
         rest_wavelength_second = wavedict[doubletdict[linename][1]]
@@ -1215,12 +1222,13 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         return {}
         
     # Make sure that the immediate region around the line is not all masked
-    line_region = np.logical_and(lpeak_init - 2.5 < wavelength, wavelength < lpeak_init + 2.5)
+    line_region_size = 2.5 if linename != 'STACK' else 200 # in Angstroms for normal lines, in km/s for stacked lines
+    line_region = np.logical_and(lpeak_init - line_region_size < wavelength, wavelength < lpeak_init + line_region_size)
     # Include second line region if doublet
     if method == 'doublet':
         line_region += np.logical_and(
-            lpeak_init * (rest_wavelength_second / rest_wavelength) - 2.5 < wavelength,
-            wavelength < lpeak_init * (rest_wavelength_second / rest_wavelength) + 2.5
+            lpeak_init * (rest_wavelength_second / rest_wavelength) - line_region_size < wavelength,
+            wavelength < lpeak_init * (rest_wavelength_second / rest_wavelength) + line_region_size
         )
     if np.sum(fit_mask & line_region) < 3 and not method == 'doublet':
         print(f"Immediate region around {linename} is too heavily masked. Abandoning fit.")
@@ -1232,14 +1240,14 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     err_fit  = errors[fit_mask]
 
     # Condition initial guesses using the actual data
-    initial_guesses = condition_initial_guesses(initial_guesses, wl_fit, spec_fit, err_fit, linename)
-    # Generate bounds
-    bounds = gen_bounds(initial_guesses, linename, input_bounds=bounds)
-
-    # Prepare and validate inputs
-    initial_guesses, bounds = prep_inputs(initial_guesses, linename,
-                                          z_lya=lya_z,
-                                          bounds=bounds)
+    if linename != 'STACK': # No conditioning for stacked lines since wavelength axis is in velocity space and may not be centered on 0
+        initial_guesses = condition_initial_guesses(initial_guesses, wl_fit, spec_fit, err_fit, linename)
+        # Generate bounds
+        bounds = gen_bounds(initial_guesses, linename, input_bounds=bounds)
+        # Prepare and validate inputs
+        initial_guesses, bounds = prep_inputs(initial_guesses, linename,
+                                            z_lya=lya_z,
+                                            bounds=bounds)
     
     # Get initial guesses
     flux_init       = initial_guesses.get('FLUX', 10)
@@ -1249,7 +1257,7 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     slope_init      = initial_guesses.get('SLOPE', 0)
 
     # Get bounds
-    lpeak_bounds = bounds['LPEAK']
+    lpeak_bounds = bounds[lpeak_key]
     flux_bounds = bounds['FLUX']
     fluxsecond_bounds = bounds.get('FLUX2', (np.nan, np.nan) if linename not in const.flines else flux_bounds) # this will be used if fitting a doublet
     fwhm_bounds = bounds['FWHM']
@@ -1333,7 +1341,7 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
             error_values = np.sqrt(np.diag(pcovg))
         
         # Populate the parameter dictionary
-        param_list = ['FLUX', 'LPEAK', 'FWHM', 'FLUX2', 'CONT', 'SLOPE']
+        param_list = ['FLUX', lpeak_key, 'FWHM', 'FLUX2', 'CONT', 'SLOPE']
         param_dict = {param: val for param, val
                       in zip(param_list, poptg)}
         error_dict = {param: error_values[i] 
@@ -1404,7 +1412,7 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
             error_values = np.sqrt(np.diag(pcovg))
         
         # Populate the parameter dictionary
-        param_list = ['FLUX', 'LPEAK', 'FWHM', 'CONT', 'SLOPE']
+        param_list = ['FLUX', lpeak_key, 'FWHM', 'CONT', 'SLOPE']
         param_dict = {param: val for param, val
                       in zip(param_list, poptg)}
         error_dict = {param: error_values[i] 

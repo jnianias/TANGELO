@@ -105,7 +105,7 @@ def generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffe
     continuum_buffer : float
         Buffer region around the line to include in the fit.
     linename   : str
-        Name of the line (needs to be in wavedict).
+        Name of the line (needs to be in wavedict or "STACK" to fit a single gaussian to a stacked line).
 
     Returns
     -------
@@ -125,8 +125,9 @@ def generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffe
     fit_mask &= ~np.isinf(errors)
 
     # Mask out skylines and other known lines
-    fit_mask &= mask_skylines(wavelength)
-    fit_mask &= mask_otherlines(wavelength, lpeak_init, linename)
+    if linename != 'STACK':  # Don't apply line masking for stacked lines
+        fit_mask &= mask_skylines(wavelength)
+        fit_mask &= mask_otherlines(wavelength, lpeak_init, linename)
 
     return fit_mask
 
@@ -537,9 +538,12 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
         
         # Get the continuum uncertainty at the line peak from the spectrum
         cont_err = np.interp(lpeak, spectab['wave'], spectab['spec_err'])
+
+        # Get the total amplitude error including continuum
+        amp_total_err = np.sqrt(amp_complex.error**2 + cont_err**2)
         
         # Peak significance is the ratio of amplitude to continuum uncertainty
-        peak_snr = np.abs(amp_complex.value / cont_err)
+        peak_snr = np.abs(amp_complex.value / amp_total_err)
         tests['peakdominant'] = (peak_snr > np.abs(snr))
         
         if verbose:

@@ -252,3 +252,106 @@ def lya_swhm(disp, asym, side):
         return side * numerator / denominator
     else:
         raise ValueError("Side must be +1 or -1.")
+    
+def gaussian_kernel(x: np.ndarray, fwhm: float) -> np.ndarray:
+    """
+    Generate a Gaussian kernel for convolution.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        The input array for which the kernel will be generated. The kernel will be centered on the mean of this array.
+    fwhm : float
+        The full width at half maximum (FWHM) of the Gaussian kernel in the same units as the input array.
+
+    Returns
+    -------
+    kernel : np.ndarray
+        The generated Gaussian kernel.
+
+    """
+    
+def convolver(input_array: np.ndarray, gauss_fwhm: float) -> np.ndarray:
+    """
+    Convolve a model spectrum with a Gaussian kernel using numpy's convolution function.
+
+    Parameters
+    ----------
+    input_array : np.ndarray
+        The input spectrum to be convolved.
+    gauss_fwhm : float
+        The full width at half maximum (FWHM) of the Gaussian kernel in the same units 
+        as the input array.
+    
+    Returns
+    -------
+    convolved_array : np.ndarray
+        The convolved spectrum.
+
+    """
+    # Generate the Gaussian kernel
+    kernel = gaussian_kernel(input_array, gauss_fwhm)
+
+    # Perform convolution using numpy's convolution function
+    convolved_array = np.convolve(input_array, kernel, mode='same')
+
+    return convolved_array
+
+#=== Convolved models ===#
+# These functions are designed to be used by scipy.optimize.curve_fit, which requires the model 
+# function to take the independent variable as the first argument and the parameters to be fitted 
+# as subsequent arguments. The convolution is applied to the output of the base model function.
+
+def convolved_gaussian(gauss_fwhm):
+    def model(x, flux, center, fwhm, continuum, slope):
+        base_model = gaussian(x, flux, center, fwhm, continuum, slope)
+        return convolver(base_model, gauss_fwhm)
+    return model
+
+def convolved_gaussian_doublet(wavelength_ratio, gauss_fwhm):
+    def model(x, flux1, center, fwhm, flux2, continuum, slope):
+        base_model = gaussian_doublet(wavelength_ratio)(x, flux1, center, fwhm, flux2, continuum, slope)
+        return convolver(base_model, gauss_fwhm)
+    return model
+
+def convolved_gaussian_doublet_vel(wavelengths, z, gauss_fwhm):
+    def model(x, flux1, center, fwhm, flux2, continuum, slope):
+        base_model = gaussian_doublet_vel(wavelengths, z)(x, flux1, center, fwhm, flux2, continuum, slope)
+        return convolver(base_model, gauss_fwhm)
+    return model
+
+def convolved_lya_speak(gauss_fwhm):
+    def model(x, amp, lpeak, disp, asym, const, slope):
+        base_model = lya_speak_lin(x, amp, lpeak, disp, asym, const, slope)
+        return convolver(base_model, gauss_fwhm)
+    return model
+
+def convolved_lya_dpeak(gauss_fwhm):
+    def model(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const, slope):
+        base_model = lya_dpeak_lin(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const, slope)
+        return convolver(base_model, gauss_fwhm)
+    return model
+
+def convolved_lya_speak_damp(gauss_fwhm):
+    def model(x, amp, lpeak, disp, asym, const, tau, fwhm, lpeak_abs):
+        base_model = lya_speak_damp(x, amp, lpeak, disp, asym, const, tau, fwhm, lpeak_abs)
+        return convolver(base_model, gauss_fwhm)
+    return model
+
+def convolved_lya_dpeak_damp(gauss_fwhm):
+    def model(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const, tau, fwhm, lpeak_abs):
+        base_model = lya_dpeak_damp(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const, tau, fwhm, lpeak_abs)
+        return convolver(base_model, gauss_fwhm)
+    return model
+
+def convolved_lya_speak_lin(gauss_fwhm):
+    def model(x, amp, lpeak, disp, asym, const, slope):
+        base_model = lya_speak_lin(x, amp, lpeak, disp, asym, const, slope)
+        return convolver(base_model, gauss_fwhm)
+    return model
+
+def convolved_lya_dpeak_lin(gauss_fwhm):
+    def model(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const, slope):
+        base_model = lya_dpeak_lin(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const, slope)
+        return convolver(base_model, gauss_fwhm)
+    return model

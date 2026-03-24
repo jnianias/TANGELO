@@ -7,6 +7,32 @@ import glob
 from . import spectroscopy as spectro
 from . import constants as const
 from . import io as io
+
+def get_z_key(tab):
+    """
+    Determine the correct redshift key ('Z' or 'z') in a table.
+    
+    Parameters
+    ----------
+    tab : astropy.table.Table
+        Table containing redshift information.
+
+    Returns
+    -------
+    str
+        The key for the redshift column ('Z' or 'z').
+
+    Raises
+    ------
+    KeyError
+        If neither 'Z' nor 'z' is found in the table.
+    """
+    if 'Z' in tab.colnames:
+        return 'Z'
+    elif 'z' in tab.colnames:
+        return 'z'
+    else:
+        raise KeyError("No redshift column found. Expected 'Z' or 'z'.")
         
 def has_valid_mul(row):
     """
@@ -96,7 +122,9 @@ def is_counterpart(row1, row2, lenstables, sigma=3.0, method='fit_match'):
     (True, 1.2)
     """
     # Immediately eliminate any cases where there's a big difference in z to speed things up
-    if np.abs(row1['z'] - row2['z']) > 0.1:
+    z_key1, z_key2 = get_z_key(row1), get_z_key(row2)
+    z1, z2 = row1[z_key1], row2[z_key2]
+    if np.abs(z1 - z2) > 0.1:
         return False, np.inf
     
     if method == 'fit_match':
@@ -218,7 +246,8 @@ def get_muse_cand(iden, clus, check_lya_velocity=True):
         lya_rows = rows[lya_mask]
         lya_fluxes = lya_rows['FLUX']
         lya_best_idx = np.argmax(lya_fluxes)
-        lya_z = lya_rows['Z'][lya_best_idx]
+        lya_z_key = get_z_key(lya_rows)
+        lya_z = lya_rows[lya_z_key][lya_best_idx]
 
         # Eliminate any lines that are not within 1000 km/s of the Lya redshift
         goodrows = np.abs(spectro.wave2vel(rows['LBDA_OBS'], rows['LBDA_REST'], redshift=lya_z) < 1000.)
@@ -316,7 +345,7 @@ def insert_fit_results(megatab, clus, iden, lya_results, other_results):
 
     # insert SNR for Lya fit
     megatab['SNRR'][row_index] = lya_params['FLUXR'] / lya_errors['FLUXR']
-    if 'SNRB' in lya_params and 'FLUXB' in lya_errors and not np.isnan(lya_params['FLUXB']) and not np.isnan(lya_errors['FLUXB']):
+    if 'FLUXB' in lya_params and 'FLUXB' in lya_errors and not np.isnan(lya_params['FLUXB']) and not np.isnan(lya_errors['FLUXB']):
         megatab['SNRB'][row_index] = lya_params['FLUXB'] / lya_errors['FLUXB']
     else:
         megatab['SNRB'][row_index] = np.nan
@@ -470,7 +499,7 @@ def is_candidate(tab, wavedict, sig=3.0, n=1, return_lines=False, type='emission
     Parameters
     ----------
     tab : astropy.table.Table or astropy.table.Row
-        Catalog table or single row containing spectroscopic measurements.
+        Catalog table or single row containing spectroscopic measurements. (megatable)
         Must contain columns for each line in wavedict with format:
         'SNR_{linename}' for signal-to-noise ratio.
     wavedict : dict
@@ -501,7 +530,8 @@ def is_candidate(tab, wavedict, sig=3.0, n=1, return_lines=False, type='emission
     - For absorption lines, checks if SNR < -sig.  
     - For a single row input, returns a scalar boolean (or tuple with single-element list).
     """
-    tv = np.zeros(len(tab['Z']) if isinstance(tab['Z'], (np.ndarray, aptb.Table.Column)) else 1).astype(int)
+    z_key = get_z_key(tab)
+    tv = np.zeros(len(tab[z_key]) if isinstance(tab[z_key], (np.ndarray, aptb.Table.Column)) else 1).astype(int)
     trulist = [[] for r in tv]
     for line in wavedict:
         if type.lower() == 'emission':
@@ -566,7 +596,8 @@ def is_true_emitter(tab, wavedict, sig=3.0, n=1, return_lines=False):
     >>> is_true_emitter(tab, wavedict, sig=3.0, n=2, return_lines=True)
     (array([True, False, ...]), [['CIII', 'OIII'], ...])
     """
-    tv = np.zeros(len(tab['Z']) if isinstance(tab['Z'], (np.ndarray, aptb.Table.Column)) else 1).astype(int)
+    z_key = get_z_key(tab)
+    tv = np.zeros(len(tab[z_key]) if isinstance(tab[z_key], (np.ndarray, aptb.Table.Column)) else 1).astype(int)
     trulist = [[] for r in tv]
     for line in wavedict:
         if line == 'LYALPHA':
@@ -627,7 +658,7 @@ def find_closest_cluster_member(row, maxdist=5.0 * u.arcsec, return_all=False):
     <Row ...>
     """
     clus = row['CLUSTER']
-    ortab = load_r21_catalogue(clus)
+    ortab = io.load_r21_catalogue(clus)
     ortab.add_column(Column([np.inf for p in ortab], name='NORMDIST'))
     
     def normalised_distance(distance, magnitude):
@@ -638,7 +669,8 @@ def find_closest_cluster_member(row, maxdist=5.0 * u.arcsec, return_all=False):
 
     target_ra = row['RA']
     target_dec = row['DEC']
-    target_z = row['z']
+    z_key = get_z_key(row)
+    target_z = row[z_key]
 
     min_normdist = np.inf
     best_galaxy = None
@@ -647,7 +679,8 @@ def find_closest_cluster_member(row, maxdist=5.0 * u.arcsec, return_all=False):
     for crow in ortab:
         galaxy_ra = crow['RA']
         galaxy_dec = crow['DEC']
-        galaxy_z = crow['z']
+        z_key = get_z_key(crow)
+        galaxy_z = crow[z_key]
         distance = np.sqrt((target_ra - galaxy_ra)**2 + (target_dec - galaxy_dec)**2) * u.deg
         normdist = normalised_distance(distance, crow['MAG_ISO_HST_F814W'])
         
@@ -756,3 +789,46 @@ def get_source_value(cluster, full_iden, colname):
         return None
 
     return source_row[colname][0]
+
+
+def generate_source_mask(table, selection_criteria):
+    """
+    Generate a boolean mask from selection criteria.
+    
+    Parameters
+    ----------
+    table : astropy.table.Table
+        The table to apply selection criteria to
+    selection_criteria : list of tuples
+        List of (column_name, threshold, bound_type) tuples where:
+        - column_name: str, name of column in table
+        - threshold: float, threshold value
+        - bound_type: 'upper' or 'lower'
+            'upper' means keep values <= threshold
+            'lower' means keep values > threshold
+            'exact' means keep values equal to threshold
+            'nexact' means keep values not equal to threshold
+
+    
+    Returns
+    -------
+    mask : np.ndarray
+        Boolean mask array
+    """
+    mask = np.ones(len(table), dtype=bool)
+    for colname, threshold, bound_type in selection_criteria:
+        if bound_type == 'lower':
+            mask &= table[colname] > threshold
+        elif bound_type == 'upper':
+            mask &= table[colname] <= threshold
+        elif bound_type == 'upper-nan': # Nans should be treated as passing the cut
+            mask &= (table[colname] <= threshold) | np.isnan(table[colname])
+        elif bound_type == 'lower-nan': # Nans should be treated as passing the cut
+            mask &= (table[colname] > threshold) | np.isnan(table[colname])
+        elif bound_type == 'exact':
+            mask &= table[colname] == threshold
+        elif bound_type == 'nexact':
+            mask &= table[colname] != threshold
+        else:
+            raise ValueError(f"Invalid bound_type: {bound_type}. Must be 'upper', 'lower', 'upper-nan', 'lower-nan', 'exact', or 'nexact'")
+    return mask
