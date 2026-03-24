@@ -65,11 +65,11 @@ def test_fit_lya_convolved():
     true_params = {
         'AMPB'   :  100.0,
         'LPEAKB' :  5540.0,
-        'DISPB'  :  3.0 / 2.355,
+        'DISPB'  :  1.0 / 2.355,
         'ASYMB'  :  -0.2,
         'AMPR'   :  500.0,
         'LPEAKR' :  5545.0,
-        'DISPR'  :  3.0 / 2.355,
+        'DISPR'  :  1.0 / 2.355,
         'ASYMR'  :  0.2,
         'CONT'   :  10.0
     }
@@ -88,11 +88,11 @@ def test_fit_lya_convolved():
     initial_guesses = {
         'AMPB'   :  80.0,
         'LPEAKB' :  5535.0,
-        'DISPB'  :  4.0 / 2.355,
+        'DISPB'  :  2.0 / 2.355,
         'ASYMB'  :  -0.1,
         'AMPR'   :  400.0,
         'LPEAKR' :  5550.0,
-        'DISPR'  :  4.0 / 2.355,
+        'DISPR'  :  2.0 / 2.355,
         'ASYMR'  :  0.1,
         'CONT'   :  8.0
     }
