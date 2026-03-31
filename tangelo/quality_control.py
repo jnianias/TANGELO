@@ -564,7 +564,8 @@ def get_initial_sersic_params(contaminant, img, ccmem_impos, rough_rad):
 
 def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_iden, mask_radius=2, 
                                     target_coord=None, plot_result=False, aper_radius=1, outlier_removal=True,
-                                    outlier_kwargs={'niter': 3, 'sigma_upper': 3.0}, bbcenter=6000, bbwidth=1000):
+                                    outlier_kwargs={'niter': 3, 'sigma_upper': 3.0}, bbcenter=6000, bbwidth=1000,
+                                    seg_mask=None, weight_map=None):
     """
     Estimate the spectrum of the most likely contaminating source by fitting a Sersic profile
     to the MUSE white light image and scaling a spectrum of the contaminant (taken from the 
@@ -599,6 +600,9 @@ def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_ide
     bbwidth : float, optional
         The width of the broadband normalization (default is 1000). This should be the same as the bbrange used for 
         creating the MUSE white light image to ensure consistent flux scaling.
+    weight_map : np.ndarray, optional
+        A weight map to use for weighting the Sersic profile when summing over the aperture. Should be a weight map
+        multiplied by a binary mask for the segmentation map.
 
     Returns
     -------
@@ -668,9 +672,15 @@ def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_ide
         plot.plot_2d_model(img, sersic_img, markers=ccmem_impos, iden=target_iden, cluster=target_clus,
                            aperture=(target_img_coord, aperrad_pix), save_plot=True)
     
-    # We now need to sum the Sersic profile over the aperture containing the target
-    aper_mask = improc.create_circular_mask(np.shape(img.data), target_img_coord, aperrad_pix)
-    mod_apersum = np.nansum(sersic_img[aper_mask])
+    # We now need to sum the Sersic profile over the aperture containing the target or segmentation map
+    if weight_map is not None:
+        # Ensure weight map is normalised so that its sum equals the number of non-zero pixels
+        n_pixels = np.sum(weight_map > 0)
+        weight_map *= n_pixels / np.nansum(weight_map)
+        mod_apersum = np.nansum(sersic_img * weight_map)
+    else:
+        aper_mask = improc.create_circular_mask(np.shape(img.data), target_img_coord, aperrad_pix)
+        mod_apersum = np.nansum(sersic_img[aper_mask])
 
     # Get the spectrum of the contaminant made by R21 with weighting and sky subtraction
     contaminant_spec = io.load_r21_spec(target_clus, contaminant['iden'], contaminant['idfrom'],
@@ -910,6 +920,8 @@ def flag_contamination(megatab, maxdist=5.0 * u.arcsec, imgbuff=1.0 * u.arcsec, 
         clus = row['CLUSTER']
         iden = row['iden']
         idfrom = row['idfrom']
+        ra = row['RA']
+        dec = row['DEC']
 
         print("\n" + "="*80)
         print(f"Checking for contamination in {clus} object {iden}...")
@@ -944,24 +956,32 @@ def flag_contamination(megatab, maxdist=5.0 * u.arcsec, imgbuff=1.0 * u.arcsec, 
             
             print(f"Estimating the contaminant spectrum for {clus} object {iden}...")
             try:
-                # Estimate contaminant spectrum over an aperture of radius 1fwhm
-                contaminating_spec = estimate_contaminating_spectrum(nearby_sources_sorted, img, clus, iden, 
-                                                                     bbcenter=bbcenter, bbwidth=bbwidth, 
-                                                                     plot_result=plot_model,
-                                                                     outlier_removal=outlier_removal, 
-                                                                     outlier_kwargs=outlier_kwargs)
+                # Estimate contaminant spectrum
+                # If spec type is APER, get the aperture diameter and pass to estimate_contaminating_spectrum
+                aper_size = 0
+                if spec_type == 'APER' and 'fwhm' in spec_type:
+                    aper_size = float(spec_type.split("fwhm")[0])
+                    contaminating_spec = estimate_contaminating_spectrum(nearby_sources_sorted, img, clus, iden, 
+                                                                        bbcenter=bbcenter, bbwidth=bbwidth, 
+                                                                        plot_result=plot_model,
+                                                                        aper_radius=aper_size / 2,
+                                                                        outlier_removal=outlier_removal, 
+                                                                        outlier_kwargs=outlier_kwargs)
+                elif spec_type == 'R21':
+                    # If the spectrum is from R21, it was extracted from over segmentation maps.
+                    # Get a weight map
+                    weight_map = improc.get_convolved_weightmap(clus, iden, ra, dec, binary="noweight" in spec_type,
+                                                                size=maxdist)
+                    contaminating_spec = estimate_contaminating_spectrum(nearby_sources_sorted, img, clus, iden,
+                                                                        bbcenter=bbcenter, bbwidth=bbwidth,
+                                                                        plot_result=plot_model, aper_radius=0,
+                                                                        outlier_removal=outlier_removal, 
+                                                                        outlier_kwargs=outlier_kwargs)
             except fitting.BadDataError as e:
                 # If the Sersic fitting fails due to bad data (e.g. all pixels masked), we catch the error and 
                 # skip the contamination check for this source, rather than crashing the entire script.
                 print(f"Error estimating contaminant spectrum: {e}")
                 continue
-
-        # If N_fwhm > 1, scale the contaminant up by appropriate factor
-        N_fwhm = float(spec_type.split('fwhm')[0])
-        if N_fwhm > 1:
-            print(f"Scaling contaminant spectrum by factor of {N_fwhm} to match the aperture size of the target spectrum...")
-            contaminating_spec['spec'] *= N_fwhm
-            contaminating_spec['spec_err'] *= N_fwhm
 
         # Load the target spectrum and to obtain error bars for the contaminant spectrum. This
         # step is vital, as uncertainties in the actual target spectrum are needed to determine

@@ -383,6 +383,33 @@ def load_spec(clus, iden, idfrom, spec_source = 'R21', spec_type = 'weight_skysu
         return load_aper_spec(clus, iden, idfrom, spec_type)
     else:
         raise ValueError(f"spec_source {spec_source} not recognized. Use 'R21' or 'APER'.")
+    
+def download_r21_spectrum(clus, iden, spec_type):
+    """
+    Retrieve a spectrum from the R21 database
+
+    Parameters
+    ----------
+    clus : str
+        Cluster name (e.g., 'A2744', 'MACS0416', etc.)
+    iden : int
+        Identifier number of the object (e.g., 1234)
+    spec_type : str
+        Type of spectrum to download
+
+    Returns
+    -------
+    bool
+        True if the download was successful, False otherwise.
+    """
+    cluster_dir = get_r21_spectra_dir(clus)
+    os.makedirs(cluster_dir, exist_ok=True)
+    if clus == 'BULLET':
+        os.system(f"wget --no-check-certificate {get_spectra_url()}Bullet_final_catalog/spectra/spec_{iden}_{spec_type}.fits"
+                + f" -P {cluster_dir}")
+    else:
+        os.system(f"wget --no-check-certificate {get_spectra_url()}{clus}_final_catalog/spectra/spec_{iden}_{spec_type}.fits"
+                + f" -P {cluster_dir}")
 
 def load_r21_spec(clus, iden, idfrom, spec_type):
     """
@@ -429,13 +456,7 @@ def load_r21_spec(clus, iden, idfrom, spec_type):
     locfile = glob.glob(f"{cluster_dir}/spec_{identifier}_{spec_type}.fits")
     if len(locfile) == 0: # If the file is not found, attempt to download it
         print(f"File not found. Downloading from {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spec_type}.fits")
-        os.makedirs(cluster_dir, exist_ok=True)
-        if clus == 'BULLET':
-            os.system(f"wget --no-check-certificate {get_spectra_url()}Bullet_final_catalog/spectra/spec_{identifier}_{spec_type}.fits"
-                    + f" -P {cluster_dir}")
-        else:
-            os.system(f"wget --no-check-certificate {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spec_type}.fits"
-                    + f" -P {cluster_dir}")
+        download_r21_spectrum(clus, identifier, spec_type)
         print(f"Download complete.")
         locfile = glob.glob(f"{cluster_dir}/spec_{identifier}_{spec_type}.fits")
     
@@ -471,12 +492,7 @@ def load_r21_spec(clus, iden, idfrom, spec_type):
         except Exception as e:
             print(f"Could not remove corrupted file: {e}")
         # Re-download
-        if clus == 'BULLET':
-            os.system(f"wget --no-check-certificate {get_spectra_url()}Bullet_final_catalog/spectra/spec_{identifier}_{spec_type}.fits"
-                    + f" -P {cluster_dir}")
-        else:
-            os.system(f"wget --no-check-certificate {get_spectra_url()}{clus}_final_catalog/spectra/spec_{identifier}_{spec_type}.fits"
-                    + f" -P {cluster_dir}")
+        download_r21_spectrum(clus, identifier, spec_type)
         print("Re-download complete.")
         # Try loading again
         result = try_load(locfile)

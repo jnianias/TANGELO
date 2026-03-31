@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import astropy.units as u
 from mpdaf.obj import Cube, Image
+from photutils import segmentation
 from . import io
 import matplotlib.pyplot as plt
 from astropy.wcs import WCS
@@ -208,6 +209,135 @@ def make_muse_img(row, size, lcenter=None, width=None, cont=None, verbose=True):
             return img_line
     else:
         return img_line
+    
+def get_segmentation_mask(cluster: str, iden: str, ra: float, dec: float, size: float = 5, 
+                          download_if_missing: bool = False) -> Cutout2D:
+    """
+    Get a cutout of the R21 segmentation map for a given source based on its RA, DEC and cluster.
+    Resolves composite sources that are not in the segmentation map.
+    
+    Parameters
+    ----------
+    cluster : str
+        Name of the cluster.
+    ra : float
+        Right ascension of the source in degrees.
+    dec : float
+        Declination of the source in degrees.
+    size : float, optional
+        Size of the cutout in arcseconds. Default is 5.
+    download_if_missing : bool, optional
+        If True, attempts to download the segmentation map if not found locally. Default is False.
+    
+    Returns
+    -------
+    Cutout2D
+        A cutout of the R21 segmentation map centered on the source position.
+    
+    Raises
+    ------
+    FileNotFoundError
+        If the segmentation map for the specified cluster cannot be loaded.
+    ValueError
+        If the source position is out of bounds for the segmentation map or if no segmentation region is found for the source ID.
+    """
+    position = SkyCoord(ra=ra, dec=dec, unit='deg')
+    idno = int(''.join(filter(str.isdigit, iden)))) # Extract numeric part of id
+
+    # Load segmentation map HDUList with proper file handling
+    with io.load_segmentation_map(cluster, download_if_missing=download_if_missing) as seg_hdul:
+        if seg_hdul is None:
+            print(f"Segmentation map for cluster {cluster} could not be loaded.")
+            raise FileNotFoundError(f"Segmentation map for cluster {cluster} not found.")
+        
+        # Look for an extension called "DATA". If not present, revert to primary HDU
+        if 'DATA' in seg_hdul:
+            segmap = seg_hdul['DATA'].data
+            segmap_header = seg_hdul['DATA'].header
+        else:
+            segmap = seg_hdul[0].data
+            segmap_header = seg_hdul[0].header
+        
+        segmap_wcs = WCS(segmap_header)
+
+        # Check to see whether the object ID exists in the segmentation map
+        composite = False  # flag to indicate whether this source was constructed from multiple segmentation regions
+        if idno not in segmap:
+            composite = True # If the source wasn't in the seg map, that's because it was constructed from multiple 
+                            # segmentation regions (i.e., it's a composite source)
+            print(f"Object ID {iden} not found in segmentation map.")
+            # Check to see what the iden is at the source position
+            pix_coords = segmap_wcs.world_to_pixel(position) # Convert world to pixel coordinates
+            x_pix, y_pix = int(pix_coords[0]), int(pix_coords[1]) # Pixel coordinates
+            id_at_position = -1
+            if (0 <= x_pix < segmap.shape[1]) and (0 <= y_pix < segmap.shape[0]): # Check to make sure within array bounds
+                id_at_position = segmap[y_pix, x_pix] # Value at that pixel
+            else:
+                raise ValueError(f"Source position {position.to_string('hmsdms')} is out of bounds for "
+                                 f"segmentation map of cluster {cluster}.")
+            if id_at_position == 0:
+                print(f"Source position corresponds to background. Finding closest non-zero region...")
+                # Find the nearest non-zero pixel in the segmentation map to the source position
+                non_zero_coords = np.argwhere(segmap > 0)
+                if len(non_zero_coords) == 0:
+                    print(f"Warning: No non-zero pixels found in segmentation map. Using original source position.")
+                    return None
+                distances = np.sqrt((non_zero_coords[:, 1] - x_pix)**2 + (non_zero_coords[:, 0] - y_pix)**2)
+                nearest_idx = np.argmin(distances)
+                nearest_coord = non_zero_coords[nearest_idx]
+                id_at_position = segmap[nearest_coord[0], nearest_coord[1]]
+                print(f"Nearest non-zero pixel found at ({nearest_coord[1]}, {nearest_coord[0]}) with ID {id_at_position}. Using that instead.")
+                idno = id_at_position
+            else:
+                print(f"ID at source position is {id_at_position}. Using that instead.")
+                idno = id_at_position
+        
+        # If the source is a composite, find connected regions and merge them
+        if composite:
+            print(f"Source appears to be a composite. Attempting to merge connected segmentation regions with ID {idno}...")
+            # Get full list of ID numbers from the corresponding R21 catalogue so that we know which 
+            # ones are "missing"
+            source_cat = io.load_r21_catalogue(cluster, type='source')
+            all_idens = source_cat['iden']
+            # Create a mask for the initial ID
+            for i in range(3): # Iterate a few times to ensure all connected regions are merged (adjust as needed)
+                initial_mask = (segmap == idno)
+                # Use binary dilation to find connected regions (this will merge adjacent regions)
+                dilated_mask = binary_dilation(initial_mask, iterations=1) # Adjust iterations as needed
+                # Find all unique IDs in the dilated region that are NOT in the catalogue (and therefore were merged)
+                unique_ids = np.unique(segmap[dilated_mask])
+                unique_ids = unique_ids[unique_ids > 0] # Exclude background
+                unique_ids = [uid for uid in unique_ids if uid not in all_idens] # Exclude IDs in the catalogue
+                
+                if len(unique_ids) > 1:
+                    print(f"Found {len(unique_ids)} connected regions with IDs: {unique_ids}. Merging them into one region.")
+                    for uid in unique_ids:
+                        segmap[segmap == uid] = idno # Merge all connected regions into the original ID
+                else:
+                    print(f"No additional connected regions found.")
+
+        # Determine size of cutout if set to 'auto'
+        if size == 'auto':
+            ys, xs = np.where(segmap == idno)
+            if len(xs) == 0 or len(ys) == 0:
+                print(f"Can't find segmentation region for object ID {iden} in cluster {cluster}.")
+                return None
+            # Determine the minimum enclosing box
+            x_min, x_max = np.min(xs), np.max(xs)
+            y_min, y_max = np.min(ys), np.max(ys)
+            # Convert pixel coordinates to world coordinates
+            world_min = segmap_wcs.pixel_to_world(x_min, y_min)
+            world_max = segmap_wcs.pixel_to_world(x_max, y_max)
+            # Calculate size in arcseconds
+            size_x = np.abs(world_max.ra.arcsec - world_min.ra.arcsec)
+            size_y = np.abs(world_max.dec.arcsec - world_min.dec.arcsec)
+            size = np.max([size_x, size_y, 2.0]) # Minimum size of 2 arcseconds
+        
+        # Use the Cutout2D utility to make the cutout
+        cutout = Cutout2D(segmap, position, size*u.arcsec, wcs=segmap_wcs, mode='trim')
+        cutout.data = cutout.data == idno # convert to binary mask
+
+        return cutout
 
 def show_segmentation_mask(row, ax_in, return_cutout = False, size = 'auto', download_if_missing=False,
                            convolve_psf = None):
@@ -244,78 +374,114 @@ def show_segmentation_mask(row, ax_in, return_cutout = False, size = 'auto', dow
         Otherwise, returns None.
     """
 
-    position = SkyCoord(ra=row['RA'], dec=row['DEC'], unit='deg')
-    clus = row['CLUSTER'] 
-    id   = row['iden'] 
-    idno = int(''.join(filter(str.isdigit, id))) # Extract numeric part of id
+    clus = row['CLUSTER']
+    ra = row['RA']
+    dec = row['DEC']
+    iden = row['iden']
 
-    # Load segmentation map HDUList with proper file handling
-    with io.load_segmentation_map(clus, download_if_missing=download_if_missing) as seg_hdul:
-        if seg_hdul is None:
-            print(f"Segmentation map for cluster {clus} could not be loaded.")
-            raise FileNotFoundError(f"Segmentation map for cluster {clus} not found.")
+    cutout = get_segmentation_mask(clus, iden, ra, dec, size=size, download_if_missing=download_if_missing)    
+
+    # Optionally convolve with Gaussian PSF
+    if convolve_psf is not None:
+        pixel_scale = np.abs(cutout.wcs.pixel_scale_matrix[0,0]) * 3600.0 # arcsec/pixel
+        sigma_pixels = (convolve_psf / (2.0 * np.sqrt(2.0 * np.log(2.0)))) / pixel_scale
+        kernel = Gaussian2DKernel(sigma_pixels)
+        cutout.data = convolve(cutout.data.astype(float), kernel, fill_value=0.0)
+        cutout.data = cutout.data > 0.1 # Binarize after convolution
+
+    # Overlay contour outlining the segmentation map on the provided axis
+    ax_in.contour(cutout.data, levels=[0.5], colors='red', linewidths=1.5, 
+                    transform=ax_in.get_transform(WCS(cutout.wcs.to_header())))
+
+    if return_cutout:
+        return cutout # returns the cutout object containing vital WCS info
         
-        # Look for an extension called "DATA". If not present, revert to primary HDU
-        if 'DATA' in seg_hdul:
-            segmap = seg_hdul['DATA'].data
-            segmap_header = seg_hdul['DATA'].header
-        else:
-            segmap = seg_hdul[0].data
-            segmap_header = seg_hdul[0].header
-        
-        segmap_wcs = WCS(segmap_header)
+def get_wmap_cutout(cluster: str, ra: float, dec: float, size: int = 5) -> Cutout2D:
+    """
+    Generate a cutout of the HST weight map for a given source in the megatable based on
+    the RA, DEC and cluster.
 
-        # Check to see whether the object ID exists in the segmentation map
-        if idno not in segmap:
-            # Check to see what the iden is at the source position
-            pix_coords = segmap_wcs.world_to_pixel(position) # Convert world to pixel coordinates
-            x_pix, y_pix = int(pix_coords[0]), int(pix_coords[1]) # Pixel coordinates
-            id_at_position = -1
-            if (0 <= x_pix < segmap.shape[1]) and (0 <= y_pix < segmap.shape[0]): # Check to make sure within array bounds
-                id_at_position = segmap[y_pix, x_pix] # Value at that pixel
-            else:
-                raise ValueError(f"Source position {position.to_string('hmsdms')} is out of bounds for "
-                                 f"segmentation map of cluster {clus}.")
-            print(f"Object ID {id} not found in segmentation map for cluster {clus}. "
-                  f"ID at source position is {id_at_position}. Using that instead.")
-            idno = id_at_position
-                
-        # Determine size of cutout
-        if size == 'auto':
-            ys, xs = np.where(segmap == idno)
-            if len(xs) == 0 or len(ys) == 0:
-                print(f"Can't find segmentation region for object ID {id} in cluster {clus}.")
-                return None
-            # Determine the minimum enclosing box
-            x_min, x_max = np.min(xs), np.max(xs)
-            y_min, y_max = np.min(ys), np.max(ys)
-            # Convert pixel coordinates to world coordinates
-            world_min = segmap_wcs.pixel_to_world(x_min, y_min)
-            world_max = segmap_wcs.pixel_to_world(x_max, y_max)
-            # Calculate size in arcseconds
-            size_x = np.abs(world_max.ra.arcsec - world_min.ra.arcsec)
-            size_y = np.abs(world_max.dec.arcsec - world_min.dec.arcsec)
-            size = np.max([size_x, size_y, 2.0]) # Minimum size of 2 arcseconds
-            
-        # Use the Cutout2D utility to make the cutout
-        cutout = Cutout2D(segmap, position, size*u.arcsec, wcs=segmap_wcs, mode='trim')
-        cutout.data = cutout.data == idno
+    Parameters
+    ----------
+    cluster : str
+        Name of the cluster.
+    ra : float
+        Right ascension of the source in degrees.
+    dec : float
+        Declination of the source in degrees.
+    size : int, optional
+        The size of the cutout in arcseconds (default is 5).
 
-        # Optionally convolve with Gaussian PSF
-        if convolve_psf is not None:
-            pixel_scale = np.abs(cutout.wcs.pixel_scale_matrix[0,0]) * 3600.0 # arcsec/pixel
-            sigma_pixels = (convolve_psf / (2.0 * np.sqrt(2.0 * np.log(2.0)))) / pixel_scale
-            kernel = Gaussian2DKernel(sigma_pixels)
-            cutout.data = convolve(cutout.data.astype(float), kernel, fill_value=0.0)
-            cutout.data = cutout.data > 0.1 # Binarize after convolution
+    Returns
+    -------
+    Cutout2D
+        A cutout of the HST weight map centered on the source.
+    """
 
-        # Overlay contour outlining the segmentation map on the provided axis
-        ax_in.contour(cutout.data, levels=[0.5], colors='red', linewidths=1.5, 
-                      transform=ax_in.get_transform(WCS(cutout.wcs.to_header())))
+    coord = SkyCoord(ra, dec, unit='deg')
 
-        if return_cutout:
-            return cutout # returns the cutout object containing vital WCS info
-        
+    # Get the directory of the HST weight map based on the cluster
+    with io.load_weight_map(cluster) as weight_map:
+        # Print names of the fits extensions in the weight map
+        print(f"Weight map extensions for cluster {cluster}: {[ext.name for ext in weight_map]}")
+        # Generate cutout
+        cutout = Cutout2D(weight_map['DATA'].data, coord, size*u.arcsec,
+                          wcs = WCS(weight_map['DATA'].header))
+        return cutout
+    
+def get_convolved_weightmap(cluster: str, iden: int, ra: float, dec: float, 
+                            binary: bool = False, size: int = 5, 
+                            mask_thresh: float = 0.1) -> Cutout2D:
+    """
+    Get a cutout of the HST weight map for a given source, multiplied by a binary segmentation mask
+     and convolved with a Gaussian kernel to match the MUSE PSF.
+
+    Parameters
+    ----------
+    cluster : str
+        Name of the cluster.
+    iden : int
+        Numeric identifier of the source (without the 'P' prefix).
+    ra : float
+        Right ascension of the source in degrees.
+    dec : float
+        Declination of the source in degrees.
+    binary : bool, optional
+        If true, return only the binary mask (i.e. no weighting, just segmentation map)
+    size : int, optional
+        The size of the cutout in arcseconds (default is 5).
+
+    Returns
+    -------
+    Cutout2D
+        A cutout of the HST weight map multiplied by the segmentation mask and convolved with a Gaussian kernel.
+    """
+    segmap = get_segmentation_mask(cluster, iden, ra, dec, size=size)
+
+    # Set up Gaussian kernel based on MUSE PSF FWHM for the cluster
+    fwhm = get_muse_psf(cluster)
+    pixel_scale = np.abs(segmap.wcs.pixel_scale_matrix[0,0]) * 3600.0 # arcsec/pixel
+    sigma_pixels = (fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))) / pixel_scale
+    kernel = Gaussian2DKernel(sigma_pixels)
+
+    # Convolve segmentation mask and re-binarize
+    convolved_mask = convolve(segmap.data.astype(float), kernel, fill_value=0.0)
+    convolved_mask = convolved_mask > mask_thresh # Binarize after convolution
+
+    if binary:
+        segmap.data = convolved_mask.astype(float)
+        return segmap
+
+    # Convolve weight map with the same kernel
+    wmap = get_wmap_cutout(cluster, ra, dec, size)
+    convolved_wmap = convolve(wmap.data.astype(float), kernel, fill_value=0.0)
+
+    # Multiply convolved weight map by convolved segmentation mask
+    weighted_mask = convolved_wmap * convolved_mask
+    wmap.data = weighted_mask # Update the cutout data to be the weighted mask
+    
+    return wmap
+
 def get_segmap_peak(full_iden, cluster, seg_map=None, weight_map=None, search_size=20.0):
     """
     Finds the brightest pixel in the segmentation map for the given source ID. If no segmentation map is found

@@ -98,10 +98,15 @@ class LyaProfile:
         """
         advdict = {} # Dictionary to hold advanced parameters
 
+        # Determine whether Complex values are being used for error propagation
+        is_complex = isinstance(list(param_dict.values())[0], Complex)
+
         # Calculate FWHM
         if self.ncomp == 2:
-            advdict['FWHMB'] = 2 * np.sqrt(2 * np.log(2)) * param_dict['DISPB'] / (1. - 2 * np.log(2) * param_dict['ASYMB'] ** 2.)
-        advdict['FWHMR'] = 2 * np.sqrt(2 * np.log(2)) * param_dict['DISPR'] / (1. - 2 * np.log(2) * param_dict['ASYMR'] ** 2.)
+            advdict['FWHMB'] = 2 * np.sqrt(2 * np.log(2)) * param_dict['DISPB'] \
+                / (1. - 2 * np.log(2) * np.abs(param_dict['ASYMB']) ** 2.)
+        advdict['FWHMR'] = 2 * np.sqrt(2 * np.log(2)) * param_dict['DISPR'] \
+            / (1. - 2 * np.log(2) * np.abs(param_dict['ASYMR']) ** 2.)
         
         # Calculate integrated fluxes over a minimum intrinsic range (4 Angstroms rest-frame)
         intrange_rest = 4.0
@@ -111,13 +116,16 @@ class LyaProfile:
                               / mdl.lya_swhm(param_dict['DISPB'], param_dict['ASYMB'], +1))
             intstart = param_dict['LPEAKB'] - asymfrac * intrange / (1. + asymfrac)
             intend = param_dict['LPEAKB'] + intrange / (1. + asymfrac)
+            if is_complex:
+                intstart = intstart.value
+                intend = intend.value
             xaxis = np.arange(intstart, intend, 0.125)
             modfuncb = mdl.lya_speak(
                 xaxis, 
-                param_dict['AMPB'], 
-                param_dict['LPEAKB'], 
-                param_dict['DISPB'], 
-                param_dict['ASYMB'], 
+                param_dict['AMPB'], # keep this complex if using Complex for error propagation
+                param_dict['LPEAKB'].value if is_complex else param_dict['LPEAKB'], 
+                param_dict['DISPB'].value if is_complex else param_dict['DISPB'], 
+                param_dict['ASYMB'].value if is_complex else param_dict['ASYMB'], 
                 0.
             )
             posmask = modfuncb > 0.
@@ -126,13 +134,16 @@ class LyaProfile:
                           / mdl.lya_swhm(param_dict['DISPR'], param_dict['ASYMR'], +1))
         intstart = param_dict['LPEAKR'] - asymfrac * intrange / (1. + asymfrac)
         intend = param_dict['LPEAKR'] + intrange / (1. + asymfrac)
+        if is_complex:
+            intstart = intstart.value
+            intend = intend.value
         xaxis = np.arange(intstart, intend, 0.125)
         modfuncr = mdl.lya_speak(
             xaxis, 
-            param_dict['AMPR'], 
-            param_dict['LPEAKR'], 
-            param_dict['DISPR'], 
-            param_dict['ASYMR'], 
+            param_dict['AMPR'], # keep this complex if using Complex for error propagation
+            param_dict['LPEAKR'].value if is_complex else param_dict['LPEAKR'], 
+            param_dict['DISPR'].value if is_complex else param_dict['DISPR'], 
+            param_dict['ASYMR'].value if is_complex else param_dict['ASYMR'], 
             0.
         )
         posmask = modfuncr > 0.
@@ -213,7 +224,8 @@ class LyaProfile:
                 return None, None, None, None
             perrs = np.sqrt(np.diag(pcov))
             complex_pars = [Complex(val, err) for val, err in zip(popt, perrs)]
-            advpars = self.get_adv_params(complex_pars)
+            complex_dict = {k: v for k, v in zip(self.param_dict.keys(), complex_pars)}
+            advpars = self.get_adv_params(complex_dict)
             adv_params = {k: v.value for k, v in advpars.items()}
             adv_errors = {k: v.error for k, v in advpars.items()}
             residuals = y[mask] - self.func(x[mask], *popt)

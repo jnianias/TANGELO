@@ -253,16 +253,14 @@ def lya_swhm(disp, asym, side):
     else:
         raise ValueError("Side must be +1 or -1.")
     
-def gaussian_kernel(x: np.ndarray, fwhm: float) -> np.ndarray:
+def gaussian_kernel(fwhm: float, step: float = 1.25) -> np.ndarray:
     """
-    Generate a Gaussian kernel for convolution.
+    Generate a Gaussian kernel for convolution of size 3 times the FWHM, sampled at the specified step size.
 
     Parameters
     ----------
-    x : np.ndarray
-        The input array for which the kernel will be generated. The kernel will be centered on the mean of this array.
     fwhm : float
-        The full width at half maximum (FWHM) of the Gaussian kernel in the same units as the input array.
+        The full width at half maximum (FWHM) of the Gaussian kernel
 
     Returns
     -------
@@ -270,15 +268,22 @@ def gaussian_kernel(x: np.ndarray, fwhm: float) -> np.ndarray:
         The generated Gaussian kernel.
 
     """
+    stddev = fwhm / (2 * np.sqrt(2 * np.log(2)))
+    kernel_size = int(3 * fwhm / step)  # Size of the kernel to cover 3 FWHM
+    x = np.linspace(-kernel_size * step / 2, kernel_size * step / 2, kernel_size)
+    kernel = np.exp(-0.5 * (x / stddev) ** 2)
+    kernel /= np.sum(kernel)  # Normalize the kernel to have a sum of 1
+    return kernel
+
     
-def convolver(input_array: np.ndarray, gauss_fwhm: float) -> np.ndarray:
+def convolver(spec_in: np.ndarray, gauss_fwhm: float, step: float = 1.25) -> np.ndarray:
     """
     Convolve a model spectrum with a Gaussian kernel using numpy's convolution function.
 
     Parameters
     ----------
-    input_array : np.ndarray
-        The input spectrum to be convolved.
+    spec_in : np.ndarray
+        The input model spectrum to be convolved.
     gauss_fwhm : float
         The full width at half maximum (FWHM) of the Gaussian kernel in the same units 
         as the input array.
@@ -290,10 +295,14 @@ def convolver(input_array: np.ndarray, gauss_fwhm: float) -> np.ndarray:
 
     """
     # Generate the Gaussian kernel
-    kernel = gaussian_kernel(input_array, gauss_fwhm)
+    kernel = gaussian_kernel(gauss_fwhm, step=step)
+
+    # Raise an error if the kernel is larger than the input spectrum
+    if len(kernel) > len(spec_in):
+        raise ValueError("Gaussian kernel is larger than the input spectrum. Please reduce the FWHM or increase the step size.")
 
     # Perform convolution using numpy's convolution function
-    convolved_array = np.convolve(input_array, kernel, mode='same')
+    convolved_array = np.convolve(spec_in, kernel, mode='same')
 
     return convolved_array
 
@@ -321,14 +330,14 @@ def convolved_gaussian_doublet_vel(wavelengths, z, gauss_fwhm):
     return model
 
 def convolved_lya_speak(gauss_fwhm):
-    def model(x, amp, lpeak, disp, asym, const, slope):
-        base_model = lya_speak_lin(x, amp, lpeak, disp, asym, const, slope)
+    def model(x, amp, lpeak, disp, asym, const):
+        base_model = lya_speak(x, amp, lpeak, disp, asym, const)
         return convolver(base_model, gauss_fwhm)
     return model
 
 def convolved_lya_dpeak(gauss_fwhm):
-    def model(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const, slope):
-        base_model = lya_dpeak_lin(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const, slope)
+    def model(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const):
+        base_model = lya_dpeak(x, ampb, lpeakb, dispb, asymb, ampr, lpeakr, dispr, asymr, const)
         return convolver(base_model, gauss_fwhm)
     return model
 

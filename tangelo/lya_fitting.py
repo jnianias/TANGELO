@@ -302,7 +302,7 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
         print("Constant baseline fit is good enough; returning result.")
         if plot_result:
             plot.plot_lya_fit_result(fit_const, iden, cluster, save_plots=save_plots, 
-                               plot_dir=plot_dir, spec_type=spec_type, convolve_model=convolve_model)
+                               plot_dir=plot_dir, spec_type=spec_type)
         return fit_const
     
     # If not, try a linear baseline
@@ -320,7 +320,7 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
         print("Linear baseline fit is good enough; returning result.")
         if plot_result:
             plot.plot_lya_fit_result(fit_lin, iden, cluster, save_plots=save_plots, 
-                                    plot_dir=plot_dir, spec_type=spec_type, convolve_model=convolve_model)
+                                    plot_dir=plot_dir, spec_type=spec_type)
         return fit_lin
     
     # If still not good enough, try a damped Lyman alpha baseline
@@ -346,7 +346,7 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
         print("Damped Lyman alpha baseline fit is good enough; returning result.")
         if plot_result:
             plot.plot_lya_fit_result(fit_damp, iden, cluster, save_plots=save_plots, 
-                               plot_dir=plot_dir, spec_type=spec_type, convolve_model=convolve_model)
+                               plot_dir=plot_dir, spec_type=spec_type)
         return fit_damp
     
     # If none of the fits were good enough, return the one with the lowest reduced chi-squared
@@ -360,7 +360,7 @@ def fit_lya_autobase(wave, spec, spec_err, initial_guesses, iden, cluster,
     # Plot the best fit if requested
     if plot_result and best_fit:
         plot.plot_lya_fit_result(best_fit, iden, cluster, save_plots=save_plots, 
-                           plot_dir=plot_dir, spec_type=spec_type, convolve_model=convolve_model)
+                           plot_dir=plot_dir, spec_type=spec_type)
     
     return best_fit
 
@@ -577,6 +577,14 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
                 mdl.lya_speak_damp if baseline == 'damp' else \
                 mdl.lya_speak
     
+    # If convolving the double-peaked model, also convolve the single-peaked model
+    if convolve_model:
+        conv_func_name_single = f"convolved_{mdl_func_single.__name__}"
+        if hasattr(mdl, conv_func_name_single):
+            mdl_func_single = getattr(mdl, conv_func_name_single)(lsf_fwhm)
+        else:
+            raise AttributeError(f"Model function {conv_func_name_single} not found in models module. Cannot convolve model.")
+    
     # Ensure initial guesses are within bounds
     p0_single, speak_bounds = check_inputs(p0_single, speak_bounds)
 
@@ -648,7 +656,7 @@ def fit_lya(wave, spec, spec_err, initial_guesses, iden, cluster,
 
     # Now get the final parameters and errors using bootstrapping
     # Using the LyaProfile class which is in this module
-    initial_profile = LyaProfile(param_dict, error_dict)
+    initial_profile = LyaProfile(param_dict, error_dict, )
     # Now use the class method to generate uncertainties
     final_params, final_errors, \
         final_function, final_reduced_chisq \
