@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 from scipy.stats import ks_2samp
 
+from typing import Optional
+
 def stack_and_plot_lines(
     megatab,
     emission_lines,
@@ -271,11 +273,62 @@ from matplotlib import colormaps as cm
 blured = cm.get_cmap('seismic')
 black = cm.get_cmap('bone_r')
 
-def make_scatter(colx, coly, ax, z = None, plotxubs=False, plotyubs=False, color = None, 
-                   skymask = 'total', edgecolor = 'black', filts = [],
-                   color_redshift = False, highlight = False, alpha = 0.6, 
-                   alpha_ubs = 0.3, msize = 25, z_cmap = blured, alpha_e = 0.3,
-                  label = None, marker='o'):
+def mask_bad_scatter_points(colx: list, coly: list, upper_bounds: Optional[np.ndarray] = None, z: Optional[np.ndarray] = None, 
+                            mask_in: Optional[np.ndarray] = None) -> tuple[list, list, Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Masks out points in colx and coly that have NaN or inf values in either the values or error bars.
+
+    Parameters
+    ----------
+    colx : list of arrays
+        List of arrays for x values and optional error bars. First element is x values, second is symmetric error bars, third is asymmetric error bars.
+    coly : list of arrays
+        List of arrays for y values and optional error bars. First element is y values, second is symmetric error bars, third is asymmetric error bars.
+    upper_bounds : np.ndarray, optional
+        Mask for points that are upper limits. Should have the same length as colx[0] and coly[0]. Default is 
+        None (no upper limits).
+    z : array-like, optional
+        Values for coloring the points. Should have the same length as colx[0] and coly[0]. Default is None (no coloring).
+    mask_in : array-like, optional
+        Optional boolean array to further mask the points. Should have the same length as colx[0] and coly[0]. 
+        Default is None (no additional masking).
+        
+    Returns
+    -------
+    tuple of lists
+        Masked versions of colx and coly with NaN and inf points removed.
+    """
+    mask = np.ones(np.size(colx[0])).astype(bool)
+    if mask_in is not None:
+        mask &= mask_in
+    mask &= ~np.isnan(colx[0])
+    mask &= ~np.isnan(coly[0])
+    mask &= ~np.isinf(colx[0])
+    mask &= ~np.isinf(coly[0])
+    if len(colx) > 1:
+        mask &= ~np.isnan(colx[1])
+        mask &= ~np.isinf(colx[1])
+    if len(colx) > 2:
+        mask &= ~np.isnan(colx[2])
+        mask &= ~np.isinf(colx[2])
+    if len(coly) > 1:
+        mask &= ~np.isnan(coly[1])
+        mask &= ~np.isinf(coly[1])
+    if len(coly) > 2:
+        mask &= ~np.isnan(coly[2])
+        mask &= ~np.isinf(coly[2])
+
+    masked_colx = [arr[mask] for arr in colx]
+    masked_coly = [arr[mask] for arr in coly]
+    masked_upper_bounds = upper_bounds[mask] if upper_bounds is not None else None
+    masked_z = z[mask] if z is not None else None
+
+    return masked_colx, masked_coly, masked_upper_bounds, masked_z
+
+def make_scatter(colx: list, coly: list, ax: plt.Axes, mask: Optional[np.ndarray] = None, 
+                 z = None, upper_bounds: Optional[np.ndarray] = None, edgecolor = 'black',
+                 color_redshift = False, alpha = 0.6, msize = 25, z_cmap = blured, alpha_e = 0.3,
+                 label = None, marker='o', alpha_ubs = 0.1):
     """
     Makes a scatter plot of colx vs coly, with optional coloring by z and filtering by filts.
 
@@ -287,28 +340,22 @@ def make_scatter(colx, coly, ax, z = None, plotxubs=False, plotyubs=False, color
         List of arrays for y values and optional error bars. First element is y values, second is symmetric error bars, third is asymmetric error bars.
     ax : matplotlib.axes.Axes
         The axes on which to plot.
+    mask : array-like, optional
+        Optional boolean array to mask the points. Should have the same length as colx[0] and coly[0]. Default 
+        is None (no masking).
     z : array-like, optional
-        Values for coloring the points. If None, points will not be colored by z.
-    plotxubs : bool, optional
-        Whether to plot upper bounds in x as arrows.
-    plotyubs : bool, optional
-        Whether to plot upper bounds in y as arrows.
-    color : str or array-like, optional
-        Color for the points. If None, color will be determined by z if color_redshift is True, otherwise default color will be used.
-    skymask : str, optional
-        Sky mask to apply for filtering the data. Default is 'total'.
+        Values for coloring the points.
+    upper_bounds : np.ndarray, optional
+        Mask for points that are upper limits. Should have the same length as colx[0] and coly[0]. Default is 
+        None (no upper limits).
     edgecolor : str, optional
         Color for the edges of the points. Default is 'black'.
-    filts : list of arrays, optional
-        List of boolean arrays for filtering the data. Each array should have the same length as colx[0] and coly[0], and the final mask will be the logical AND of all the filters.
     color_redshift : bool, optional
         Whether to color the points by redshift using the z_cmap. If True, z values will be used for coloring the points. If False, color will be determined by the color parameter or default color.
-    highlight : bool, optional
-        Whether to highlight points that meet certain criteria (e.g. high redshift). If True, points that meet the criteria will be colored differently or plotted with a different marker. The specific criteria for highlighting should be defined within the function based on the data and requirements.
     alpha : float, optional
         Alpha value for the points. Default is 0.6.
     alpha_ubs : float, optional
-        Alpha value for the upper bound arrows. Default is 0.3.
+        Alpha value for the upper bound arrows. Default is 0.1.
     msize : float, optional
         Marker size for the points. Default is 25.
     z_cmap : matplotlib.colors.Colormap, optional
@@ -324,12 +371,11 @@ def make_scatter(colx, coly, ax, z = None, plotxubs=False, plotyubs=False, color
     -------
     None
     """
-    mask = np.ones(np.size(colx[0])).astype(bool) # Initialize mask to include all points
-    mask *= ~(np.isnan(colx[0]) + np.isnan(coly[0])) # Exclude points where x or y is NaN
-
-    for cond in filts:
-        # Apply additional filters to the mask
-        mask *= cond
+    if upper_bounds is None:
+        upper_bounds = np.zeros(np.size(colx[0])).astype(bool)
+    # If there are any NaN or inf values or error bars, remove all the corresponding points from the plot
+    colx, coly, upper_bounds, z = mask_bad_scatter_points(colx, coly, upper_bounds = upper_bounds, z = z,
+                                                           mask_in=mask)
     
     if z is None:
         # If z is not provided, use a default color for all points
@@ -351,25 +397,19 @@ def make_scatter(colx, coly, ax, z = None, plotxubs=False, plotyubs=False, color
         yerrsm = coly[1] # Lower error bars
         yerrsp = coly[2] # Upper error bars
     
-    # Create scatter plot with error bars and optional upper bound arrows
-    sc = ax.scatter(xvals[mask], yvals[mask], c=z[mask], 
-               cmap=z_cmap, edgecolor=edgecolor, s=msize, vmin=3.0, 
-               vmax=6.7, alpha = alpha, label=label, marker=marker)
-    ax.errorbar(xvals[mask], yvals[mask], xerr=[xerrsm[mask], xerrsp[mask]], 
-                yerr=[yerrsm[mask], yerrsp[mask]], marker='', color=edgecolor, 
-                zorder=0, alpha = alpha_e, linestyle='')
-    if plotxubs:
-        x_ubs_mask = mask & (xerrsp > 0) & ~np.isnan(xvals)
-        ax.scatter(xvals[x_ubs_mask] + xerrsp[x_ubs_mask], yvals[x_ubs_mask],
-                   marker='^', color=edgecolor, s=msize * 0.5, alpha=alpha_ubs, zorder=1)
-    if plotyubs:
-        y_ubs_mask = mask & (yerrsp > 0) & ~np.isnan(yvals)
-        ax.scatter(xvals[y_ubs_mask], yvals[y_ubs_mask] + yerrsp[y_ubs_mask],
-                   marker='^', color=edgecolor, s=msize * 0.5, alpha=alpha_ubs, zorder=1)
-    if highlight:
-        highlight_mask = mask & (z > 5.0)  # Example criterion for highlighting high-redshift sources
-        ax.scatter(xvals[highlight_mask], yvals[highlight_mask],
-                   marker='*', color='gold', s=msize * 1.5, alpha=1.0, zorder=2, label='High-z Highlight')
+    # Create scatter plots with error bars for the detections and upper limits
+    # Detections first
+    sc = ax.scatter(xvals[~upper_bounds], yvals[~upper_bounds], c=z[~upper_bounds], cmap=z_cmap, 
+                    edgecolor=edgecolor, s=msize, vmin=3.0, vmax=6.7, 
+                    alpha = alpha, label=label, marker=marker) # points
+    ax.errorbar(xvals[~upper_bounds], yvals[~upper_bounds], xerr=[xerrsm[~upper_bounds], xerrsp[~upper_bounds]], 
+                yerr=[yerrsm[~upper_bounds], yerrsp[~upper_bounds]], marker='', color=edgecolor, 
+                zorder=0, alpha = alpha_e, linestyle='') # error bars
+    # Then upper limits
+    ax.errorbar(xvals[upper_bounds], yvals[upper_bounds], xerr=[xerrsm[upper_bounds], xerrsp[upper_bounds]], 
+                yerr=[3*yerrsm[upper_bounds], yerrsp[upper_bounds]], marker='v', color='red', zorder=0, 
+                alpha = alpha_ubs, linestyle='', uplims=upper_bounds[upper_bounds]) # upper limit arrows
+
     if color_redshift:
         cbar = plt.colorbar(sc, ax=ax)
         cbar.set_label('Redshift (z)')

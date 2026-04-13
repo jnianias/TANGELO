@@ -2,6 +2,7 @@
 Quality control utilities for processing of MUSE spectra
 """
 
+from typing import Optional, Dict, List
 from . import io
 from . import image_processing as improc
 from . import plotting as plot
@@ -562,10 +563,10 @@ def get_initial_sersic_params(contaminant, img, ccmem_impos, rough_rad):
 
     return initial_guesses, sersic_bounds
 
-def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_iden, mask_radius=2, 
+def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_iden, spec_type, mask_radius=2, 
                                     target_coord=None, plot_result=False, aper_radius=1, outlier_removal=True,
                                     outlier_kwargs={'niter': 3, 'sigma_upper': 3.0}, bbcenter=6000, bbwidth=1000,
-                                    seg_mask=None, weight_map=None):
+                                    weight_map=None):
     """
     Estimate the spectrum of the most likely contaminating source by fitting a Sersic profile
     to the MUSE white light image and scaling a spectrum of the contaminant (taken from the 
@@ -585,6 +586,8 @@ def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_ide
         The sky coordinates of the target source. If provided, this will be used to define the aperture for scaling the contaminant spectrum. If None, the target position in the image will be used
     target_iden : str, optional
         Identifier for the target source. Used for labeling plots and outputs.
+    spec_type : str, optional
+        Type of the spectrum (e.g., 'contaminant', 'target'). Used for labeling plots and outputs.
     plot_result : bool, optional
         Whether to plot the fitted Sersic profile and contaminant spectrum (default is False).
     aper_radius : float, optional
@@ -670,7 +673,7 @@ def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_ide
     if plot_result:
         print(f"Generating figure of fitted Sersic profile and contaminant spectrum...")
         plot.plot_2d_model(img, sersic_img, markers=ccmem_impos, iden=target_iden, cluster=target_clus,
-                           aperture=(target_img_coord, aperrad_pix), save_plot=True)
+                           aperture=(target_img_coord, aperrad_pix), save_plot=True, weight_map=weight_map)
     
     # We now need to sum the Sersic profile over the aperture containing the target or segmentation map
     if weight_map is not None:
@@ -696,7 +699,7 @@ def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_ide
                             plot_name='contaminant_spectrum.png')
     
     # Save the contaminant spectrum for later use in checking for contaminant lines in the target spectrum
-    contaminant_spec.write(io.get_misc_dir(cluster=target_clus) / f"{target_iden}_contaminant_spec.fits", overwrite=True)
+    contaminant_spec.write(io.get_misc_dir(cluster=target_clus) / f"{target_iden}_{spec_type}_contaminant_spec.fits", overwrite=True)
 
     return contaminant_spec
 
@@ -851,10 +854,17 @@ def check_contamination(row, contaminating_spec, target_spec, save_plot=True):
 from astropy.io import fits
 from pathlib import Path
 
-def flag_contamination(megatab, maxdist=5.0 * u.arcsec, imgbuff=1.0 * u.arcsec, flux_filter='HST_F814W',
-                        spec_source='APER', spec_type='1fwhm_opt', bbcenter=6000, bbwidth=1000,
-                        save_contamination_plots=True, use_existing_contaminant_spectra=False, plot_model=True,
-                        save_bb_images=False, outlier_removal=True, outlier_kwargs={'niter': 3, 'sigma_upper': 3.0}):
+class WeightMapError(Exception):
+    """Custom exception for errors related to weight maps."""
+    pass
+
+def flag_contamination(megatab: aptb.Table, maxdist: Optional[u.Quantity] = None, imgbuff: Optional[u.Quantity] = None, 
+                        flux_filter: str = 'HST_F814W', spec_source: str = 'APER', spec_type: str = '1fwhm_opt', 
+                        bbcenter: float = 6000, bbwidth: float = 1000, save_contamination_plots: bool = True, 
+                        use_existing_contaminant_spectra: bool = False, plot_model: bool = True, 
+                        save_bb_images: bool = False, outlier_removal: bool = True, 
+                        outlier_kwargs: Optional[Dict[str, float]] = None, wmap_tightness: float = 1.0,
+                        plot_weight: bool = True, mask_thresh: float = 0.1) -> None:
     """
     Flag likely cases of contaminated emission/absorption lines using the spectrum of the most likely
     contaminating source based on proximity and brightness and comparing its spectrum with target
@@ -895,12 +905,31 @@ def flag_contamination(megatab, maxdist=5.0 * u.arcsec, imgbuff=1.0 * u.arcsec, 
         (default: True).
     outlier_kwargs : dict, optional
         Dictionary of keyword arguments to pass to the outlier removal function (default: {'niter': 3, 'sigma_upper': 3.0}).
+    wmap_tightness : float, optional
+        Controls the size of the HST weight map cutout relative to maxdist when using segmentation map weighting 
+        (spec_source='R21'). A value of 1.0 (default) means the weight map size equals maxdist. Values less than 1.0 
+        create a tighter crop (smaller weight map), while values greater than 1.0 create a larger crop. The weight map 
+        is then resampled to match the MUSE image grid, with pixels outside the weight map region filled with fill_value=0.
+    plot_weight : bool, optional
+        If True, save a plot of the resampled weight map with a contour at the 1% level when using segmentation map 
+        weighting (spec_source='R21') (default: True).
+    mask_thresh : float, optional
+        When using segmentation map weighting (spec_source='R21'), pixels in the segmentation with values above this 
+        threshold are set to 1 after convolution.
 
     Returns
     -------
         None
 
     """
+    # Set defaults for optional parameters
+    if maxdist is None:
+        maxdist = 5.0 * u.arcsec
+    if imgbuff is None:
+        imgbuff = 1.0 * u.arcsec
+    if outlier_kwargs is None:
+        outlier_kwargs = {'niter': 3, 'sigma_upper': 3.0}
+    
     # Convert maxdist and imgbuff to astropy quantities if they are provided as floats
     if isinstance(maxdist, (int, float)):
         maxdist = maxdist * u.arcsec
@@ -935,7 +964,7 @@ def flag_contamination(megatab, maxdist=5.0 * u.arcsec, imgbuff=1.0 * u.arcsec, 
                 _ = improc.make_bb_image(clus, bbcenter, bbwidth, save=True)
 
         # Check to see if a contaminant spectrum has already been estimated and saved for this target, and load it if desired
-        contaminant_spec_path = io.get_misc_dir(cluster=clus) / f"{iden}_contaminant_spec.fits"
+        contaminant_spec_path = io.get_misc_dir(cluster=clus) / f"{iden}_{spec_type}_contaminant_spec.fits"
         if use_existing_contaminant_spectra and contaminant_spec_path.exists():
             print(f"Loading existing contaminant spectrum for {clus} object {iden} from {contaminant_spec_path}")
             contaminant_spec_hdul = fits.open(contaminant_spec_path)
@@ -959,24 +988,41 @@ def flag_contamination(megatab, maxdist=5.0 * u.arcsec, imgbuff=1.0 * u.arcsec, 
                 # Estimate contaminant spectrum
                 # If spec type is APER, get the aperture diameter and pass to estimate_contaminating_spectrum
                 aper_size = 0
-                if spec_type == 'APER' and 'fwhm' in spec_type:
+                if (spec_source == 'APER' and 'fwhm' in spec_type):
                     aper_size = float(spec_type.split("fwhm")[0])
+                    print(f"Estimating contaminant spectrum using an aperture of size {aper_size} FWHM.")
                     contaminating_spec = estimate_contaminating_spectrum(nearby_sources_sorted, img, clus, iden, 
-                                                                        bbcenter=bbcenter, bbwidth=bbwidth, 
-                                                                        plot_result=plot_model,
-                                                                        aper_radius=aper_size / 2,
-                                                                        outlier_removal=outlier_removal, 
-                                                                        outlier_kwargs=outlier_kwargs)
-                elif spec_type == 'R21':
-                    # If the spectrum is from R21, it was extracted from over segmentation maps.
+                                                                         spec_type,
+                                                                         bbcenter=bbcenter, bbwidth=bbwidth, 
+                                                                         plot_result=plot_model,
+                                                                         aper_radius=aper_size / 2,
+                                                                         outlier_removal=outlier_removal,
+                                                                         outlier_kwargs=outlier_kwargs)
+                elif spec_source == 'R21' and iden[0] == 'P':
+                    # If the spectrum is from R21 and is of PRIOR type, it was extracted from over segmentation maps.
+                    print(f"Estimating contaminant spectrum using segmentation map weighting.")
                     # Get a weight map
                     weight_map = improc.get_convolved_weightmap(clus, iden, ra, dec, binary="noweight" in spec_type,
-                                                                size=maxdist)
+                                                                size=maxdist*wmap_tightness, mask_thresh=mask_thresh)
+                    # Resample weight map to match the image grid
+                    weight_map_resampled = improc.resample_weightmap(weight_map, img, fill_value=0)
+                    
                     contaminating_spec = estimate_contaminating_spectrum(nearby_sources_sorted, img, clus, iden,
+                                                                        spec_type,
                                                                         bbcenter=bbcenter, bbwidth=bbwidth,
                                                                         plot_result=plot_model, aper_radius=0,
                                                                         outlier_removal=outlier_removal, 
+                                                                        outlier_kwargs=outlier_kwargs,
+                                                                        weight_map=weight_map_resampled)
+                else:
+                    print(f"Estimating contaminant spectrum using a default aperture of 1 FWHM.")
+                    contaminating_spec = estimate_contaminating_spectrum(nearby_sources_sorted, img, clus, iden,
+                                                                        spec_type,
+                                                                        bbcenter=bbcenter, bbwidth=bbwidth, 
+                                                                        plot_result=plot_model, aper_radius=1,
+                                                                        outlier_removal=outlier_removal, 
                                                                         outlier_kwargs=outlier_kwargs)
+
             except fitting.BadDataError as e:
                 # If the Sersic fitting fails due to bad data (e.g. all pixels masked), we catch the error and 
                 # skip the contamination check for this source, rather than crashing the entire script.

@@ -500,7 +500,7 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
     tests['sky'] = check_sky_contamination(lpeak, lpeak_err, flux)
     
     # Test 2: Line too thin (below spectral resolution)
-    tests['thin'] = (fwhm < fwhm_threshold)
+    tests['thin'] = (fwhm + fwhm_err < fwhm_threshold)
     
     # Test 3: Negative flux domination
     # Check if the spectrum around the line is dominated by negative values
@@ -523,33 +523,18 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
                 print(f"Negative flux check: {frac_negative*100:.1f}% of pixels negative, median={np.median(line_flux):.2e}")
     
     # Test 4: Peak-dominated line
-    # Calculate peak amplitude with proper error propagation
+    # Compare the SNR of the peak amplitude (amplitude / nearest-channel error)
+    # against the integrated flux SNR. If peak SNR > integrated SNR, the detection
+    # is dominated by a single channel rather than the integrated line profile.
     if spectab is not None:
-        # Use error_propagation to compute amplitude and its uncertainty
-        # amp = flux / (sigma * sqrt(2*pi)), where sigma = fwhm / (2 * sqrt(2*ln(2)))
-        flux_complex = ep.Complex(flux, flux_err)
-        fwhm_complex = ep.Complex(fwhm, fwhm_err)
-        
-        # sigma = fwhm / 2.355
-        sigma_complex = fwhm_complex / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-        
-        # amp = flux / (sigma * sqrt(2*pi))
-        amp_complex = flux_complex / (sigma_complex * np.sqrt(2.0 * np.pi))
-        
-        # Get the continuum uncertainty at the line peak from the spectrum
-        cont_err = np.interp(lpeak, spectab['wave'], spectab['spec_err'])
+        amplitude = flux / (fwhm * (np.sqrt(2 * np.pi) / 2.355))
+        peak_channel_idx = np.argmin(np.abs(spectab['wave'] - lpeak))
+        peak_channel_err = spectab['spec_err'][peak_channel_idx]
+        amplitude_snr = np.abs(amplitude) / peak_channel_err
+        tests['peakdominant'] = amplitude_snr > np.abs(snr)
 
-        # Get the total amplitude error including continuum
-        amp_total_err = np.sqrt(amp_complex.error**2 + cont_err**2)
-        
-        # Peak significance is the ratio of amplitude to continuum uncertainty
-        peak_snr = np.abs(amp_complex.value / amp_total_err)
-        tests['peakdominant'] = (peak_snr > np.abs(snr))
-        
         if verbose:
-            print(f"Peak amplitude: {amp_complex.value:.2e} +/- {amp_complex.error:.2e}")
-            print(f"Continuum error: {cont_err:.2e}")
-            print(f"Peak SNR: {peak_snr:.2f}, Integrated SNR: {snr:.2f}")
+            print(f"Peak amplitude SNR: {amplitude_snr:.2f}, Integrated SNR: {np.abs(snr):.2f}")
     
     # Check for doublet partner
     partner = find_partner(linename, list(wavedict.keys()))

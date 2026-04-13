@@ -13,6 +13,90 @@ from pathlib import Path
 import matplotlib
 from matplotlib.colors import PowerNorm
 
+unit_strings = {
+    'FLUX DENSITY': r"[$10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$\,\AA$^{-1}$]",
+    'FLUX': r"[$10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$]",
+    'VELOCITY': r"[km\,s$^{-1}$]",
+    'WAVELENGTH': r"[\AA]",
+    'ASYMMETRY': r"[\AA$^{-1}$]",
+}
+
+plot_names = {
+    'LYA': r'Lyman-$\alpha$',
+    'lya': r'Lyman-$\alpha$',
+    'CIV1548': r'C IV $\lambda$1548',
+    'CIV1550': r'C IV $\lambda$1550',
+    'CIV': r'C IV $\lambda\lambda$1548,1550',
+    'OIII1660': r'O III] $\lambda$1660',
+    'OIII1666': r'O III] $\lambda$1666',
+    'OIII': r'O III] $\lambda\lambda$1660,1666',
+    'CIII1907': r'C III] $\lambda$1907',
+    'CIII1909': r'C III] $\lambda$1909',
+    'CIII': r'C III] $\lambda\lambda$1907,1909',
+    'HeII1640': r'He II $\lambda$1640',
+    'SiII1260': r'Si II $\lambda$1260',
+    'SiII1527': r'Si II $\lambda$1527',
+    'SiIV1394': r'Si IV $\lambda$1394',
+    'SiIV1403': r'Si IV $\lambda$1403',
+    'SiIV': r'Si IV $\lambda\lambda$1394,1403',
+    'CII1334': r'C II $\lambda$1334',
+    'NV1238': r'N V $\lambda$1238',
+    'NV1242': r'N V $\lambda$1242',
+    'NV': r'N V $\lambda\lambda$1238,1242',
+    'SiIII1883': r'Si III] $\lambda$1883',
+    'SiIII1892': r'Si III] $\lambda$1892',
+    'SiIII': r'Si III] $\lambda\lambda$1883,1892',
+    'DISPR': r'$ d_{\text{red peak}} $ ' + unit_strings['WAVELENGTH'],
+    'DISPB': r'$ d_{\text{blue peak}} $ ' + unit_strings['WAVELENGTH'],
+    'LPEAKR': r'$\lambda_{c,\text{red peak}}$ ' + unit_strings['WAVELENGTH'],
+    'LPEAKB': r'$\lambda_{c,\text{blue peak}}$ ' + unit_strings['WAVELENGTH'],
+    'AMPR': r'$A_{\text{red peak}}$ ' + unit_strings['FLUX DENSITY'],
+    'AMPB': r'$A_{\text{blue peak}}$ ' + unit_strings['FLUX DENSITY'],
+    'ASYMR': r'$a_{\text{red peak}}$ ' + unit_strings['ASYMMETRY'],
+    'ASYMB': r'$a_{\text{blue peak}}$ ' + unit_strings['ASYMMETRY'],
+    'SLOPE': r'Linear slope',
+    'TAU': r'Damping parameter $\tau$',
+    'FWHM_ABS': r'FWHM of absorption component ' + unit_strings['WAVELENGTH'],
+    'LPEAK_ABS': r'Peak wavelength of absorption component ' + unit_strings['WAVELENGTH'],
+    'FWHMR': r'FWHM$_{\text{red peak}}$ ' + unit_strings['WAVELENGTH'],
+    'FWHMB': r'FWHM$_{\text{blue peak}}$ ' + unit_strings['WAVELENGTH'],
+    'DELTAV_LYA': r'$\Delta v_{\text{Ly}\alpha}$ ' + unit_strings['VELOCITY'],
+    'FLUXR': r'$F_{\text{red peak}}$ ' + unit_strings['FLUX'],
+    'FLUXB': r'$F_{\text{blue peak}}$ ' + unit_strings['FLUX'],
+    'BRRATIO': r'Blue-to-red flux ratio',
+    'BRSEP': r'$\Delta \lambda_{\text{blue-red}}$ ' + unit_strings['WAVELENGTH'],
+    'CVEL': r"Velocity in rest frame " + unit_strings['VELOCITY'],
+    'FLUX': r"Flux " + unit_strings['FLUX'],
+    'VEXP_ZELDA': r'$v_{\text{exp, HTS}}$ ' + unit_strings['VELOCITY'],
+    'CONT': r"f$_{\lambda, \text{cont}}$ " + unit_strings['FLUX DENSITY'],
+    'LYA_EW': r'Ly$\alpha$ EW ' + unit_strings['WAVELENGTH'],
+    'EW': r'EW ' + unit_strings['WAVELENGTH'],
+}
+
+def get_plot_name(param, unit=True):
+    """
+    Get the LaTeX-formatted plot name for a given parameter.
+
+    Parameters
+    ----------
+    param : str
+        The parameter name (e.g., 'LPEAKR', 'DISPR', 'AMPR', etc.)
+    unit : bool, optional
+        Whether to include units in the plot name. Default is True.
+
+    Returns
+    -------
+    str
+        The LaTeX-formatted name for the parameter, suitable for axis labels or titles.
+    """
+    if not unit:
+        # If units are not desired, remove the unit part from the plot name
+        if param in plot_names and '[' in plot_names[param]:
+            return plot_names[param].split('[')[0][:-1]  # Return only the part before the unit
+    
+    # Otherwise, return the full plot name (with units if available)
+    return plot_names.get(param, param)  # Return the formatted name if it exists, otherwise return the original
+
 def safe_show():
     """
     Show matplotlib figure only if not running in a non-GUI environment.
@@ -201,12 +285,16 @@ def plotline(iden, clus, idfrom, wln, ax_in, spec_source = '2fwhm', width=100, m
         return spectab[region]
 
 
-def lya_mod_plot(row, axin, eml=False):
+from . import constants as const
+l_lya = const.wavedict['LYALPHA']
+
+
+def lya_mod_plot(row, axin, eml=False, width=40, snr_threshold=3.0, velocity=True):
     """
-    Plot Lyman alpha models on a given axis in velocity space.
+    Plot Lyman alpha models on a given axis in velocity or wavelength space.
     
     This function generates a high-resolution model of the Lyman alpha line profile
-    and plots it in velocity space on the provided axis. It can handle both single-peak
+    and plots it in velocity or wavelength space on the provided axis. It can handle both single-peak
     and double-peak Lyman alpha models with different baseline types (constant, linear,
     or damped) depending on the fit parameters available in the row.
     
@@ -221,7 +309,7 @@ def lya_mod_plot(row, axin, eml=False):
         - 'ASYMR': Asymmetry parameter of the red peak
         - 'CONT': Continuum level
         - 'SNRB': Signal-to-noise ratio of the blue peak
-        If SNRB > 3.0, also requires:
+        If SNRB > snr_threshold, also requires:
         - 'AMPB': Amplitude of the blue peak
         - 'LPEAKB': Rest-frame wavelength of the blue peak (Angstroms)
         - 'DISPB': Dispersion of the blue peak
@@ -234,13 +322,20 @@ def lya_mod_plot(row, axin, eml=False):
         - 'LPEAK_ABS': Peak wavelength of absorption component
         If eml=True, also requires:
         - 'DELTAV_LYA': Velocity offset for emission lines (km/s)
-    
     axin : matplotlib.axes.Axes
         The matplotlib axis object on which to plot the model.
-    
     eml : bool, optional
         If True, applies a velocity offset (DELTAV_LYA) to the model.
         Default is False.
+    width : float, optional
+        The wavelength range (in Angstroms) around the red peak to plot the model.
+    snr_threshold : float, optional
+        The signal-to-noise ratio threshold for determining whether to use a single-peak or double-peak model.
+        Default is 3.0.
+    velocity : bool, optional
+        If True, plots the model in velocity space. If False, plots in wavelength space.
+        Default is True.
+
     
     Returns
     -------
@@ -249,19 +344,19 @@ def lya_mod_plot(row, axin, eml=False):
     
     Notes
     -----
-    - The function creates a high-resolution wavelength grid spanning ±40 Angstroms
+    - The function creates a high-resolution wavelength grid spanning ±`width` Angstroms
       around the red peak wavelength with 1000 points.
     - Model selection hierarchy:
       1. If 'SLOPE' is not NaN: uses linear baseline models (lya_speak_lin/lya_dpeak_lin)
       2. Elif 'TAU' is not NaN: uses damped baseline models (lya_speak_damp/lya_dpeak_damp)  
       3. Else: uses constant baseline models (lya_speak/lya_dpeak)
-    - Uses single-peak model if blue SNR <= 3.0, otherwise uses double-peak model.
+    - Uses single-peak model if blue SNR <= `snr_threshold`, otherwise uses double-peak model.
     - Converts wavelength to velocity using the Lyman alpha rest wavelength (1215.67 Å).
     - The flux is converted from wavelength space to velocity space using dλ/dv.
     - The model is plotted as a dashed maroon line with 60% opacity.
     """
     # Create high-resolution wavelength grid around the red peak
-    hireswl = np.linspace(row['LPEAKR'] - 40, row['LPEAKR'] + 40, 1000)
+    hireswl = np.linspace(row['LPEAKR'] - width, row['LPEAKR'] + width, 1000)
     
     # Determine baseline type (matching logic in lya_profile.py)
     # Check for SLOPE first (linear baseline), but TAU takes precedence if present
@@ -270,10 +365,15 @@ def lya_mod_plot(row, axin, eml=False):
         baseline_type = 'lin'
     elif not np.isnan(row['TAU']):
         baseline_type = 'damp'  # damped overrides linear if both present
+
+    blue_detected = row['SNRB'] > snr_threshold
+
+    print(f"Plotting Lyman-α model with baseline type: {baseline_type} and "
+          f"{'single' if not blue_detected else 'double'}-peak model.")
     
     if baseline_type == 'lin':
         # Use linear baseline models
-        if row['SNRB'] > 3.0:
+        if blue_detected:
             # Double-peak with linear baseline
             hiresmod = models.lya_dpeak_lin(hireswl, row['AMPB'], row['LPEAKB'], row['DISPB'], row['ASYMB'],
                                            row['AMPR'], row['LPEAKR'], row['DISPR'], row['ASYMR'], 
@@ -284,7 +384,7 @@ def lya_mod_plot(row, axin, eml=False):
                                            row['CONT'], row['SLOPE'])
     elif baseline_type == 'damp':
         # Use damped baseline models
-        if row['SNRB'] > 3.0:
+        if blue_detected:
             # Double-peak with damped baseline
             hiresmod = models.lya_dpeak_damp(hireswl, row['AMPB'], row['LPEAKB'], row['DISPB'], row['ASYMB'],
                                             row['AMPR'], row['LPEAKR'], row['DISPR'], row['ASYMR'], 
@@ -295,7 +395,7 @@ def lya_mod_plot(row, axin, eml=False):
                                             row['CONT'], row['TAU'], row['FWHM_ABS'], row['LPEAK_ABS'])
     else:
         # Use constant baseline models (original behavior)
-        if row['SNRB'] > 3.0:
+        if blue_detected:
             # Double-peak with constant baseline
             hiresmod = models.lya_dpeak(hireswl, row['AMPB'], row['LPEAKB'], row['DISPB'], row['ASYMB'],
                                        row['AMPR'], row['LPEAKR'], row['DISPR'], row['ASYMR'], row['CONT'])
@@ -304,7 +404,7 @@ def lya_mod_plot(row, axin, eml=False):
             hiresmod = models.lya_speak(hireswl, row['AMPR'], row['LPEAKR'], row['DISPR'], row['ASYMR'], row['CONT'])
     
     # Convert wavelength to velocity
-    hiresvel = spectro.wave2vel(hireswl, 1215.67, redshift=row['LPEAKR'] / 1215.67 - 1)
+    hiresvel = spectro.wave2vel(hireswl, l_lya, redshift=row['LPEAKR'] / l_lya - 1)
     
     # Apply velocity offset if requested
     if eml and 'DELTAV_LYA' in row:
@@ -314,8 +414,11 @@ def lya_mod_plot(row, axin, eml=False):
     dldv = np.ediff1d(hireswl, to_end=np.ediff1d(hireswl)[-1]) / np.ediff1d(hiresvel, to_end=np.ediff1d(hiresvel)[-1])
     
     # Plot the model
-    axin.plot(hiresvel[1:-1], dldv[1:-1] * hiresmod[1:-1], 
-              color='maroon', alpha=0.6, label=r"model", linestyle='--')
+    if velocity:
+        axin.plot(hiresvel[1:-1], dldv[1:-1] * hiresmod[1:-1], 
+                  color='maroon', alpha=0.6, label=r"model", linestyle='--')
+    else:
+        axin.plot(hireswl, hiresmod, color='maroon', alpha=0.6, label=r"model", linestyle='--')
     
 
 def plot_lya_fit_result(fit_result, iden, cluster, save_plots=False, plot_dir='./', spec_type='aper'):
@@ -705,7 +808,7 @@ def gen_mpdaf_img_ticks(cutout, pixscale, tickspace = 1.0):
 import matplotlib.patches as patches
 
 def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=True,
-                  aperture=None, marker_type='x', title='contaminant source model'):
+                  aperture=None, marker_type='x', title='contaminant source model', weight_map=None):
     """
     Plot a 2D model of a source (data, model, data-model) with optional markers and aperture.
 
@@ -729,6 +832,8 @@ def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=
         Marker style for the overlay markers (default is 'x').
     title : str, optional
         Title for the plot (default is 'contaminant source model').
+    weight_map : np.ndarray, optional
+        Optional weight map to overlay as a 1% contour (default is None).
 
     Returns
     -------
@@ -778,6 +883,11 @@ def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=
             ap_radius = aperture[1]
             circ = patches.Circle(apcenter, radius=ap_radius, facecolor='none', edgecolor='coral', linestyle='--')
             a.add_artist(circ)
+        
+        # If a weight map was provided, overlay its 1% contour
+        if weight_map is not None:
+            contour_level = np.nanmax(weight_map) * 0.01
+            a.contour(weight_map, levels=[contour_level], colors='yellow', linewidths=1.5, linestyles='solid')
     axs[1].set_title(f"{cluster} source {iden} {title}")
 
     if save_plot:

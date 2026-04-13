@@ -296,7 +296,13 @@ def get_line_table(iden, clus, exclude_lya=True):
     return line_table
     
 
-def insert_fit_results(megatab, clus, iden, lya_results, other_results):
+wavedict = const.wavedict
+
+from typing import Union
+
+def insert_fit_results(megatab: aptb.Table, clus: str, iden: str, 
+                       lya_results: Union[dict, None], other_results: Union[dict, None],
+                       replace_stacked: bool = False) -> None:
     """
     Insert fitting results into the megatab for a given source.
 
@@ -311,10 +317,14 @@ def insert_fit_results(megatab, clus, iden, lya_results, other_results):
         Cluster identifier.
     iden : str
         Source identifier.
-    lya_results : tuple
-        Tuple of dictionaries (params, errors, _, reduced_chisq) from the Lya fitting.
-    other_results : dict
+    lya_results : dict or None
+        Dictionary containing Lya fitting results with keys 'param_dict', 'error_dict', and 'reduced_chisq'.
+        If None, Lya results will not be inserted and existing Lya columns will not be modified.
+    other_results : dict or None
         Dictionary of tuples (params, errors, _, rchsq) from other line fittings, keyed by line name.
+        If None, results for other lines will not be inserted and existing columns for other lines will not be modified.
+    replace_stacked : bool, optional
+        Whether to replace the identifier with the 'S' prefix to indicate a stacked spectrum
 
     Example
     -------
@@ -327,51 +337,92 @@ def insert_fit_results(megatab, clus, iden, lya_results, other_results):
         raise ValueError(f"No matching row found in megatab for cluster {clus} and identifier {iden}")
     row_index = row_index[0]  # Get the single index value
 
-    # Insert Lya results
-    lya_params = lya_results['param_dict']
-    lya_errors = lya_results['error_dict']
-    reduced_chisq = lya_results['reduced_chisq']
-    for key in lya_params.keys():
-        if key in megatab.colnames:
-            megatab[key][row_index] = lya_params[key]
-            megatab[key + '_ERR'][row_index] = lya_errors[key]
-
-    # insert reduced chi-squared for Lya fit
-    if 'RCHSQ' not in megatab.colnames:
-        megatab['RCHSQ'] = np.full(len(megatab), np.nan)
-    megatab['RCHSQ'][row_index] = reduced_chisq
-    
-    bluecols = ['AMPB', 'FLUXB', 'DISPB', 'FWHMB', 'ASYMB', 'LPEAKB']
-
-    # insert SNR for Lya fit
-    megatab['SNRR'][row_index] = lya_params['FLUXR'] / lya_errors['FLUXR']
-    if 'FLUXB' in lya_params and 'FLUXB' in lya_errors and not np.isnan(lya_params['FLUXB']) and not np.isnan(lya_errors['FLUXB']):
-        megatab['SNRB'][row_index] = lya_params['FLUXB'] / lya_errors['FLUXB']
-    else:
-        megatab['SNRB'][row_index] = np.nan
-        for colname in bluecols:
-            megatab[colname][row_index]             = np.nan
-            megatab[colname + '_ERR'][row_index]    = np.nan
-
-    # Insert other line results
-    for line_name, fit_results in other_results.items():
-        params = fit_results['param_dict']
-        errors = fit_results['error_dict']
-        reduced_chisq = fit_results['reduced_chisq']
-        for key in params.keys():
-            colname = f"{key}_{line_name}"
-            errcolname = f"{key}_ERR_{line_name}"
+    if lya_results is not None: # If Lya results are provided, insert them; otherwise just insert the other lines
+        # First, clear all prior Lyman alpha results except flags, which persist
+        lya_colnames = ['AMPB', 'FLUXB', 'DISPB', 'FWHMB', 'ASYMB', 'LPEAKB', 'SNRB',
+                        'AMPR', 'FLUXR', 'DISPR', 'FWHMR', 'ASYMR', 'LPEAKR', 'SNRR',
+                        'CONT', 'SLOPE', 'TAU', 'FWHM_ABS', 'LPEAK_ABS', 'Z_LYA',
+                        'FLUXB_UB', 'RCHSQ']
+        for colname in lya_colnames:
             if colname in megatab.colnames:
-                megatab[colname][row_index] = params[key]
-                megatab[errcolname][row_index] = errors[key]
-        megatab[f'RCHSQ_{line_name}'][row_index] = reduced_chisq
-        megatab[f'SNR_{line_name}'][row_index] = params['FLUX'] / errors['FLUX']
+                megatab[colname][row_index] = np.nan
+                if colname + '_ERR' in megatab.colnames:
+                    megatab[colname + '_ERR'][row_index] = np.nan
 
-    # Finally, update the identifier with the 'S' prefix to indicate stacked spectrum
-    megatab['iden'][row_index] = iden
+        # Insert Lya results
+        lya_params = lya_results['param_dict']
+        lya_errors = lya_results['error_dict']
+        reduced_chisq = lya_results['reduced_chisq']
+        for key in lya_params.keys():
+            if key in megatab.colnames:
+                megatab[key][row_index] = lya_params[key]
+                megatab[key + '_ERR'][row_index] = lya_errors[key]
 
-    # Print confirmation message
-    print(f"\nInserted fit results for {iden} in {clus} into megatab at index {row_index}\n")
+        # insert reduced chi-squared for Lya fit
+        if 'RCHSQ' not in megatab.colnames:
+            megatab['RCHSQ'] = np.full(len(megatab), np.nan)
+        megatab['RCHSQ'][row_index] = reduced_chisq
+        
+        bluecols = ['AMPB', 'FLUXB', 'DISPB', 'FWHMB', 'ASYMB', 'LPEAKB']
+
+        # insert SNR for Lya fit
+        megatab['SNRR'][row_index] = lya_params['FLUXR'] / lya_errors['FLUXR']
+        if 'FLUXB' in lya_params and 'FLUXB' in lya_errors and not np.isnan(lya_params['FLUXB']) and not np.isnan(lya_errors['FLUXB']):
+            megatab['SNRB'][row_index] = lya_params['FLUXB'] / lya_errors['FLUXB']
+        else:
+            megatab['SNRB'][row_index] = np.nan
+            for colname in bluecols:
+                megatab[colname][row_index]             = np.nan
+                megatab[colname + '_ERR'][row_index]    = np.nan
+
+        print(f"\nInserted Lyman alpha fit results for {iden} in {clus} into megatab at index {row_index}\n")
+
+    if other_results is not None:
+        # Clear prior results for other lines (except flags, which persist)
+        for col in megatab.colnames:
+            colname_split = col.split('_')
+            if any(part in wavedict.keys() for part in colname_split[1:]) and colname_split[0] not in ['FLAG']:
+                megatab[col][row_index] = np.nan
+
+        # Insert other line results
+        for line_name, fit_results in other_results.items():
+            params = fit_results['param_dict']
+            errors = fit_results['error_dict']
+            reduced_chisq = fit_results['reduced_chisq']
+            for key in params.keys():
+                colname = f"{key}_{line_name}"
+                errcolname = f"{key}_ERR_{line_name}"
+                if colname in megatab.colnames:
+                    megatab[colname][row_index] = params[key]
+                    megatab[errcolname][row_index] = errors[key]
+            megatab[f'RCHSQ_{line_name}'][row_index] = reduced_chisq
+            megatab[f'SNR_{line_name}'][row_index] = params['FLUX'] / errors['FLUX']
+            megatab[f'FLAG_{line_name}'][row_index] = fit_results.get('flags', [''])[0]
+            # If the line was a doublet, insert the info for the second component
+            if 'FLUX2' in params.keys():
+                secondary_line = const.doublets[line_name][1]
+                wave_ratio = wavedict[secondary_line] / wavedict[line_name]
+                lpeak_secondary = wave_ratio * params['LPEAK']
+                megatab[f'FLUX_{secondary_line}'][row_index] = params['FLUX2']
+                megatab[f'FLUX_ERR_{secondary_line}'][row_index] = errors['FLUX2']
+                megatab[f'LPEAK_{secondary_line}'][row_index] = lpeak_secondary
+                megatab[f'LPEAK_ERR_{secondary_line}'][row_index] = wave_ratio * errors['LPEAK']
+                megatab[f'FWHM_{secondary_line}'][row_index] = params['FWHM']
+                megatab[f'FWHM_ERR_{secondary_line}'][row_index] = errors['FWHM']
+                megatab[f'CONT_{secondary_line}'][row_index] = params['CONT']
+                megatab[f'CONT_ERR_{secondary_line}'][row_index] = errors['CONT']
+                megatab[f'SLOPE_{secondary_line}'][row_index] = params['SLOPE']
+                megatab[f'SLOPE_ERR_{secondary_line}'][row_index] = errors['SLOPE']
+                megatab[f'RCHSQ_{secondary_line}'][row_index] = reduced_chisq
+                megatab[f'SNR_{secondary_line}'][row_index] = params['FLUX2'] / errors['FLUX2']
+                megatab[f'FLAG_{secondary_line}'][row_index] = fit_results.get('flags', ['', ''])[1]
+
+        # Print confirmation message
+        print(f"\nInserted fit results for {iden} in {clus} into megatab at index {row_index}\n")
+
+    if replace_stacked:
+        megatab['iden'][row_index] = 'S' + megatab['iden'][row_index][1:]
+        print(f"Updated identifier to indicate stacked spectrum: {megatab['iden'][row_index]}")
 
 
 def update_table(megatable, index, linename, params, param_errs, rchsq, flag=''):
@@ -379,7 +430,7 @@ def update_table(megatable, index, linename, params, param_errs, rchsq, flag='')
     Update a table with new fit parameters and statistics for a given index.
 
     For Lyman alpha fits, uses special column naming conventions (e.g., 'FLUXB', 'RCHSQ').
-    For other lines, appends the line name to column names (e.g., 'FLUX_CIII', 'RCHSQ_CIII').
+    For other lines, appends the line name to column names (e.g., 'FLUX_CIII1909', 'RCHSQ_CIII1909').
     SNR values are calculated automatically from flux and error parameters.
 
     Parameters
@@ -409,10 +460,10 @@ def update_table(megatable, index, linename, params, param_errs, rchsq, flag='')
         - SNRB calculated from FLUXB / FLUXB_ERR
         - SNRR calculated from FLUXR / FLUXR_ERR
     For other lines, column names include the line name:
-        - Parameters 'FLUX_CIII', 'FWHM_CIII', etc.
-        - Errors: 'FLUX_ERR_CIII', 'FWHM_ERR_CIII', etc.
-        - Stats: 'RCHSQ_CIII', 'SNR_CIII', etc.
-        - Flag: 'FLAG_CIII'
+        - Parameters 'FLUX_CIII1909', 'FWHM_CIII1909', etc.
+        - Errors: 'FLUX_ERR_CIII1909', 'FWHM_ERR_CIII1909', etc.
+        - Stats: 'RCHSQ_CIII1909', 'SNR_CIII1909', etc.
+        - Flag: 'FLAG_CIII1909', etc.
         - SNR calculated from FLUX / FLUX_ERR
     """
     # Check if this is a Lyman alpha fit

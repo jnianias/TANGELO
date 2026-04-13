@@ -1127,12 +1127,106 @@ def condition_initial_guesses(initial_guesses, wavelength, spectrum, errors, lin
 
     return initial_guesses
 
+from typing import Tuple
+from typing import Union
+
+def flag_fit_result(param_dict: dict, error_dict: dict, initial_guesses: dict, bounds: dict,
+                    wl_fit: np.ndarray, spec_fit: np.ndarray, err_fit: np.ndarray, linename: str,
+                    doublet: bool = False) -> Union[str, Tuple[str, str]]:
+    """
+    Flag fit results based on parameter values and errors. UNDER DEVELOPMENT -- CURRENTLY BROKEN
+
+    Parameters
+    ----------
+    param_dict : dict
+        Dictionary of fitted parameters.
+    error_dict : dict
+        Dictionary of parameter uncertainties.
+    initial_guesses : dict
+        Dictionary of initial guesses for parameters.
+    bounds : dict
+        Dictionary of bounds for parameters.
+    wl_fit : array-like
+        Wavelength array for the fitting region.
+    spec_fit : array-like
+        Flux density array for the fitting region.
+    err_fit : array-like
+        Flux density uncertainties for the fitting region.
+    linename : str
+        Name of the line being fitted.
+    doublet : bool, optional
+        Whether the line is part of a doublet (default: False).
+
+    Returns
+    ---------
+    str or tuple of str
+        Flag indicating potential issues with the fit. 't' for thin line, 'p' for peak-dominated.
+        If doublet, returns a tuple of flags for primary and secondary lines.
+    """
+    flag1 = '' # initialize flag as empty string; will add to it based on conditions below
+
+    # Check to see if FWHM is close to lower bound, which can indicate systematics
+    thin = param_dict['FWHM'] <= bounds['FWHM'][0] * 1.01 # Flag as thin if FWHM is very close to lower bound \
+                                                        #(allowing for small numerical issues
+
+    if thin:
+        print(f"Thin {linename} fit detected: FWHM={param_dict['FWHM']:.3f} is close to lower bound {bounds['FWHM'][0]:.3f}")
+        flag1 += 't'
+
+    # check to see if the line is dominated by a single pixel, which we can tell by looking at 
+    # the SNR of amplitude as measured by fitted amplitude over the error on the peak channel
+    amplitude = param_dict['FLUX'] / (param_dict['FWHM'] * (np.sqrt(2 * np.pi) / 2.355)) # Convert integrated flux to peak amplitude
+    peak_channel_idx = np.argmin(np.abs(wl_fit - param_dict['LPEAK']))
+    peak_channel_err = err_fit[peak_channel_idx]
+    amplitude_snr = np.abs(amplitude) / peak_channel_err
+    peak_dominated = amplitude_snr > np.abs(param_dict['FLUX']) / error_dict['FLUX']
+
+    if peak_dominated:
+        print(f"Peak-dominated {linename} fit detected: Amplitude SNR={amplitude_snr:.3f} is greater than integrated flux SNR={np.abs(param_dict['FLUX']) / error_dict['FLUX']:.3f}")
+        flag1 += 'p'
+
+    # If a doublet, check the secondary line too
+    if doublet:
+        # If both primary and secondary are detected at > 3 sigma, remove flags and trust the fit
+        snr1 = np.abs(param_dict['FLUX']) / error_dict['FLUX']
+        snr2 = np.abs(param_dict['FLUX2']) / error_dict['FLUX2']
+        if snr1 > 3 and snr2 > 3:
+            print(f"Both lines of doublet confidently detected (SNR1={snr1:.3f}, SNR2={snr2:.3f}); clearing flags.")
+            return '', '' # Clear flags if both lines are confidently detected
+
+        secondary_name = doubletdict[linename][1]
+        wave_ratio = wavedict[secondary_name] / wavedict[linename]
+        lpeak_secondary = wave_ratio * param_dict['LPEAK']
+
+        flag2 = '' # Initialize flag for secondary line
+
+        # Check to see if it's thin
+        if thin:
+            print(f"Thin {secondary_name} fit detected: FWHM={param_dict['FWHM']} is close to lower bound {bounds['FWHM'][0]}")
+            flag2 += 't'
+
+        # Check to see if it's peak-dominated
+        amplitude2 = param_dict['FLUX2'] / (param_dict['FWHM'] * (np.sqrt(2 * np.pi) / 2.355))
+        peak_channel_idx2 = np.argmin(np.abs(wl_fit - lpeak_secondary))
+        peak_channel_err2 = err_fit[peak_channel_idx2]
+        amplitude2_snr = np.abs(amplitude2) / peak_channel_err2
+        peak_dominated_2 = amplitude2_snr > np.abs(param_dict['FLUX2']) / error_dict['FLUX2']
+
+        if peak_dominated_2:
+            print(f"Peak-dominated {secondary_name} fit detected: Amplitude SNR={amplitude2_snr:.3f} is greater than integrated flux SNR={np.abs(param_dict['FLUX2']) / error_dict['FLUX2']:.3f}")
+            flag2 += 'p'
+
+        return flag1, flag2
+
+    return flag1
+
+
 
 def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
              bounds = {}, continuum_buffer = 25., plot_result = True, 
              ax_in = None, bootstrap_params: Optional[BootstrapParams] = None, 
              save_plots=False, plot_dir=None, cluster='', full_iden='',
-             spec_type='aper', lya_z=None):
+             spec_type='aper', lya_z=None, flag_fit=False):
     """
     Fit a single or double Gaussian profile to a spectral line (plus its doublet partner if present).
     If the line is Lyman alpha, raises an error (use specialized function).
@@ -1174,6 +1268,8 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         Type of spectrum being fitted (for labeling purposes, default: 'aper').
     lya_z : float, optional
         Redshift of Lyman alpha line (used for sanity check of LPEAK -- if None, no check performed).
+    flag_fit : bool, optional
+        Whether to flag fit results based on parameter values and errors (default: True).
 
     Returns
     -------
@@ -1351,6 +1447,10 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         reduced_chisq = np.nansum(np.square((mdl.gaussian_doublet(rest_ratio)(wl_fit, *poptg) -
                                     spec_fit) / err_fit)) / (np.nansum(fit_mask) - len(initg))
         
+        # # Flag results
+        # flag1, flag2 = flag_fit_result(param_dict, error_dict, initial_guesses, bounds, wl_fit, spec_fit, 
+        #                         err_fit, linename, doublet=True)
+        
 
     elif method == 'single':
         # Generate list of initial guesses and bounds
@@ -1421,6 +1521,10 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         # Calculate the reduced chi-squared value of the fit
         reduced_chisq = np.nansum(np.square((mdl.gaussian(wl_fit, *poptg) -
                                     spec_fit) / err_fit)) / (np.nansum(fit_mask) - len(initg))
+        
+        # # Flag results
+        # flag1 = flag_fit_result(param_dict, error_dict, initial_guesses, bounds, wl_fit, spec_fit, 
+        #                         err_fit, linename, doublet=False)
 
     else:
         raise ValueError(f"Unknown fitting method: {method}")
@@ -1448,7 +1552,7 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         for i, peak in enumerate(peak_check['peak_info']):
             print(f"  Suspicious peak {i+1}: λ={peak['wavelength']:.2f}, "
                   f"SNR={peak['snr']:.1f}, amp_ratio={peak['amplitude_ratio']:.2f}")
-
+            
     # Populate the fit_result dictionary
     fit_result['method'] = method
     fit_result['popt'] = poptg
@@ -1463,6 +1567,8 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     fit_result['model'] = model
     fit_result['peak_check'] = peak_check  # Add multiple peaks check result
     fit_result['multipeak_flag'] = peak_check['flag']  # Quick access to flag
+    # fit_result['flags'] = [peak_check['flag'] + flag1] if method == 'single' \
+    #                         else [peak_check['flag'] + flag1, peak_check['flag2'] + flag2]  # Add fit flags to result
 
     # If requested, plot the fitting result
     if plot_result:

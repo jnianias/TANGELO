@@ -211,7 +211,7 @@ def make_muse_img(row, size, lcenter=None, width=None, cont=None, verbose=True):
         return img_line
     
 def get_segmentation_mask(cluster: str, iden: str, ra: float, dec: float, size: float = 5, 
-                          download_if_missing: bool = False) -> Cutout2D:
+                          download_if_missing: bool = False, connect_niter: int = 3) -> Cutout2D:
     """
     Get a cutout of the R21 segmentation map for a given source based on its RA, DEC and cluster.
     Resolves composite sources that are not in the segmentation map.
@@ -242,7 +242,7 @@ def get_segmentation_mask(cluster: str, iden: str, ra: float, dec: float, size: 
         If the source position is out of bounds for the segmentation map or if no segmentation region is found for the source ID.
     """
     position = SkyCoord(ra=ra, dec=dec, unit='deg')
-    idno = int(''.join(filter(str.isdigit, iden)))) # Extract numeric part of id
+    idno = int(''.join(filter(str.isdigit, iden))) # Extract numeric part of id
 
     # Load segmentation map HDUList with proper file handling
     with io.load_segmentation_map(cluster, download_if_missing=download_if_missing) as seg_hdul:
@@ -300,7 +300,7 @@ def get_segmentation_mask(cluster: str, iden: str, ra: float, dec: float, size: 
             source_cat = io.load_r21_catalogue(cluster, type='source')
             all_idens = source_cat['iden']
             # Create a mask for the initial ID
-            for i in range(3): # Iterate a few times to ensure all connected regions are merged (adjust as needed)
+            for i in range(connect_niter): # Iterate a few times to ensure all connected regions are merged (adjust as needed)
                 initial_mask = (segmap == idno)
                 # Use binary dilation to find connected regions (this will merge adjacent regions)
                 dilated_mask = binary_dilation(initial_mask, iterations=1) # Adjust iterations as needed
@@ -333,8 +333,14 @@ def get_segmentation_mask(cluster: str, iden: str, ra: float, dec: float, size: 
             size_y = np.abs(world_max.dec.arcsec - world_min.dec.arcsec)
             size = np.max([size_x, size_y, 2.0]) # Minimum size of 2 arcseconds
         
+        # Convert size to Quantity if it isn't already
+        if isinstance(size, u.Quantity):
+            size_quantity = size.to(u.arcsec)
+        else:
+            size_quantity = size * u.arcsec
+        
         # Use the Cutout2D utility to make the cutout
-        cutout = Cutout2D(segmap, position, size*u.arcsec, wcs=segmap_wcs, mode='trim')
+        cutout = Cutout2D(segmap, position, size_quantity, wcs=segmap_wcs, mode='partial', fill_value=0)
         cutout.data = cutout.data == idno # convert to binary mask
 
         return cutout
@@ -422,16 +428,21 @@ def get_wmap_cutout(cluster: str, ra: float, dec: float, size: int = 5) -> Cutou
 
     # Get the directory of the HST weight map based on the cluster
     with io.load_weight_map(cluster) as weight_map:
-        # Print names of the fits extensions in the weight map
-        print(f"Weight map extensions for cluster {cluster}: {[ext.name for ext in weight_map]}")
+        # Convert size to Quantity if it isn't already
+        if isinstance(size, u.Quantity):
+            size_quantity = size.to(u.arcsec)
+        else:
+            size_quantity = size * u.arcsec
         # Generate cutout
-        cutout = Cutout2D(weight_map['DATA'].data, coord, size*u.arcsec,
-                          wcs = WCS(weight_map['DATA'].header))
+        # The actual weight image is sometimes in 'DATA' and sometimes in 'SCI'
+        weight_data_key = 'DATA' if 'DATA' in weight_map else 'SCI'
+        cutout = Cutout2D(weight_map[weight_data_key].data, coord, size_quantity,
+                          wcs = WCS(weight_map[weight_data_key].header), mode='partial', fill_value=0)
         return cutout
     
 def get_convolved_weightmap(cluster: str, iden: int, ra: float, dec: float, 
                             binary: bool = False, size: int = 5, 
-                            mask_thresh: float = 0.1) -> Cutout2D:
+                            mask_thresh: float = 0.1, connect_niter: int = 3) -> Cutout2D:
     """
     Get a cutout of the HST weight map for a given source, multiplied by a binary segmentation mask
      and convolved with a Gaussian kernel to match the MUSE PSF.
@@ -456,7 +467,7 @@ def get_convolved_weightmap(cluster: str, iden: int, ra: float, dec: float,
     Cutout2D
         A cutout of the HST weight map multiplied by the segmentation mask and convolved with a Gaussian kernel.
     """
-    segmap = get_segmentation_mask(cluster, iden, ra, dec, size=size)
+    segmap = get_segmentation_mask(cluster, iden, ra, dec, size=size, connect_niter=connect_niter)
 
     # Set up Gaussian kernel based on MUSE PSF FWHM for the cluster
     fwhm = get_muse_psf(cluster)
@@ -474,13 +485,120 @@ def get_convolved_weightmap(cluster: str, iden: int, ra: float, dec: float,
 
     # Convolve weight map with the same kernel
     wmap = get_wmap_cutout(cluster, ra, dec, size)
-    convolved_wmap = convolve(wmap.data.astype(float), kernel, fill_value=0.0)
+    pixel_scale_wmap = np.abs(wmap.wcs.pixel_scale_matrix[0,0]) * 3600.0 # arcsec/pixel
+    sigma_pixels_wmap = (fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))) / pixel_scale_wmap
+    kernel_wmap = Gaussian2DKernel(sigma_pixels_wmap)
+    convolved_wmap = convolve(wmap.data.astype(float), kernel_wmap, fill_value=0.0)
+
+    # Resample convolved segmentation mask to match the weight map grid if needed
+    if convolved_mask.shape != convolved_wmap.shape:
+        convolved_mask_resampled = resample_cutout_to_wcs(segmap, wmap.wcs, convolved_wmap.shape, fill_value=0)
+        # Re-apply the convolution binarization threshold to the resampled mask
+        convolved_mask_resampled = convolved_mask_resampled > mask_thresh
+    else:
+        convolved_mask_resampled = convolved_mask
 
     # Multiply convolved weight map by convolved segmentation mask
-    weighted_mask = convolved_wmap * convolved_mask
+    weighted_mask = convolved_wmap * convolved_mask_resampled.astype(float)
     wmap.data = weighted_mask # Update the cutout data to be the weighted mask
-    
+
     return wmap
+
+def resample_cutout_to_wcs(source_cutout, target_wcs, target_shape, fill_value=0):
+    """
+    Resample a cutout to match a target WCS grid and shape using bilinear interpolation.
+    
+    Parameters
+    ----------
+    source_cutout : Cutout2D
+        The source cutout to resample, containing `data` and `wcs` attributes.
+    target_wcs : astropy.wcs.WCS
+        The target WCS to resample to.
+    target_shape : tuple
+        The target shape (height, width) for the output array.
+    fill_value : float, optional
+        The fill value to use for pixels outside the source cutout region (default is 0).
+    
+    Returns
+    -------
+    np.ndarray
+        A 2D array with the specified target_shape, containing the resampled data.
+    """
+    # Create grid of pixel coordinates for the target
+    target_y = np.arange(target_shape[0])
+    target_x = np.arange(target_shape[1])
+    
+    # Get WCS from source cutout
+    source_wcs = source_cutout.wcs
+    
+    # Create meshgrid of target pixel coordinates
+    target_xx, target_yy = np.meshgrid(target_x, target_y)
+    
+    # Convert target pixel coordinates to world coordinates
+    target_world = target_wcs.pixel_to_world(target_xx.ravel(), target_yy.ravel())
+    
+    # Convert world coordinates to source cutout pixel coordinates
+    source_xx, source_yy = source_wcs.world_to_pixel(target_world)
+    source_xx = source_xx.reshape(target_shape)
+    source_yy = source_yy.reshape(target_shape)
+    
+    # Create output array initialized with fill_value
+    resampled = np.full(target_shape, fill_value, dtype=float)
+    
+    # Determine which pixels are within bounds of the source cutout
+    x_min, x_max = 0, source_cutout.data.shape[1]
+    y_min, y_max = 0, source_cutout.data.shape[0]
+    in_bounds = ((source_xx >= x_min) & (source_xx < x_max) & 
+                 (source_yy >= y_min) & (source_yy < y_max))
+    
+    # Interpolate only pixels within bounds using bilinear interpolation
+    if np.any(in_bounds):
+        xx_flat = source_xx[in_bounds]
+        yy_flat = source_yy[in_bounds]
+        # Bilinear interpolation
+        x_floor = np.floor(xx_flat).astype(int)
+        y_floor = np.floor(yy_flat).astype(int)
+        x_ceil = np.minimum(x_floor + 1, source_cutout.data.shape[1] - 1)
+        y_ceil = np.minimum(y_floor + 1, source_cutout.data.shape[0] - 1)
+        x_frac = xx_flat - x_floor
+        y_frac = yy_flat - y_floor
+        
+        # Bilinear interpolation formula
+        v00 = source_cutout.data[y_floor, x_floor]
+        v01 = source_cutout.data[y_floor, x_ceil]
+        v10 = source_cutout.data[y_ceil, x_floor]
+        v11 = source_cutout.data[y_ceil, x_ceil]
+        
+        interp_vals = (v00 * (1 - x_frac) * (1 - y_frac) + 
+                       v01 * x_frac * (1 - y_frac) + 
+                       v10 * (1 - x_frac) * y_frac + 
+                       v11 * x_frac * y_frac)
+        
+        resampled[in_bounds] = interp_vals
+    
+    return resampled
+
+def resample_weightmap(weight_map_cutout, image, fill_value=0):
+    """
+    Resample a weight map cutout to match the grid and shape of a MUSE image.
+    
+    Parameters
+    ----------
+    weight_map_cutout : Cutout2D
+        The HST weight map cutout to resample, containing `data` and `wcs` attributes.
+    image : mpdaf.obj.Image
+        The MUSE image to match. The weight map will be resampled to match this image's grid and WCS.
+    fill_value : float, optional
+        The fill value to use for pixels outside the weight map region (default is 0).
+    
+    Returns
+    -------
+    np.ndarray
+        A 2D array with the same shape as the image data, containing the resampled weight map.
+    """
+    img_wcs = WCS(image.wcs.to_header())
+    img_shape = image.data.shape
+    return resample_cutout_to_wcs(weight_map_cutout, img_wcs, img_shape, fill_value=fill_value)
 
 def get_segmap_peak(full_iden, cluster, seg_map=None, weight_map=None, search_size=20.0):
     """
