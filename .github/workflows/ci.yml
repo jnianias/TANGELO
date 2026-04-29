@@ -18,10 +18,11 @@ jobs:
     - name: Set up uv
       uses: astral-sh/setup-uv@v5
       with:
-        python-version: '3.9'
+        python-version: '3.13'
     - name: Install TANGELO with dependencies
       run: |
-        uv pip install --system -e ".[dev]"
+        uv venv
+        uv pip install -e ".[dev]"
     - name: Run tests
       run: |
         uv run pytest
