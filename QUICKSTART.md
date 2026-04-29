@@ -6,7 +6,7 @@
 ### Option 1: Use Default Location
 ```bash
 # No setup needed! Data will be stored in ~/.astro_data
-pip install -e .
+uv pip install -e .
 ```
 
 ### Option 2: Custom Location
@@ -18,7 +18,7 @@ echo 'export R21_SPEC_URL="<your_R21_spec_url>"' >> ~/.bashrc
 source ~/.bashrc
 
 # Install
-pip install -e .
+uv pip install -e .
 ```
 
 ### Option 3: Per-Session Setup
@@ -42,7 +42,7 @@ export R21_SPEC_URL="<your_R21_spec_url>"
 ### Scenario 1: First Time User
 ```bash
 # Let it use defaults
-pip install -e .
+uv pip install -e .
 python your_script.py
 # Data will be in ~/.astro_data
 ```

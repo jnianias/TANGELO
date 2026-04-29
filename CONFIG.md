@@ -47,7 +47,7 @@ The MUSE_DATA_DIR environment variable must be set by the user -- an error is ra
 
 #### `MUSE_DATA_DIR`
 - **Description**: Base directory for all MUSE data
-- **Example**: `export ASTRO_DATA_DIR="~/muse_data"` (in your home directory)
+- **Example**: `export MUSE_DATA_DIR="~/muse_data"` (in your home directory)
 
 #### `R21_CAT_URL`
 - **Description**: Base URL for downloading Richard+21 (R21) catalogs from the official MUSE data release.

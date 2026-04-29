@@ -389,6 +389,7 @@ def insert_fit_results(megatab: aptb.Table, clus: str, iden: str,
             params = fit_results['param_dict']
             errors = fit_results['error_dict']
             reduced_chisq = fit_results['reduced_chisq']
+            flags = fit_results.get('flags', [''])  # list of flag strings
             for key in params.keys():
                 colname = f"{key}_{line_name}"
                 errcolname = f"{key}_ERR_{line_name}"
@@ -397,12 +398,13 @@ def insert_fit_results(megatab: aptb.Table, clus: str, iden: str,
                     megatab[errcolname][row_index] = errors[key]
             megatab[f'RCHSQ_{line_name}'][row_index] = reduced_chisq
             megatab[f'SNR_{line_name}'][row_index] = params['FLUX'] / errors['FLUX']
-            megatab[f'FLAG_{line_name}'][row_index] = fit_results.get('flags', [''])[0]
+            megatab[f'FLAG_{line_name}'][row_index] = flags[0]
             # If the line was a doublet, insert the info for the second component
             if 'FLUX2' in params.keys():
                 secondary_line = const.doublets[line_name][1]
                 wave_ratio = wavedict[secondary_line] / wavedict[line_name]
                 lpeak_secondary = wave_ratio * params['LPEAK']
+                flag2 = flags[1] if len(flags) > 1 else ''
                 megatab[f'FLUX_{secondary_line}'][row_index] = params['FLUX2']
                 megatab[f'FLUX_ERR_{secondary_line}'][row_index] = errors['FLUX2']
                 megatab[f'LPEAK_{secondary_line}'][row_index] = lpeak_secondary
@@ -415,12 +417,12 @@ def insert_fit_results(megatab: aptb.Table, clus: str, iden: str,
                 megatab[f'SLOPE_ERR_{secondary_line}'][row_index] = errors['SLOPE']
                 megatab[f'RCHSQ_{secondary_line}'][row_index] = reduced_chisq
                 megatab[f'SNR_{secondary_line}'][row_index] = params['FLUX2'] / errors['FLUX2']
-                megatab[f'FLAG_{secondary_line}'][row_index] = fit_results.get('flags', ['', ''])[1]
+                megatab[f'FLAG_{secondary_line}'][row_index] = flag2
 
         # Print confirmation message
         print(f"\nInserted fit results for {iden} in {clus} into megatab at index {row_index}\n")
 
-    if replace_stacked:
+    if replace_stacked and not megatab['iden'][row_index].startswith('S'):
         megatab['iden'][row_index] = 'S' + megatab['iden'][row_index][1:]
         print(f"Updated identifier to indicate stacked spectrum: {megatab['iden'][row_index]}")
 
@@ -824,7 +826,10 @@ def get_source_value(cluster, full_iden, colname):
     >>> get_source_value('A2744', 'E1234', 'MAG_ISO_HST_F814W')
     24.5
     """
-    r21_table = io.load_r21_catalogue(cluster)
+    if full_iden in ['M2055', 'M20355'] and cluster == 'MACS0416S':
+        full_iden = full_iden[:-2] # Just remove the '55' at the end
+
+    r21_table = io.load_r21_catalogue(cluster, type='source')
 
     # Generate full identifiers for matching
     full_idens = np.array([x['idfrom'][0].replace('E','X') + str(x['iden']) for x in r21_table])

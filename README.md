@@ -27,20 +27,14 @@ Please note that much of the documentation is, at present, machine-generated. Co
 git clone https://github.com/jnianias/TANGELO.git
 cd TANGELO
 
-# Install in development mode
+# Install in development mode (uv recommended)
+uv pip install -e .
+
+# Or with pip
 pip install -e .
 ```
 
-### Dependencies
-
-- numpy
-- scipy
-- astropy
-- matplotlib
-- mpdaf
-- error_propagation
-- beautifulsoup4
-- requests
+All dependencies are declared in `pyproject.toml` and will be installed automatically.
 
 
 ## Configuration

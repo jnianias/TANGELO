@@ -71,6 +71,10 @@ plot_names = {
     'CONT': r"f$_{\lambda, \text{cont}}$ " + unit_strings['FLUX DENSITY'],
     'LYA_EW': r'Ly$\alpha$ EW ' + unit_strings['WAVELENGTH'],
     'EW': r'EW ' + unit_strings['WAVELENGTH'],
+    'LOGN_ZELDA': r'$\log(N_{\text{HI, HTS}})$ [cm$^{-2}$]',
+    'LOGIEW_ZELDA': r'$\log(\text{Ly}\alpha\,EW_{\text{int, HTS}})$ '+ unit_strings['WAVELENGTH'],
+    'WINT_ZELDA': r'$W_{\text{int, HTS}}$ ' + unit_strings['WAVELENGTH'],
+    'TDUST_ZELDA': r'$\tau_{\text{dust, HTS}}$',
 }
 
 def get_plot_name(param, unit=True):
@@ -363,7 +367,7 @@ def lya_mod_plot(row, axin, eml=False, width=40, snr_threshold=3.0, velocity=Tru
     baseline_type = 'const'  # default
     if not np.isnan(row['SLOPE']):
         baseline_type = 'lin'
-    elif not np.isnan(row['TAU']):
+    if not np.isnan(row['TAU']):
         baseline_type = 'damp'  # damped overrides linear if both present
 
     blue_detected = row['SNRB'] > snr_threshold

@@ -15,7 +15,7 @@ from mpdaf.MUSE import LSF
 from pathlib import Path
 
 # Import constants
-from .constants import c, wavedict, doublets, skylines
+from .constants import c, wavedict, doublets, skylines, ztypes
 from . import models as mdl
 from . import io as io
 
@@ -51,7 +51,12 @@ def mask_skylines(wavelength):
 
     return sky_mask
 
-def mask_otherlines(wavelength, expected_wavelength, linename):
+
+from . import catalogue_operations as catops
+
+
+def mask_otherlines(wavelength, expected_wavelength, linename, continuum_buffer=30, 
+                    iden=None, cluster=None, spec_z=None):
     """
     Mask out regions around other known lines to avoid contamination in fits.
     
@@ -63,6 +68,15 @@ def mask_otherlines(wavelength, expected_wavelength, linename):
         Expected observed wavelength of the line being fitted.
     linename   : str
         Name of the line (needs to be in wavedict).
+    continuum_buffer : float
+        Buffer region around the expected wavelength to consider for masking other lines.
+    spec_z : float, optional
+        Redshift to use for calculating expected wavelengths of other lines. If None, 
+        it will be calculated on a per-line basis using the relevant wavelength family from the tables
+    iden : int, optional
+        Object identifier (used to look up redshift from catalogs if spec_z is not provided)
+    cluster : str, optional
+        Cluster name (used to look up redshift from catalogs if spec_z is not provided)
 
     Returns
     -------
@@ -77,17 +91,30 @@ def mask_otherlines(wavelength, expected_wavelength, linename):
     # Initialize mask to all True
     line_mask = np.ones_like(wavelength, dtype=bool)
 
-    # Get the expected redshift
-    z_exp = (expected_wavelength / wavedict[linename]) - 1
+    z_approx = expected_wavelength / wavedict[linename] - 1
 
-    # Mask out +/- 2.5 Angstroms around each other line
+    # Mask out +/- 2.5 Angstroms around each other line within the continuum buffer of the expected wavelength
     for line in otherlines:
-        line_center = wavedict[line] * (1 + z_exp)
-        line_mask &= ~((wavelength > (line_center - 2.5)) & (wavelength < (line_center + 2.5)))
+        line_center = wavedict[line] * (1 + z_approx) if spec_z is None else wavedict[line] * (1 + spec_z)
+
+        if np.abs(line_center - expected_wavelength) <= continuum_buffer:
+            z_exp_exact = spec_z
+            if z_exp_exact is None and iden and cluster:
+                original_iden = iden
+                if original_iden.startswith('S'):
+                    original_iden = original_iden[1:]
+                z_exp_exact = catops.get_source_value(cluster, original_iden, ztypes[line])
+            elif z_exp_exact is None:
+                z_exp_exact = z_approx
+            
+            line_center_exact = wavedict[line] * (1 + z_exp_exact)
+            print(f"Masking line {line} at expected wavelength {line_center_exact:.2f} Å")
+            line_mask &= ~((wavelength > (line_center_exact - 2.5)) & (wavelength < (line_center_exact + 2.5)))
 
     return line_mask
 
-def generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffer, linename):
+def generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffer, 
+                       linename, spec_z=None, iden=None, cluster=None):
     """
     Generates a mask for the fitting region around a specified observed wavelength,
     excluding problematic areas (zeros, nans, infs), skylines, and unrelated spectral lines.
@@ -106,7 +133,13 @@ def generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffe
         Buffer region around the line to include in the fit.
     linename   : str
         Name of the line (needs to be in wavedict or "STACK" to fit a single gaussian to a stacked line).
-
+    spec_z : float, optional
+        Redshift to use for masking other lines. If None, it will be calculated from lpeak_init and the rest wavelength of the line.
+    iden : int, optional
+        Object identifier (used to look up redshift from catalogs if spec_z is not provided)
+    cluster : str, optional
+        Cluster name (used to look up redshift from catalogs if spec_z is not provided)
+        
     Returns
     -------
     array_like
@@ -127,7 +160,8 @@ def generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffe
     # Mask out skylines and other known lines
     if linename != 'STACK':  # Don't apply line masking for stacked lines
         fit_mask &= mask_skylines(wavelength)
-        fit_mask &= mask_otherlines(wavelength, lpeak_init, linename)
+        fit_mask &= mask_otherlines(wavelength, lpeak_init, linename, continuum_buffer=continuum_buffer,
+                                    spec_z=spec_z, iden=iden, cluster=cluster)
 
     return fit_mask
 
@@ -238,7 +272,7 @@ def vel2wave(vel, restLambda, z = 0.):
 
     return observed_wavelength
 
-def is_reasonable_dpeak(popt, perr, z = None):
+def is_reasonable_dpeak(popt: list, perr: list, z: float = None) -> dict:
     """
     Check if the fitted parameters for a double peak Lyman-alpha profile are reasonable.
     Reasonable double peaked fits should be (1) statistically significant in both peaks,
@@ -256,8 +290,8 @@ def is_reasonable_dpeak(popt, perr, z = None):
     
     Returns
     -------
-    bool
-        True if the fit is reasonable, False otherwise.
+    dict
+        Dictionary with boolean values for each reasonableness check.
     """
     # If z is not provided, get a rough estimate from the peak wavelength
     # of the red peak (popt[5])
@@ -276,8 +310,8 @@ def is_reasonable_dpeak(popt, perr, z = None):
     # Use the larger of the two widths as the minimum separation for the peaks
     wid = np.nanmax([np.abs(fwhm_br.value), np.abs(fwhm_rl.value)])
     # Catch cases where the blue peak has a poorly constrained width
-    if fwhm_br.value < 3 * fwhm_br.error:
-        wid = np.abs(fwhm_rl.value)
+    # if fwhm_br.value < fwhm_br.error:
+    #     wid = np.abs(fwhm_rl.value)
     
     # Calculate the velocity separation of the two peaks
     deltavel = np.abs(
@@ -286,18 +320,18 @@ def is_reasonable_dpeak(popt, perr, z = None):
     )
 
     # Filter out bad results
-    conditions = [
-        (psnr[0] > 3.0 and psnr[4] > 3.0), # Both peaks are significant
-        (psnr[0] < 5000 and psnr[4] < 5000), # Both peaks are not unphysically large
-        popt[0] < popt[4],  # Blue peak amplitude < red peak amplitude
-        np.abs(popt[5] - popt[1]) > wid, # Peaks are spectrally resolved
-        popt[1] < popt[5], # Blue peak is at lower wavelength than red peak
-        deltavel < 1000. # Velocity separation is less than 1000 km/s
-    ]
+    conditions = {
+        "significance_check": psnr[0] > 3.0 and psnr[4] > 3.0,
+        "amplitude_check": psnr[0] < 5000 and psnr[4] < 5000,
+        "amplitude_ratio_check": popt[0] <= popt[4],
+        "resolved_check": popt[5] - popt[1] > wid,
+        "peak_wavelength_check": popt[1] < popt[5],
+        "velocity_separation_check": deltavel < 1000.
+    }
     
-    print(conditions)
-    
-    return all(conditions)
+    return conditions
+
+
 
 def get_line_spec(row, line, width, rest = True, spec_source = 'R21', spec_type = 'weight_skysub'):
     """
@@ -473,7 +507,8 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
         'peakdominant': False,
         'negative': False,
         'contamination': False,
-        'flags_applied': ''
+        'flags_applied': '',
+        'multipeak': False # This tells us whether other unexpected "peaks" were found in the vicinity of the line
     }
     
     # Extract line parameters with errors where available
@@ -491,9 +526,14 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
     flux_err = row[flux_err_col] if flux_err_col else np.abs(flux / snr)
     fwhm_err = row[fwhm_err_col] if fwhm_err_col else 0.0
     
-    # Check for pre-existing contamination flag
-    if current_flag == 'c':
-        tests['contamination'] = True
+    # Check for pre-existing contamination ('c') or multipeak ('m') flag
+    if 'c' in current_flag:
+        # If contaminated, we can stop the flagging here as it's already spurious
+        print(f"Line {linename} in row {index} already flagged as contaminated. Skipping further tests.")
+        return tests
+
+    if 'm' in current_flag:
+        tests['multipeak'] = True
     
     # Test 1: Sky line contamination
     # Check if the line peak coincides with any known sky lines
@@ -523,60 +563,71 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
                 print(f"Negative flux check: {frac_negative*100:.1f}% of pixels negative, median={np.median(line_flux):.2e}")
     
     # Test 4: Peak-dominated line
-    # Compare the SNR of the peak amplitude (amplitude / nearest-channel error)
-    # against the integrated flux SNR. If peak SNR > integrated SNR, the detection
-    # is dominated by a single channel rather than the integrated line profile.
+    # Compare the flux in the peak channel to the integrated flux. If more than 50% of integrated flux is in the peak
+    # flag as peak-dominated
     if spectab is not None:
-        amplitude = flux / (fwhm * (np.sqrt(2 * np.pi) / 2.355))
-        peak_channel_idx = np.argmin(np.abs(spectab['wave'] - lpeak))
-        peak_channel_err = spectab['spec_err'][peak_channel_idx]
-        amplitude_snr = np.abs(amplitude) / peak_channel_err
-        tests['peakdominant'] = amplitude_snr > np.abs(snr)
+        # Find the index of the peak wavelength in the spectrum
+        peak_idx = np.argmin(np.abs(spectab['wave'] - lpeak))
+        cont_level = row[f"CONT_{linename}"]
+        peak_flux = (spectab['spec'][peak_idx] - cont_level) * 1.25 
+        line_flux = flux
+        tests['peakdominant'] = (peak_flux / line_flux) > 0.5
+        
+        if verbose and tests['peakdominant']:
+            print(f"Peak dominance check: peak_flux={peak_flux:.2e}, line_flux={line_flux:.2e}, ratio={peak_flux/line_flux:.2f}")
 
-        if verbose:
-            print(f"Peak amplitude SNR: {amplitude_snr:.2f}, Integrated SNR: {np.abs(snr):.2f}")
+            
     
     # Check for doublet partner
     partner = find_partner(linename, list(wavedict.keys()))
     if partner is not None:
         partner_snr_col = f'SNR_{partner}'
         partner_flag_col = f'FLAG_{partner}'
+
         # If both lines in doublet are detected, remove all flags
         if partner_snr_col in megatab.colnames:
-            if np.abs(row[partner_snr_col]) > 3.0 and np.abs(snr) > 3.0:
+            partner_snr = row[partner_snr_col]
+            sign = np.sign(snr)
+            partner_sign = np.sign(partner_snr)
+            partner_flag = row[partner_flag_col] if partner_flag_col in megatab.colnames else ''
+            if np.abs(snr) > 3.0 and np.abs(partner_snr) > 3.0 and sign == partner_sign and 'c' not in partner_flag:
                 if verbose:
-                    print(f"Doublet partner {partner} detected - removing flags")
+                    print(f"Doublet partner {partner} detected with SNR={row[partner_snr_col]:.2f}. "
+                          f"Removing all flags for {linename} and {partner}.")
+                    
                 megatab[flag_col][index] = ''
+
                 if partner_flag_col in megatab.colnames:
                     megatab[partner_flag_col][index] = ''
+                
                 tests['flags_applied'] = ''
                 return tests
     
     # Apply flags (skip contamination as it's pre-existing)
     flag_string = ''
-    if not tests['contamination']:
-        # Clear any non-contamination flags
-        megatab[flag_col][index] = ''
-        
-        # Apply new flags
-        if tests['sky']:
-            flag_string += 's'
-            if verbose:
-                print(f"  Applying flag 's': Sky line contamination detected")
-        if tests['thin']:
-            flag_string += 't'
-            if verbose:
-                print(f"  Applying flag 't': Line too thin (FWHM={fwhm:.2f} < {fwhm_threshold:.2f} Å)")
-        if tests['negative']:
-            flag_string += 'n'
-            if verbose:
-                print(f"  Applying flag 'n': Spectrum dominated by negative flux")
-        if tests['peakdominant']:
-            flag_string += 'p'
-            if verbose:
-                print(f"  Applying flag 'p': Peak-dominated line")
-        
-        megatab[flag_col][index] = flag_string
+    # Apply new flags
+    if tests['sky']:
+        flag_string += 's'
+        if verbose:
+            print(f"  Applying flag 's': Sky line contamination detected")
+    if tests['thin']:
+        flag_string += 't'
+        if verbose:
+            print(f"  Applying flag 't': Line too thin (FWHM={fwhm:.2f} < {fwhm_threshold:.2f} Å)")
+    if tests['negative']:
+        flag_string += 'n'
+        if verbose:
+            print(f"  Applying flag 'n': Spectrum dominated by negative flux")
+    if tests['peakdominant']:
+        flag_string += 'p'
+        if verbose:
+            print(f"  Applying flag 'p': Peak-dominated line")
+    if tests['multipeak']:
+        flag_string += 'm'
+        if verbose:
+            print(f"  Applying flag 'm': Multiple peaks detected in line region")
+    
+    megatab[flag_col][index] = flag_string
     
     tests['flags_applied'] = flag_string
     
@@ -586,6 +637,8 @@ def flag_fitted_line(megatab, index, linename, spectab=None,
             print(f"  Flags applied: '{flag_string}'")
         else:
             print(f"  No flags raised")
+
+    assert megatab[flag_col][index] == flag_string, "Flag column was not updated correctly."
     
     return tests
 

@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import error_propagation as ep
 from collections import namedtuple
 from . import plotting as plot
+from tqdm import tqdm
 
 # Import moved components for backwards compatibility
 from .spectroscopy import generate_spec_mask, mask_skylines, mask_otherlines
@@ -118,14 +119,14 @@ def autocorr_length(wave, spec, yerr, max_lag=10, baseline_order=None):
     # Use robust estimator: median of |residuals|/yerr
     # This is less sensitive to outliers than χ²_red
     normalized_residuals = np.abs(residuals) / yerr
-    median_normalized_residual = np.median(normalized_residuals)
+    median_normalized_residual = np.median(normalized_residuals) # This value represents the typical amount by which
+                                                                    # true errors exceed measurment uncertainties
     
     # Trigger conservatively using median to avoid outlier sensitivity
     # But correct using proper Gaussian calibration for accurate scaling
     threshold = 1.0
     if median_normalized_residual > threshold:
-        # For Gaussian noise, median(|z|) ≈ 0.675, so scale to get true σ
-        inflation_factor = median_normalized_residual / 0.675
+        inflation_factor = median_normalized_residual
         print(f"Systematic excess variance detected: inflating errors by {inflation_factor:.2f}x")
     else:
         inflation_factor = 1.0
@@ -314,39 +315,59 @@ def gen_corr_noise(yerr, corr_len, size=None):
     return noise * (yerr[:n] if yerr.ndim > 0 else yerr) 
 
 
-def check_multiple_peaks(wave, residuals, err, fitted_peak_wave, fitted_amplitude, 
-                         fitted_width, n_fit_params=3, min_separation=3, 
-                         amplitude_ratio_threshold=0.5, width_ratio_range=(0.5, 2.0), 
-                         detection_threshold=3.0, chi2_threshold=3.0):
+from scipy.signal import find_peaks, peak_widths
+
+
+def check_multiple_peaks(wave, spec_cont_sub, residuals, err, fitted_peak_wave, fitted_amplitude,
+                         fitted_width, excluded_centers=None, n_fit_params=3, min_separation=3,
+                         amplitude_ratio_threshold=1.0, width_ratio_range=(0.8, 2.0),
+                         detection_threshold=3.0, chi2_threshold=3.0, spike_contrast_threshold=3.0):
     """
-    Check for additional unexplained peaks in the residuals similar to the fitted line.
+    Check for additional unexplained peaks in the spectrum similar to the fitted line.
+
+    Peaks are detected in the continuum-subtracted spectrum (not the residuals) so that
+    all features are assessed on equal footing, regardless of whether the fitter happened
+    to latch onto them. The residuals are still used to compute the reduced chi-squared
+    gate. Known fitted components (e.g. both lines of a doublet) are excluded from the
+    suspicious-peak count via `excluded_centers`. Spiky, non-Gaussian features (sky
+    residuals) are excluded using a neighbour-channel contrast test consistent with the
+    `check_peak_dominant` criterion.
 
     Parameters
     ----------
     wave : array-like
         Wavelength array.
+    spec_cont_sub : array-like
+        Continuum-subtracted flux array (observed spectrum minus fitted continuum + slope).
     residuals : array-like
-        Residuals after subtracting the fitted model (observed - model).
+        Residuals after subtracting the full fitted model (used for chi-squared only).
     err : array-like
         Error array (for significance calculation).
     fitted_peak_wave : float
-        Wavelength of the fitted peak.
+        Wavelength of the primary fitted peak.
     fitted_amplitude : float
-        Amplitude (height) of the fitted peak.
+        Amplitude (height) of the primary fitted peak.
     fitted_width : float
-        FWHM or sigma of the fitted peak (in same units as wave).
+        FWHM of the fitted peak (in same units as wave).
+    excluded_centers : list of float, optional
+        Wavelengths of all fitted components (e.g. both doublet lines) to exclude from
+        the suspicious-peak count. If None, only `fitted_peak_wave` is excluded.
     n_fit_params : int, optional
         Number of parameters in the fit (default: 3).
     min_separation : float, optional
-        Minimum separation in units of fitted_width to consider peaks as distinct (default: 3).
+        Minimum separation in units of fitted_width to consider a peak distinct from an
+        excluded center (default: 3).
     amplitude_ratio_threshold : float, optional
-        Minimum amplitude ratio to flag comparable peaks (default: 0.5).
+        Minimum amplitude ratio (candidate / fitted) to flag a peak (default: 1.0).
     width_ratio_range : tuple, optional
-        Range of width ratios to flag comparable peaks (default: (0.5, 2.0)).
+        Range of width ratios to flag comparable peaks (default: (0.8, 2.0)).
     detection_threshold : float, optional
-        Minimum SNR for a peak in residuals to be considered significant (default: 3.0).
+        Minimum per-channel SNR for a peak to be considered significant (default: 3.0).
     chi2_threshold : float, optional
         Only search for peaks if reduced chi-square > this value (default: 3.0).
+    spike_contrast_threshold : float, optional
+        Neighbour-channel contrast ratio above which a peak is classified as a sky spike
+        and excluded from the suspicious-peak count (default: 3.0).
 
     Returns
     -------
@@ -361,22 +382,27 @@ def check_multiple_peaks(wave, residuals, err, fitted_peak_wave, fitted_amplitud
 
     Notes
     -----
-    - Flags additional peaks in residuals that may indicate poor fit or blended lines.
-    - Uses SNR and amplitude/width criteria to filter peaks.
+    - Flags additional peaks that look like genuine spectral lines (gaussian-like shape,
+      comparable amplitude and width to the fitted line).
+    - Non-gaussian sky spikes are excluded via the neighbour-contrast test.
+    - All known fitted components should be listed in `excluded_centers` to avoid
+      doublet partners triggering the flag.
 
     Examples
     --------
-    >>> result = check_multiple_peaks(wave, residuals, err, 5000, 10, 3)
+    >>> result = check_multiple_peaks(wave, spec_cont_sub, residuals, err, 5000, 10, 3)
     >>> print(result['n_comparable_peaks'])
     """
-    from scipy.signal import find_peaks
-    
-    # First check: Calculate reduced chi-square
+
+    if excluded_centers is None:
+        excluded_centers = [fitted_peak_wave]
+
+    # First check: Calculate reduced chi-square from residuals
     chi2 = np.sum((residuals / err) ** 2)
     n_data = len(residuals)
     dof = n_data - n_fit_params
     reduced_chi2 = chi2 / dof
-    
+
     # If fit is good (low chi-square), no need to search for peaks
     if reduced_chi2 <= chi2_threshold:
         return {
@@ -387,19 +413,20 @@ def check_multiple_peaks(wave, residuals, err, fitted_peak_wave, fitted_amplitud
             'reduced_chi2': reduced_chi2,
             'message': f'Good fit (χ²_red = {reduced_chi2:.2f} ≤ {chi2_threshold}), no peak search needed'
         }
-    
-    # Find peaks in the residuals (positive and negative)
-    # Look at absolute value to catch both emission and absorption features
-    abs_residuals = np.abs(residuals)
-    significance = abs_residuals / err
-    
-    # Find peaks in the significance array
-    # Use a minimum height of detection_threshold sigma
-    peaks_idx, properties = find_peaks(significance, 
+
+    print(f"Reduced χ² = {reduced_chi2:.2f} > {chi2_threshold}: searching for additional peaks in spectrum...")
+
+    # Detect peaks in the continuum-subtracted spectrum so all features are on equal footing.
+    # Operate on absolute values to catch both emission and absorption.
+    abs_spec = np.abs(spec_cont_sub)
+    significance = abs_spec / err
+
+    peaks_idx, properties = find_peaks(significance,
                                        height=detection_threshold,
                                        prominence=detection_threshold * 0.5)
-    
+
     if len(peaks_idx) == 0:
+        print("No significant peaks found in spectrum.")
         return {
             'suspicious': False,
             'n_comparable_peaks': 0,
@@ -408,47 +435,69 @@ def check_multiple_peaks(wave, residuals, err, fitted_peak_wave, fitted_amplitud
             'reduced_chi2': reduced_chi2,
             'message': f'Poor fit (χ²_red = {reduced_chi2:.2f}) but no significant peaks found'
         }
-    
+
     # Get peak properties
     peak_waves = wave[peaks_idx]
-    peak_amplitudes = abs_residuals[peaks_idx]  # Use absolute residuals where peaks were found
+    peak_amplitudes = abs_spec[peaks_idx]
     peak_snrs = significance[peaks_idx]
-    
-    # Estimate widths of peaks using scipy's peak_widths
-    from scipy.signal import peak_widths
+
+    # Estimate widths using scipy's peak_widths
     widths_idx, width_heights, left_ips, right_ips = peak_widths(
         significance, peaks_idx, rel_height=0.5
     )
-    
-    # Convert width from indices to wavelength units
+
     delta_wave = np.median(np.diff(wave))
-    peak_widths = widths_idx * delta_wave
-    
-    # Filter peaks:
-    # 1. Exclude the fitted peak itself (within min_separation * fitted_width)
-    # 2. Keep only peaks with comparable amplitude
-    # 3. Keep only peaks with comparable width
-    
+    peak_widths_wave = widths_idx * delta_wave
+
     suspicious_peaks = []
-    
-    for i, (pw, pa, psnr, pwidth) in enumerate(zip(peak_waves, peak_amplitudes, 
-                                                     peak_snrs, peak_widths)):
-        # Check if this is the fitted peak (too close)
-        separation = np.abs(pw - fitted_peak_wave)
-        if separation < min_separation * fitted_width:
-            continue  # This is probably the fitted line itself
-        
-        # Check amplitude ratio (pa is already absolute value from abs_residuals)
+
+    for i, (pw, pa, psnr, pwidth) in enumerate(zip(peak_waves, peak_amplitudes,
+                                                    peak_snrs, peak_widths_wave)):
+        peak_channel_idx = peaks_idx[i]
+
+        # Exclude any known fitted component (primary line, doublet partner, etc.)
+        sep_threshold = min_separation * min(fitted_width, 2 * delta_wave)
+        too_close = any(
+            np.abs(pw - center) < sep_threshold for center in excluded_centers
+        )
+        if too_close:
+            continue
+
+        # # Exclude sky spikes: a genuine line-like feature has neighbours of comparable
+        # # brightness; a spike has near-noise neighbours (same logic as check_peak_dominant).
+        # if 0 < peak_channel_idx < len(spec_cont_sub) - 1:
+        #     neighbour_vals = np.abs(np.array([
+        #         spec_cont_sub[peak_channel_idx - 1],
+        #         spec_cont_sub[peak_channel_idx + 1]
+        #     ]))
+        #     neighbour_errs = np.array([
+        #         err[peak_channel_idx - 1],
+        #         err[peak_channel_idx + 1]
+        #     ])
+        #     neighbour_upper = np.mean(neighbour_vals + neighbour_errs)
+        #     contrast = pa / neighbour_upper if neighbour_upper > 0 else np.inf
+        #     if neighbour_upper > 0 and contrast > spike_contrast_threshold:
+        #         print(f"  Excluding spike at λ={pw:.2f} Å (contrast={contrast:.1f} > {spike_contrast_threshold})")
+        #         continue  # Sky spike, not a line-like feature
+
+        # Exclude peaks of opposite sign to the fitted line (emission vs absorption)
+        peak_sign = np.sign(spec_cont_sub[peak_channel_idx])
+        fitted_sign = np.sign(fitted_amplitude)
+        if peak_sign != fitted_sign:
+            continue  # Opposite sign — not comparable
+
+        # Check amplitude ratio relative to the fitted line
         amplitude_ratio = pa / np.abs(fitted_amplitude)
         if amplitude_ratio < amplitude_ratio_threshold:
             continue  # Too weak
-        
+
         # Check width ratio
         width_ratio = pwidth / fitted_width
         if width_ratio < width_ratio_range[0] or width_ratio > width_ratio_range[1]:
             continue  # Too narrow or too wide
-        
-        # This peak is suspicious!
+
+        # Passed all filters — this is a suspicious line-like feature
+        separation = np.min([np.abs(pw - center) for center in excluded_centers])
         suspicious_peaks.append({
             'wavelength': pw,
             'amplitude': pa,
@@ -458,15 +507,15 @@ def check_multiple_peaks(wave, residuals, err, fitted_peak_wave, fitted_amplitud
             'width_ratio': width_ratio,
             'separation': separation
         })
-    
+
     n_suspicious = len(suspicious_peaks)
     flag = 'm' if n_suspicious > 0 else ''
-    
+
     if n_suspicious > 0:
         message = f'Poor fit (χ²_red = {reduced_chi2:.2f}): found {n_suspicious} comparable peak(s)'
     else:
-        message = f'Poor fit (χ²_red = {reduced_chi2:.2f}) but no comparable peaks (different amplitude/width)'
-    
+        message = f'Poor fit (χ²_red = {reduced_chi2:.2f}) but no comparable peaks (different amplitude/width or sky spikes)'
+
     return {
         'suspicious': n_suspicious > 0,
         'n_comparable_peaks': n_suspicious,
@@ -574,7 +623,7 @@ def avgfunc(poptl, errfunc, sig_clip = 7.0):
         medpopt = np.nanmedian(poptl, axis=0)
         return [medpopt, (p84 - p16) / 2.0]
 
-def fit_mc(f, x, y, yerr, p0, bounds=None, niter=500, errfunc='mad',
+def fit_mc(f, x, y, yerr, p0, bounds=None, niter=500, errfunc='stddev_7',
            return_sample=False, chisq_thresh=np.inf, sig_clip=7.0,
            autocorrelation=False, max_lag=10, baseline_order=0, max_nfev=5000):
     """
@@ -601,7 +650,12 @@ def fit_mc(f, x, y, yerr, p0, bounds=None, niter=500, errfunc='mad',
     niter : int, optional
         Number of Monte Carlo iterations (default: 500)
     errfunc : str, optional
-        Error estimation method: 'mad' or 'stddev' (default: 'mad')
+        Error estimation method:
+            -'stddev'    : standard deviation (sigma-clipped)
+            -'mad'       : median absolute deviation
+            -'mad_adj'   : adjusted MAD (scaled to match stddev for Gaussian)
+            -'stddev_X'  : sigma-clipped stddev with clipping value X (e.g., 'stddev_5.0')
+            -'84-16'     : 68% confidence interval from percentiles
     return_sample : bool, optional
         If True, return full MC sample in addition to mean/error (default: False)
     chisq_thresh : float, optional
@@ -676,7 +730,8 @@ def fit_mc(f, x, y, yerr, p0, bounds=None, niter=500, errfunc='mad',
         total_iters = 0
         failed_iters = 0
         max_total_iters = 2 * niter
-        
+
+        pbar = tqdm(total=niter, desc='fit_mc', unit='iter')
         while valid_iters < niter and total_iters < max_total_iters:
             total_iters += 1
             
@@ -696,20 +751,23 @@ def fit_mc(f, x, y, yerr, p0, bounds=None, niter=500, errfunc='mad',
 
                 poptlist.append(popt_i)
                 valid_iters += 1
+                pbar.update(1)
             except (RuntimeError, ValueError):
                 failed_iters += 1
                 continue
+        pbar.close()
         
         if failed_iters > 0:
             print(f"MC iterations: {valid_iters} successful, {failed_iters} failed (convergence/value errors).")
 
         # Warn if we hit the max iteration limit
         if total_iters >= max_total_iters and valid_iters < niter:
-            print(f"Warning: Reached maximum iteration limit ({max_total_iters}). "
-                  f"Only {valid_iters}/{niter} successful fits obtained.")
+            print(f"Warning: Reached maximum iteration limit ({max_total_iters}).")
 
         if not poptlist:
             raise RuntimeError("All MC iterations failed to converge")
+        
+        print(f"Completed {valid_iters} successful MC fits out of {total_iters} attempts.")
 
         return (avgfunc(poptlist, errfunc, sig_clip=sig_clip), poptlist) if return_sample else avgfunc(poptlist, errfunc, sig_clip=sig_clip)
 
@@ -896,16 +954,16 @@ def gen_bounds(initial_guesses, linename, input_bounds={}, force_sign=None):
         'LPEAKB': (initial_guesses.get('LPEAKR', np.nan) + default_lpeakb_tol[0] * (1 + z), 
                    initial_guesses.get('LPEAKR', np.nan) + default_lpeakb_tol[1] * (1 + z)),
         'DISPB':  (0.2 * (1 + z), 1 * (1 + z)), # dispersion of blue peak for Lya
-        'ASYMB':  (-0.5, 0.5), # asymmetry of blue peak for Lya
+        'ASYMB':  (-0.5, 0.2), # asymmetry of blue peak for Lya
         'AMPR':   (default_flux_min, 10000), # amplitude of red peak for Lya
         'LPEAKR': (initial_guesses.get('LPEAKR', np.nan) + default_lpeakr_tol[0] * (1 + z), 
                    initial_guesses.get('LPEAKR', np.nan) + default_lpeakr_tol[1] * (1 + z)),
         'DISPR':  (0.2 * (1 + z), 1 * (1 + z)), # dispersion of red peak for Lya
         'ASYMR':  (-0.5, 0.5), # asymmetry of red peak for Lya
         'SLOPE':  (-np.inf, np.inf), # slope for linear continuum
-        'TAU':    (0, 200), # optical depth for Damped Lyman alpha profile
-        'FWHM_ABS':   ((spectro.vel2wave(100, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z), 
-                  (spectro.vel2wave(500, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z)), # FWHM bounds
+        'TAU':    (0, 500), # optical depth for Damped Lyman alpha profile
+        'FWHM_ABS':   ((spectro.vel2wave(50, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z), 
+                  (spectro.vel2wave(1000, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z)), # FWHM bounds
         'LPEAK_ABS': (cen_r_init - 3.33 * (1 + z), cen_r_init + 3.33 * (1 + z))
     }
 
@@ -1221,12 +1279,14 @@ def flag_fit_result(param_dict: dict, error_dict: dict, initial_guesses: dict, b
     return flag1
 
 
+from . import catalogue_operations as catops
+
 
 def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
              bounds = {}, continuum_buffer = 25., plot_result = True, 
              ax_in = None, bootstrap_params: Optional[BootstrapParams] = None, 
              save_plots=False, plot_dir=None, cluster='', full_iden='',
-             spec_type='aper', lya_z=None, flag_fit=False):
+             spec_type='aper', lya_z=None):
     """
     Fit a single or double Gaussian profile to a spectral line (plus its doublet partner if present).
     If the line is Lyman alpha, raises an error (use specialized function).
@@ -1268,8 +1328,6 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         Type of spectrum being fitted (for labeling purposes, default: 'aper').
     lya_z : float, optional
         Redshift of Lyman alpha line (used for sanity check of LPEAK -- if None, no check performed).
-    flag_fit : bool, optional
-        Whether to flag fit results based on parameter values and errors (default: True).
 
     Returns
     -------
@@ -1303,14 +1361,14 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     if method == 'doublet':
         rest_wavelength_second = wavedict[doubletdict[linename][1]]
 
-    # Define fitting region, masking any problematic areas (zeros, nans, infs)
-    fit_mask = generate_spec_mask(wavelength, spectrum, errors, 
-                                  lpeak_init, continuum_buffer, linename)
+    # Define fitting region, masking any problematic areas (zeros, nans, infs, other lines, sky lines)
+    fit_mask = generate_spec_mask(wavelength, spectrum, errors, lpeak_init, continuum_buffer, 
+                                  linename, iden=full_iden, cluster=cluster)
     # Extend it if its a doublet to include the second line
     if method == 'doublet':
         fit_mask += generate_spec_mask(wavelength, spectrum, errors,
                                        lpeak_init * (rest_wavelength_second / rest_wavelength),
-                                       continuum_buffer, linename)
+                                       continuum_buffer, linename, iden=full_iden, cluster=cluster)
     
     # Make sure there are enough good points to fit
     if fit_mask.sum() < 10:
@@ -1360,6 +1418,15 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     cont_bounds = bounds['CONT']
     slope_bounds = bounds['SLOPE']
 
+    # If the secondary line is shofted out of the MUSE wavelength range, treat as a singlet
+    if method == 'doublet':
+        secondary = doubletdict[linename][1]
+        secondary_rest = wavedict[secondary]
+        wave_ratio = secondary_rest / rest_wavelength
+        secondary_lpeak = lpeak_init * wave_ratio
+        if not (wavelength.min() < secondary_lpeak < wavelength.max()):
+            print(f"Secondary line {secondary} of doublet is shifted out of wavelength range; fitting as single line.")
+            method = 'single'
 
     # Initialise fit result dictionary that the function will return
     fit_result = {}
@@ -1531,27 +1598,42 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         
     # If the reduced chi-squared is very high, print warning
     if reduced_chisq > 3.0:
-        print(f'WARNING: HIGH REDUCED CHI SQUARED STATISTIC ({reduced_chisq})! REVIEW RESULT.')
+        print(f'WARNING: HIGH REDUCED CHI SQUARED STATISTIC ({reduced_chisq:.2f})! REVIEW RESULT.')
     
-    # Check for multiple comparable peaks in residuals
+    # Check for multiple comparable peaks in spectrum
     residuals = spec_fit - model(wl_fit, *poptg)
-    fitted_amplitude = poptg[0]  # First parameter is always flux/amplitude
+    fitted_stddev = poptg[2] / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to standard deviation
+    fitted_amplitude = poptg[0] / (fitted_stddev * np.sqrt(2 * np.pi))   # First parameter is always flux, so need to convert to amp
     fitted_center = poptg[1]     # Second parameter is always center
     fitted_fwhm = poptg[2]       # Third parameter is always FWHM
     n_params = len(poptg)
-    
+
+    # Continuum-subtracted spectrum for peak detection (continuum = CONT + SLOPE * wave)
+    cont_model = param_dict['CONT'] + param_dict['SLOPE'] * (wl_fit - fitted_center)
+    spec_cont_sub = spec_fit - cont_model
+
+    # For doublets, exclude the secondary line center so it doesn't trigger the 'm' flag
+    if method == 'doublet':
+        secondary_center = rest_ratio * fitted_center
+        excluded_centers = [fitted_center, secondary_center]
+    else:
+        excluded_centers = [fitted_center]
+
     peak_check = check_multiple_peaks(
-        wl_fit, residuals, err_fit,
+        wl_fit, spec_cont_sub, residuals, err_fit,
         fitted_center, fitted_amplitude, fitted_fwhm,
+        excluded_centers=excluded_centers,
         n_fit_params=n_params,
-        chi2_threshold=3.0
+        chi2_threshold=3.0,
+        amplitude_ratio_threshold=1.0
     )
     
     if peak_check['suspicious']:
         print(f"WARNING: {peak_check['message']}")
         for i, peak in enumerate(peak_check['peak_info']):
             print(f"  Suspicious peak {i+1}: λ={peak['wavelength']:.2f}, "
-                  f"SNR={peak['snr']:.1f}, amp_ratio={peak['amplitude_ratio']:.2f}")
+                  f"SNR={peak['snr']:.1f}, amp_ratio={peak['amplitude_ratio']:.2f}, "
+                  f"width ratio={peak['width_ratio']:.2f}")
             
     # Populate the fit_result dictionary
     fit_result['method'] = method
@@ -1715,7 +1797,9 @@ def refit_other_line(wave, spec, spec_err, row, line_tab_row = None, width=25,
         continuum_buffer=width, 
         plot_result=True, 
         ax_in=ax_in,
-        bootstrap_params=bootstrap_params
+        bootstrap_params=bootstrap_params,
+        cluster=row['CLUSTER'],
+        full_iden=row['iden'],
     )
     
     # Handle fit failure

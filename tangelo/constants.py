@@ -70,3 +70,36 @@ skylines = {
     'OI6300': 6300.304,
     'OI5577': 5577.339,
 }
+
+# Dictionary defining which type of redshift to use for each line when masking other lines in the spectrum
+ztypes = {
+    'LYALPHA': 'zlya',
+    'SiII1260': 'zabs',
+    'CII1334': 'zabs',
+    'SiIV1394': 'zabs',
+    'SiIV1403': 'zabs',
+    'CIV1548': 'z',
+    'CIV1551': 'z',
+    'HeII1640': 'zforbid',
+    'OIII1660': 'zforbid',
+    'OIII1666': 'zforbid',
+    'CIII1907': 'zforbid',
+    'CIII1909': 'zforbid',
+    'NV1238': 'z',
+    'NV1243': 'z',
+    'AlII1671': 'zabs',
+    'AlIII1854': 'zabs',
+    'AlIII1862': 'zabs',
+    'SiIII1883': 'zforbid',
+    'SiIII1892': 'zforbid',
+    'FeII1608': 'zabs',
+    'FeII1611': 'zabs',
+    'NIV1483': 'zforbid',
+    'NIV1487': 'zforbid',
+    'OI1302': 'zabs',
+}
+
+# Any other lines in wavedict that are not in ztypes will default to using 'z' for masking other lines
+for line in wavedict:
+    if line not in ztypes:
+        ztypes[line] = 'z'

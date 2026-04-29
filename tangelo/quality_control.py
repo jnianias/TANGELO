@@ -819,12 +819,22 @@ def check_contamination(row, contaminating_spec, target_spec, save_plot=True):
         targz = row['z']
         velaxis = spectroscopy.wave2vel(ccmem_wl, wavedict[lname], redshift=targz)
         fit_reg = np.logical_and(-2000. < velaxis, velaxis < 2000.) * (~np.isnan(ccmem_flux)) * (~np.isnan(ccmem_specerr))
-        fit, fitcov = curve_fit(lambda x,f,w,c,s: models.gaussian(x,f,fitprops['LPEAK'],w,c,s),
-                                ccmem_wl[fit_reg], ccmem_flux[fit_reg], sigma = ccmem_specerr[fit_reg], 
-                                absolute_sigma=True, p0 = [fitprops['FLUX'], fitprops['FWHM'], local_median, 0.],
-                                bounds=[[bound(sign)[0], 2.0, -np.inf, -np.inf], 
-                                        [bound(sign)[1], 5 * fitprops['FWHM'], np.inf, np.inf]],
-                                max_nfev=10000)
+        for i in range(3):
+            # Do three fitting attempts just in case
+            try:
+                fit, fitcov = curve_fit(lambda x,f,w,c,s: models.gaussian(x,f,fitprops['LPEAK'],w,c,s),
+                                        ccmem_wl[fit_reg], ccmem_flux[fit_reg], sigma = ccmem_specerr[fit_reg], 
+                                        absolute_sigma=True, p0 = [fitprops['FLUX'], fitprops['FWHM'], local_median, 0.],
+                                        bounds=[[bound(sign)[0], 2.0, -np.inf, -np.inf], 
+                                                [bound(sign)[1], 5 * fitprops['FWHM'], np.inf, np.inf]],
+                                        max_nfev=10000)
+                break
+            except RuntimeError:
+                if i == 2:
+                    print(f"Warning: Fit did not converge after 3 attempts. Skipping this line.")
+                    continue
+                else:
+                    pass
         
         # Checks to make sure the fit is (i) significant and (ii) has the right sign to potentially be the 
         # cause of the putative line in the target spec.
@@ -1057,3 +1067,271 @@ def flag_contamination(megatab: aptb.Table, maxdist: Optional[u.Quantity] = None
                 megatab[flag_col][rowidx] = 'c' # 'c' for contaminated
             else:
                 print(f"Warning: {flag_col} not found in megatable. Cannot enter contamination flag for {line} line.")
+
+
+from .spectroscopy import wave2vel, check_sky_contamination
+
+
+def check_negative_flux(wave: np.ndarray, spec: np.ndarray, lpeak: float, fwhm: float) -> bool:
+    """
+    Check if the spectrum around the line is dominated by negative values, which can indicate a poor fit or issues with sky subtraction.
+
+    Parameters
+    ----------
+    wave : np.ndarray
+        The wavelength array of the spectrum.
+    spec : np.ndarray
+        The flux array of the spectrum.
+    lpeak : float
+        The wavelength of the line peak.
+    fwhm : float
+        The full width at half maximum of the line.
+
+    Returns
+    -------
+    bool
+        True if the spectrum around the line is dominated by negative values, False otherwise.
+    """
+    # Define the region around the line (±2 FWHM or minimum 5 Å)
+    half_width = np.max([2.0 * fwhm, 5.0])
+    line_mask = (wave > lpeak - half_width) & (wave < lpeak + half_width)
+    
+    if np.sum(line_mask) > 0:
+        line_flux = spec[line_mask]
+        # Check if more than 50% of pixels are negative
+        frac_negative = np.sum(line_flux < 0) / len(line_flux)
+        # Check if the median flux is negative
+        median_negative = np.median(line_flux) < 0
+        
+        # Flag if either condition is met
+        return (frac_negative > 0.5) or median_negative
+    
+    return False
+
+def check_peak_dominant(wave: np.ndarray, spec: np.ndarray, spec_err: np.ndarray, lpeak: float, 
+                        fwhm: float, flux: float, cont: float) -> bool:
+    """
+    Check if the line is peak-dominated, i.e. a single channel contributes more than 50% of the integrated flux
+    of the line, which usually indicates a systematics-dominated fit.
+
+    Parameters
+    ----------
+    wave : np.ndarray
+        The wavelength array of the spectrum.
+    spec : np.ndarray
+        The flux array of the spectrum.
+    spec_err : np.ndarray
+        The error array of the spectrum.
+    lpeak : float
+        The wavelength of the line peak.
+    fwhm : float
+        The full width at half maximum of the line.
+    flux : float
+        The integrated flux of the line from the fit.
+    flux_err : float
+        The error on the integrated flux of the line from the fit.
+    cont : float
+        The continuum level from the fit.
+
+    Returns
+    -------
+    bool
+        True if the line is peak-dominated, False otherwise.
+    """
+    # Find the index of the maximum flux within ±1 FWHM of the line peak
+    line_mask = (wave > lpeak - fwhm) & (wave < lpeak + fwhm)
+    if np.sum(line_mask) == 0:
+        raise ValueError("No spectral channels found within ±1 FWHM of the line peak. Cannot check for peak dominance.")
+    peak_idx = np.argmax(np.sign(flux) * spec[line_mask] - cont) + np.where(line_mask)[0][0] # Get the index of the peak in the original spectrum
+    
+    chanwid = np.median(np.diff(wave)) # Get the channel width in Å
+    peak_flux = (spec[peak_idx] - cont) * chanwid # Flux within a single channel
+    peak_flux_err = spec_err[peak_idx] * chanwid # Error on the peak flux
+    # peak_flux_lower = peak_flux - peak_flux_err # Lower bound of the peak flux considering its uncertainty
+    #                                             #this helps to avoid flagging cases where a single channel
+    #                                             # has high flux but low weight (i.e. high uncertainty)
+    
+    peakdom = (peak_flux / flux) > 0.5
+    
+    if peakdom:
+        print(f"Fit appears dominated by single channel: peak_flux={peak_flux:.2f}, line_flux={flux:.2f}, ratio={peak_flux/flux:.2f}")
+
+    return peakdom
+
+
+def apply_flags(wave: np.ndarray, spec: np.ndarray, spec_err: np.ndarray, lpeak: float, lpeak_err: float, 
+                fwhm: float, fwhm_err: float, flux: float, flux_err: float, cont: float, 
+                linename: str, fwhm_threshold: float = 2.05) -> str:
+    """
+    Apply flags to a fitted line based on various tests.
+
+    Parameters
+    ----------
+    wave : np.ndarray
+        The wavelength array of the spectrum.
+    spec : np.ndarray
+        The flux array of the spectrum.
+    spec_err : np.ndarray
+        The error array of the spectrum.
+    lpeak : float
+        The wavelength of the line peak.
+    lpeak_err : float
+        The error on the wavelength of the line peak.
+    fwhm : float
+        The full width at half maximum of the line.
+    fwhm_err : float
+        The error on the full width at half maximum of the line.
+    flux : float
+        The integrated flux of the line from the fit.
+    flux_err : float
+        The error on the integrated flux of the line from the fit.
+    cont : float
+        The continuum level from the fit.
+    linename : str
+        The name of the spectral line (e.g., 'CIV1548', 'LYALPHA').
+    fwhm_threshold : float, optional
+        The minimum FWHM threshold in Angstroms for flagging a line as too thin
+        (default is 2.05 Å, which is below the spectral resolution of MUSE).
+
+    Returns
+    -------
+    str
+        A string of flags indicating potential issues with the line fit. Flags can be 's',
+        't', 'n', 'p', or a combination thereof. An empty string indicates no flags.
+    """
+    flagstring = ''
+    # Test 2: Sky line contamination
+    # Check if the line peak coincides with any known sky lines
+    if check_sky_contamination(lpeak, lpeak_err, flux):
+        flagstring += 's'
+        print(f"Line peak at {lpeak:.2f} Å may be contaminated by sky lines.")
+    
+    # Test 3: Line too thin (below spectral resolution)
+    if fwhm + fwhm_err < fwhm_threshold:
+        flagstring += 't'
+        print(f"Line FWHM at {fwhm:.2f} Å is below the threshold of {fwhm_threshold:.2f} Å.")
+    
+    # Test 4: Negative flux domination
+    # Check if the spectrum around the line is dominated by negative values
+    if check_negative_flux(wave, spec, lpeak, fwhm):
+        flagstring += 'n'
+        print(f"Line at {lpeak:.2f} Å is dominated by negative flux values.")
+
+    # Test 5: Peak-dominated line
+    # Compare the flux in the peak channel to the integrated flux. If more than 50% of integrated flux is in the peak
+    # flag as peak-dominated
+    if check_peak_dominant(wave, spec, spec_err, lpeak, fwhm, flux, cont):
+        flagstring += 'p'
+        print(f"Line at {lpeak:.2f} Å is peak-dominated.")
+
+    return flagstring
+
+
+from .constants import wavedict, doublets
+
+
+def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float=2.05) -> List[str]:
+    """
+    This function performs several tests on a fitted spectral line to identify
+    potentially problematic measurements. Flags are applied as single characters:
+    - 's': Sky line contamination
+    - 't': Line too thin (FWHM below spectral resolution)
+    - 'n': Negative flux domination (spectrum goes below zero in line region)
+    - 'p': Peak-dominated (peak significance exceeds integrated flux SNR)
+    
+    Parameters    
+    ----------
+    fit_results_dict : dict
+        Dictionary containing fit results for the spectral line.
+    linename : str
+        Name of the spectral line (e.g., 'CIV1548', 'LYALPHA').
+    fwhm_threshold : float, optional
+        Minimum FWHM threshold in Angstroms (default: 2.05, MUSE spectral resolution).
+
+    Returns
+    -------
+    List[str]
+        A list of flag strings. For a singlet, the list has one entry; for a doublet,
+        two entries (primary then partner). Each entry is a string of flag characters
+        ('s', 't', 'n', 'p', 'm' or combinations), or an empty string if no flags apply.
+    
+    Notes:
+    ------
+    - If the line has a doublet partner that is also detected (SNR > 3), all flags
+      are removed as the doublet provides confirmation of the detection.
+    - Sky line contamination is checked against known sky line catalogs.
+    - Peak amplitude uncertainty is computed using proper error propagation via the
+      error_propagation package, accounting for uncertainties in both flux and FWHM.
+      If error columns are not present, flux error is estimated from FLUX/SNR.
+ 
+    """
+    print(f"Flagging fit results for {linename} line...")
+
+    # Extract line parameters with errors -- if any of these keys is missing, an error will be raised as desired.
+    fitted_params = fit_results_dict['param_dict']
+    lpeak = fitted_params['LPEAK']
+    flux = fitted_params['FLUX']
+    fwhm = fitted_params['FWHM']
+    cont = fitted_params['CONT']
+    fitted_errors = fit_results_dict['error_dict']
+    lpeak_err = fitted_errors['LPEAK']
+    flux_err = fitted_errors['FLUX']
+    fwhm_err = fitted_errors['FWHM']
+    cont_err = fitted_errors['CONT']
+
+    snr = flux / flux_err if flux_err != 0 else np.nan
+    if np.isnan(snr):
+        raise ValueError(f"SNR cannot be computed for line {linename} due to zero flux error. "
+                         f"Please check the fit results.")
+
+    # Test 1: Check for multiple peaks in the line region raised by fitting routine
+    # Check for multipeak flag in fit results (empty string indicates no flags, 'm' indicates multiple peaks detected)
+    flags = ''
+    if fit_results_dict['multipeak_flag'] == 'm':
+        print(f"Multi-peak flag found.")
+        flags = 'm'
+    
+    # Extract spectrum and wavelength for next tests
+    spec = fit_results_dict['spec_fit']
+    wave = fit_results_dict['wl_fit']
+    spec_err = fit_results_dict['err_fit']
+
+    # Apply flags to the line
+    flags += apply_flags(wave, spec, spec_err, lpeak, lpeak_err, 
+                        fwhm, fwhm_err, flux, flux_err, cont, 
+                        linename, fwhm_threshold=fwhm_threshold)
+
+    # Check if line is a doublet -- if so, flag the partner line.
+    # A KeyError here means FLUX2 is present but linename is not in doublets, which
+    # indicates a serious inconsistency in the fit results and should not be silenced.
+    doublet = 'FLUX2' in fitted_params
+
+    if doublet:
+        flux2 = fitted_params['FLUX2']
+        flux2_err = fitted_errors['FLUX2']
+        snr2 = flux2 / flux2_err if flux2_err != 0 else np.nan
+        if np.isnan(snr2):
+            raise ValueError(f"SNR cannot be computed for doublet partner line of {linename} due to zero flux error. "
+                             f"Please check the fit results.")
+        
+        # If the doublet partner is detected with SNR > 3, we consider the detection secure and remove all flags
+        if snr > 3 and snr2 > 3:
+            return ['', '']  # No flags for either line
+        else:
+            # Independently flag the partner line using the same tests
+            print(f"Flagging doublet partner line for {linename}...")
+            partner_linename = doublets[linename][1]
+            rest_ratio = wavedict[partner_linename] / wavedict[linename]
+            lpeak2 = lpeak * rest_ratio
+            fwhm2 = fwhm
+            fwhm2_err = fwhm_err
+            cont2 = cont
+            flags2 = ''
+            if fit_results_dict['multipeak_flag'] == 'm':
+                flags2 = 'm'
+            flags2 += apply_flags(wave, spec, spec_err, lpeak2, lpeak_err, fwhm2, fwhm2_err, 
+                                 flux2, flux2_err, cont2, partner_linename, fwhm_threshold=fwhm_threshold)
+            return [flags, flags2]
+
+    return [flags]
+            

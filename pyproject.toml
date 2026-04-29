@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tangelo"
+version = "1.0.0"
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib",
+    "numpy",
+    "scipy",
+    "astropy",
+    "error-propagation",
+    "specutils",
+    "mpdaf",
+    "photutils",
+    "requests",
+    "beautifulsoup4",
+    "linmix",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.uv.sources]
+linmix = { git = "https://github.com/jmeyers314/linmix.git" }
+
+[tool.hatch.build.targets.editable]
+mode = "compat"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "UP"]
