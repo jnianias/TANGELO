@@ -19,6 +19,7 @@ def test_fit_lya():
     Test the fit_lya function using a model spectrum with known parameters to ensure it can 
     recover those parameters accurately.
     """
+    np.random.seed(42)
     wave = np.arange(5450, 5650, 1.25) # Wavelength array in Angstroms using same sampling as MUSE
     true_params = {
         'AMPB'   :  100.0,
@@ -90,6 +91,7 @@ def test_fit_lya_convolved():
     Test the fit_lya function with convolution enabled to ensure it can recover parameters 
     when the model is convolved with the instrumental resolution.
     """
+    np.random.seed(42)
     wave = np.arange(5450, 5650, 1.25) # Wavelength array in Angstroms using same sampling as MUSE
     true_params = {
         'AMPB'   :  100.0,

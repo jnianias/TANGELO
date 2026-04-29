@@ -129,7 +129,7 @@ class LyaProfile:
                 0.
             )
             posmask = modfuncb > 0.
-            advdict['FLUXB'] = np.trapz(modfuncb[posmask], x = xaxis[posmask])
+            advdict['FLUXB'] = np.trapezoid(modfuncb[posmask], x = xaxis[posmask])
         asymfrac = np.abs(mdl.lya_swhm(param_dict['DISPR'], param_dict['ASYMR'], -1) \
                           / mdl.lya_swhm(param_dict['DISPR'], param_dict['ASYMR'], +1))
         intstart = param_dict['LPEAKR'] - asymfrac * intrange / (1. + asymfrac)
@@ -147,7 +147,7 @@ class LyaProfile:
             0.
         )
         posmask = modfuncr > 0.
-        advdict['FLUXR'] = np.trapz(modfuncr[posmask], x = xaxis[posmask])
+        advdict['FLUXR'] = np.trapezoid(modfuncr[posmask], x = xaxis[posmask])
         return advdict
     
     def fit_to(self, x, y, yerr, mask = None, bounds = None, use_bootstrap = False,

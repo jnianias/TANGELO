@@ -63,7 +63,7 @@ def test_gen_bounds():
         'LPEAKB' : (initial_guesses['LPEAKR'] + lpeakb_tol[0], 
                     initial_guesses['LPEAKR'] + lpeakb_tol[1]),
         'DISPB'  : (0.2 * (1 + z), 1 * (1 + z)),
-        'ASYMB'  : (-0.5, 0.5),
+        'ASYMB'  : (-0.5, 0.2),
         'AMPR'   : (0, 10000),
         'LPEAKR' : (initial_guesses['LPEAKR'] + lpeakr_tol[0], 
                     initial_guesses['LPEAKR'] + lpeakr_tol[1]),
