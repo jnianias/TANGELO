@@ -15,13 +15,13 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
       with:
         python-version: '3.9'
     - name: Install TANGELO with dependencies
       run: |
-        pip install -e ".[dev]"
+        uv pip install --system -e ".[dev]"
     - name: Run tests
       run: |
-        pytest
+        uv run pytest
