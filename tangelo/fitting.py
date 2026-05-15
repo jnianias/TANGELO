@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import error_propagation as ep
 from collections import namedtuple
 from . import plotting as plot
+from . import quality_control as qc
 from tqdm import tqdm
 
 # Import moved components for backwards compatibility
@@ -316,12 +317,181 @@ def gen_corr_noise(yerr, corr_len, size=None):
 
 
 from scipy.signal import find_peaks, peak_widths
+from scipy.ndimage import convolve1d
 
 
-def check_multiple_peaks(wave, spec_cont_sub, residuals, err, fitted_peak_wave, fitted_amplitude,
-                         fitted_width, excluded_centers=None, n_fit_params=3, min_separation=3,
-                         amplitude_ratio_threshold=1.0, width_ratio_range=(0.8, 2.0),
-                         detection_threshold=3.0, chi2_threshold=3.0, spike_contrast_threshold=3.0):
+def matched_filter_significance(wave: np.ndarray, spec_cont_sub: np.ndarray,
+                                 err: np.ndarray, fitted_peak_wave: float,
+                                 fitted_fwhm: float, fitted_amplitude: float,
+                                 exclude_window_fwhm: float = 1.0,
+                                 exclude_regions: list[tuple[float, float]] | None = None) -> dict:
+    """
+    Assess the significance of a fitted line using a matched filter approach.
+
+    Convolves the continuum-subtracted spectrum with a Gaussian template matching
+    the fitted line's shape (weighted by the inverse variance). The matched filter
+    response at each wavelength position represents how well the local spectrum
+    resembles the fitted line. The target's score is evaluated at the fitted centre
+    and compared to the empirical distribution of scores across the rest of the
+    spectrum, yielding a percentile rank.
+
+    This avoids peak detection entirely and is robust to:
+    - Weirdly-shaped or noisy targets that produce multiple ``find_peaks`` detections.
+    - Narrow sky spikes (which produce low matched-filter scores despite high raw SNR).
+    - A sparse population of spurious features that inflate the formal SNR without
+      being exceptional relative to the full spectrum.
+
+    Parameters
+    ----------
+    wave : np.ndarray
+        Wavelength array.
+    spec_cont_sub : np.ndarray
+        Continuum-subtracted spectrum (fitted model *not* subtracted).
+    err : np.ndarray
+        Per-pixel 1-sigma error array.
+    fitted_peak_wave : float
+        Wavelength of the fitted line centre.
+    fitted_fwhm : float
+        FWHM of the fitted Gaussian, in the same units as ``wave``.
+    fitted_amplitude : float
+        Amplitude or flux of the fitted Gaussian. Used only to determine the sign
+        of the line (emission vs. absorption) via ``np.sign()``, so any quantity
+        proportional to amplitude (including integrated flux) is equivalent. The
+        template is oriented to match this sign so that the MF response is positive
+        at the target position for both emission and absorption lines.
+    exclude_window_fwhm : float, optional
+        Half-width of the exclusion window around the target, in units of
+        ``fitted_fwhm``. Positions within this window are excluded from the
+        background distribution used to compute the percentile (default: 1.0).
+    exclude_regions : list of (float, float), optional
+        Additional wavelength intervals ``[(w_lo, w_hi), ...]`` to exclude from
+        the background distribution. The matched filter response is still
+        computed over these regions (to avoid boundary artefacts), but the
+        corresponding positions are ignored when fitting the background
+        distribution and computing the percentile. Useful for masking doublet
+        ghost features or known skyline residuals (default: None).
+
+    Returns
+    -------
+    dict
+        - ``'target_score'``   : float  — matched filter response at the line centre.
+                                          Always positive for a well-matched line.
+        - ``'percentile'``     : float  — fraction of background positions with a
+                                          lower score (0–1). Values near 1 indicate
+                                          the target is exceptional relative to the
+                                          rest of the spectrum.
+        - ``'n_background'``   : int    — number of positions used for the background.
+        - ``'mf_response'``    : np.ndarray — full matched filter response array
+                                          (sign-oriented so emission/absorption
+                                          lines appear as positive peaks).
+        - ``'message'``        : str
+
+    Notes
+    -----
+    The matched filter is normalised so that the response is in units of SNR
+    (signal-to-noise ratio), making it directly comparable across different spectra.
+    The template is a unit-amplitude Gaussian evaluated on the wavelength grid;
+    inverse-variance weighting suppresses noisy pixels automatically.
+
+    The template is multiplied by ``sign(fitted_amplitude)`` so that the response
+    is always positive at the target for both emission and absorption lines.
+    Consequently, ``percentile`` is meaningful regardless of line type.
+
+    Examples
+    --------
+    >>> result = matched_filter_significance(wave, spec_cont_sub, err, 7000.0, 5.0, amp)
+    >>> print(f"Target percentile: {result['percentile']:.3f}")
+    """
+    wave = np.asarray(wave, dtype=float)
+    spec = np.asarray(spec_cont_sub, dtype=float)
+    err = np.asarray(err, dtype=float)
+
+    sigma = fitted_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    delta_wave = np.median(np.diff(wave))
+
+    # Build Gaussian template on a relative wavelength axis (shift-invariant).
+    half_len = int(np.ceil(3.0 * sigma / delta_wave))
+    template_wave = np.arange(-half_len, half_len + 1) * delta_wave
+    template = np.exp(-0.5 * (template_wave / sigma) ** 2)
+
+    # Orient the template to match the sign of the fitted line so that
+    # the MF response is always positive at the target position.
+    template *= np.sign(fitted_amplitude)
+
+    # Inverse-variance weight the spectrum. Pixels with large errors contribute less.
+    ivar = np.where(err > 0, 1.0 / err ** 2, 0.0)
+    weighted_spec = spec * ivar
+
+    # Matched filter response in SNR units: cross-correlate the inverse-variance
+    # weighted spectrum with the template, normalised by the local weighted template norm.
+    norm_factor = np.sqrt(convolve1d(ivar, template ** 2, mode='constant', cval=0.0))
+    norm_factor = np.where(norm_factor > 0, norm_factor, np.nan)
+
+    mf_response = convolve1d(weighted_spec, template[::-1], mode='constant', cval=0.0) / norm_factor
+
+    # Score at the target position.
+    target_idx = np.argmin(np.abs(wave - fitted_peak_wave))
+    target_score = mf_response[target_idx]
+
+    # Build background distribution excluding the target window and any
+    # user-specified regions (e.g. doublet ghosts, known skyline residuals).
+    exclude_half = exclude_window_fwhm * fitted_fwhm
+    background_mask = (np.abs(wave - fitted_peak_wave) > exclude_half) & np.isfinite(mf_response)
+    if exclude_regions is not None:
+        for w_lo, w_hi in exclude_regions:
+            background_mask &= ~((wave >= w_lo) & (wave <= w_hi))
+    background_scores = mf_response[background_mask]
+    n_background = int(np.sum(background_mask))
+
+    if n_background == 0:
+        return {
+            'target_score': float(target_score),
+            'percentile': np.nan,
+            'parametric_percentile': np.nan,
+            'parametric_sigma': np.nan,
+            'background_mean': np.nan,
+            'background_std': np.nan,
+            'n_background': 0,
+            'mf_response': mf_response,
+            'message': 'No background positions available for percentile calculation.'
+        }
+
+    percentile = float(np.sum(background_scores < target_score) / n_background)
+
+    # Fit a Gaussian to the background distribution and evaluate the CDF at the
+    # target score. This gives a continuous parametric percentile that is more
+    # reliable than the empirical estimate when n_background is small (~100).
+    # norm.fit uses MLE; loc=mean, scale=std of the background.
+    bg_mean, bg_std = norm.fit(background_scores)
+    parametric_percentile = float(norm.cdf(target_score, loc=bg_mean, scale=bg_std))
+    parametric_sigma = norm.ppf(parametric_percentile)
+
+    return {
+        'target_score': float(target_score),
+        'percentile': percentile,
+        'parametric_percentile': parametric_percentile,
+        'parametric_sigma': parametric_sigma,
+        'background_mean': float(bg_mean),
+        'background_std': float(bg_std),
+        'n_background': n_background,
+        'mf_response': mf_response,
+        'message': (
+            f'Target MF score = {target_score:.2f}, '
+            f'empirical percentile = {percentile:.3f}, '
+            f'parametric percentile = {parametric_percentile:.4f} ({parametric_sigma:.2f}σ), '
+            f'parametric sigma = {parametric_sigma:.2f} '
+            f'(n_background = {n_background}, '
+            f'bg: μ={bg_mean:.2f}, σ={bg_std:.2f})'
+        )
+    }
+
+
+def check_multiple_peaks(wave: np.ndarray, spec_cont_sub: np.ndarray, residuals: np.ndarray, 
+                         err: np.ndarray, fitted_peak_wave: float, fitted_amplitude: float,
+                         fitted_width: float | tuple[float,float], excluded_centers=None, n_fit_params=3, 
+                         min_separation=3, amplitude_ratio_threshold=1.0, 
+                         width_ratio_range=(0.8, 2.0), detection_threshold=3.0, 
+                         chi2_threshold=3.0, exclude_opposite=True, verbose=False):
     """
     Check for additional unexplained peaks in the spectrum similar to the fitted line.
 
@@ -347,8 +517,9 @@ def check_multiple_peaks(wave, spec_cont_sub, residuals, err, fitted_peak_wave, 
         Wavelength of the primary fitted peak.
     fitted_amplitude : float
         Amplitude (height) of the primary fitted peak.
-    fitted_width : float
-        FWHM of the fitted peak (in same units as wave).
+    fitted_width : float | tuple[float,float]
+        FWHM of the fitted peak (in same units as wave). Can be a single value or a tuple 
+        of (value, error).
     excluded_centers : list of float, optional
         Wavelengths of all fitted components (e.g. both doublet lines) to exclude from
         the suspicious-peak count. If None, only `fitted_peak_wave` is excluded.
@@ -365,10 +536,12 @@ def check_multiple_peaks(wave, spec_cont_sub, residuals, err, fitted_peak_wave, 
         Minimum per-channel SNR for a peak to be considered significant (default: 3.0).
     chi2_threshold : float, optional
         Only search for peaks if reduced chi-square > this value (default: 3.0).
-    spike_contrast_threshold : float, optional
-        Neighbour-channel contrast ratio above which a peak is classified as a sky spike
-        and excluded from the suspicious-peak count (default: 3.0).
+    exclude_opposite : bool, optional
+        If True, exclude peaks of opposite sign to the fitted line (e.g. absorption vs emission).
+    verbose : bool, optional
+        If True, print detailed information about the peak search process (default: False).
 
+        
     Returns
     -------
     dict
@@ -393,6 +566,12 @@ def check_multiple_peaks(wave, spec_cont_sub, residuals, err, fitted_peak_wave, 
     >>> result = check_multiple_peaks(wave, spec_cont_sub, residuals, err, 5000, 10, 3)
     >>> print(result['n_comparable_peaks'])
     """
+
+    # Get the fitted width value for separation threshold calculation
+    if isinstance(fitted_width, tuple):
+        fitted_width_value = fitted_width[0]
+    else:
+        fitted_width_value = fitted_width
 
     if excluded_centers is None:
         excluded_centers = [fitted_peak_wave]
@@ -456,45 +635,49 @@ def check_multiple_peaks(wave, spec_cont_sub, residuals, err, fitted_peak_wave, 
         peak_channel_idx = peaks_idx[i]
 
         # Exclude any known fitted component (primary line, doublet partner, etc.)
-        sep_threshold = min_separation * min(fitted_width, 2 * delta_wave)
+        sep_threshold = min_separation * min(fitted_width_value, 2 * delta_wave)
         too_close = any(
             np.abs(pw - center) < sep_threshold for center in excluded_centers
         )
         if too_close:
+            if verbose:
+                print(f"Excluding peak at {pw:.2f} (too close to fitted component(s))")
             continue
-
-        # # Exclude sky spikes: a genuine line-like feature has neighbours of comparable
-        # # brightness; a spike has near-noise neighbours (same logic as check_peak_dominant).
-        # if 0 < peak_channel_idx < len(spec_cont_sub) - 1:
-        #     neighbour_vals = np.abs(np.array([
-        #         spec_cont_sub[peak_channel_idx - 1],
-        #         spec_cont_sub[peak_channel_idx + 1]
-        #     ]))
-        #     neighbour_errs = np.array([
-        #         err[peak_channel_idx - 1],
-        #         err[peak_channel_idx + 1]
-        #     ])
-        #     neighbour_upper = np.mean(neighbour_vals + neighbour_errs)
-        #     contrast = pa / neighbour_upper if neighbour_upper > 0 else np.inf
-        #     if neighbour_upper > 0 and contrast > spike_contrast_threshold:
-        #         print(f"  Excluding spike at λ={pw:.2f} Å (contrast={contrast:.1f} > {spike_contrast_threshold})")
-        #         continue  # Sky spike, not a line-like feature
 
         # Exclude peaks of opposite sign to the fitted line (emission vs absorption)
         peak_sign = np.sign(spec_cont_sub[peak_channel_idx])
         fitted_sign = np.sign(fitted_amplitude)
-        if peak_sign != fitted_sign:
+        if exclude_opposite and peak_sign != fitted_sign:
+            if verbose:
+                print(f"Excluding peak at {pw:.2f} (opposite sign to fitted line)")
             continue  # Opposite sign — not comparable
 
         # Check amplitude ratio relative to the fitted line
         amplitude_ratio = pa / np.abs(fitted_amplitude)
         if amplitude_ratio < amplitude_ratio_threshold:
+            if verbose:
+                print(f"Excluding peak at {pw:.2f} (amplitude ratio {amplitude_ratio:.2f} < {amplitude_ratio_threshold})")
             continue  # Too weak
 
         # Check width ratio
-        width_ratio = pwidth / fitted_width
-        if width_ratio < width_ratio_range[0] or width_ratio > width_ratio_range[1]:
-            continue  # Too narrow or too wide
+        if isinstance(fitted_width, tuple):
+            # If an error was provided, use that to define a range of acceptable widths
+            fitted_width_value = fitted_width[0]
+            fitted_width_error = fitted_width[1]
+            fitted_width_lb = fitted_width_value - 3 * fitted_width_error
+            fitted_width_ub = fitted_width_value + 3 * fitted_width_error
+            width_ratio = pwidth / fitted_width_value
+            if pwidth < fitted_width_lb or pwidth > fitted_width_ub:
+                if verbose:
+                    print(f"Excluding peak at {pw:.2f} (width {pwidth:.2f} outside fitted range [{fitted_width_lb:.2f}, {fitted_width_ub:.2f}])")
+                continue  # Width outside acceptable range
+        else:
+            # Otherwise fall back to hard range
+            width_ratio = pwidth / fitted_width
+            if width_ratio < width_ratio_range[0] or width_ratio > width_ratio_range[1]:
+                if verbose:
+                    print(f"Excluding peak at {pw:.2f} (width ratio {width_ratio:.2f} outside range [{width_ratio_range[0]}, {width_ratio_range[1]}])")
+                continue  # Too narrow or too wide
 
         # Passed all filters — this is a suspicious line-like feature
         separation = np.min([np.abs(pw - center) for center in excluded_centers])
@@ -943,7 +1126,7 @@ def gen_bounds(initial_guesses, linename, input_bounds={}, force_sign=None):
     defaults = {
         'LPEAK':  (initial_guesses.get('LPEAK', np.nan) - default_lpeak_tol * (1 + z), # if the user didn't provide LPEAK, set to nan so bounds will error out
                   initial_guesses.get('LPEAK', np.nan) + default_lpeak_tol * (1 + z)),
-        'FWHM':   (2.0, np.abs(spectro.vel2wave(300, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z)),
+        'FWHM':   (2.0, np.abs(spectro.vel2wave(400, rest_wave, 0) - spectro.vel2wave(0, rest_wave, 0)) * (1 + z)),
         'FLUX':   (default_flux_min, default_flux_max),
         'FLUX2':  (default_flux_min, default_flux_max), # for doublets
         'CONT':   (-50, 2000), # appropriate for sky-subtracted MUSE LAE spectra
@@ -973,7 +1156,7 @@ def gen_bounds(initial_guesses, linename, input_bounds={}, force_sign=None):
 
     return bounds
 
-def prep_inputs(initial_guesses, linename, z_lya=None, bounds={}):
+def prep_inputs(initial_guesses, linename, z_lya=None, bounds={}, vtol=1000):
     """
     Prepare and validate input parameters for fitting routines using Lyman alpha redshift as a 
     reference point.
@@ -1024,7 +1207,7 @@ def prep_inputs(initial_guesses, linename, z_lya=None, bounds={}):
         expected_wavelength = wavedict[linename] * (1 + z_lya)
         lpeak_init = initial_guesses['LPEAK']
         delta_v = spectro.wave2vel(lpeak_init, wavedict[linename], z_lya)
-        if abs(delta_v) > 500:
+        if abs(delta_v) > vtol:
             warnings.warn(f"Initial guess for LPEAK ({lpeak_init:.2f} Å) is {delta_v:.1f} km/s"
                         f" from Lyman alpha ({expected_wavelength:.2f} Å); resetting to -200 km/s offset.")
             initial_guesses['LPEAK'] = spectro.vel2wave(-200, wavedict[linename], z_lya)
@@ -1188,105 +1371,58 @@ def condition_initial_guesses(initial_guesses, wavelength, spectrum, errors, lin
 from typing import Tuple
 from typing import Union
 
-def flag_fit_result(param_dict: dict, error_dict: dict, initial_guesses: dict, bounds: dict,
-                    wl_fit: np.ndarray, spec_fit: np.ndarray, err_fit: np.ndarray, linename: str,
-                    doublet: bool = False) -> Union[str, Tuple[str, str]]:
-    """
-    Flag fit results based on parameter values and errors. UNDER DEVELOPMENT -- CURRENTLY BROKEN
-
-    Parameters
-    ----------
-    param_dict : dict
-        Dictionary of fitted parameters.
-    error_dict : dict
-        Dictionary of parameter uncertainties.
-    initial_guesses : dict
-        Dictionary of initial guesses for parameters.
-    bounds : dict
-        Dictionary of bounds for parameters.
-    wl_fit : array-like
-        Wavelength array for the fitting region.
-    spec_fit : array-like
-        Flux density array for the fitting region.
-    err_fit : array-like
-        Flux density uncertainties for the fitting region.
-    linename : str
-        Name of the line being fitted.
-    doublet : bool, optional
-        Whether the line is part of a doublet (default: False).
-
-    Returns
-    ---------
-    str or tuple of str
-        Flag indicating potential issues with the fit. 't' for thin line, 'p' for peak-dominated.
-        If doublet, returns a tuple of flags for primary and secondary lines.
-    """
-    flag1 = '' # initialize flag as empty string; will add to it based on conditions below
-
-    # Check to see if FWHM is close to lower bound, which can indicate systematics
-    thin = param_dict['FWHM'] <= bounds['FWHM'][0] * 1.01 # Flag as thin if FWHM is very close to lower bound \
-                                                        #(allowing for small numerical issues
-
-    if thin:
-        print(f"Thin {linename} fit detected: FWHM={param_dict['FWHM']:.3f} is close to lower bound {bounds['FWHM'][0]:.3f}")
-        flag1 += 't'
-
-    # check to see if the line is dominated by a single pixel, which we can tell by looking at 
-    # the SNR of amplitude as measured by fitted amplitude over the error on the peak channel
-    amplitude = param_dict['FLUX'] / (param_dict['FWHM'] * (np.sqrt(2 * np.pi) / 2.355)) # Convert integrated flux to peak amplitude
-    peak_channel_idx = np.argmin(np.abs(wl_fit - param_dict['LPEAK']))
-    peak_channel_err = err_fit[peak_channel_idx]
-    amplitude_snr = np.abs(amplitude) / peak_channel_err
-    peak_dominated = amplitude_snr > np.abs(param_dict['FLUX']) / error_dict['FLUX']
-
-    if peak_dominated:
-        print(f"Peak-dominated {linename} fit detected: Amplitude SNR={amplitude_snr:.3f} is greater than integrated flux SNR={np.abs(param_dict['FLUX']) / error_dict['FLUX']:.3f}")
-        flag1 += 'p'
-
-    # If a doublet, check the secondary line too
-    if doublet:
-        # If both primary and secondary are detected at > 3 sigma, remove flags and trust the fit
-        snr1 = np.abs(param_dict['FLUX']) / error_dict['FLUX']
-        snr2 = np.abs(param_dict['FLUX2']) / error_dict['FLUX2']
-        if snr1 > 3 and snr2 > 3:
-            print(f"Both lines of doublet confidently detected (SNR1={snr1:.3f}, SNR2={snr2:.3f}); clearing flags.")
-            return '', '' # Clear flags if both lines are confidently detected
-
-        secondary_name = doubletdict[linename][1]
-        wave_ratio = wavedict[secondary_name] / wavedict[linename]
-        lpeak_secondary = wave_ratio * param_dict['LPEAK']
-
-        flag2 = '' # Initialize flag for secondary line
-
-        # Check to see if it's thin
-        if thin:
-            print(f"Thin {secondary_name} fit detected: FWHM={param_dict['FWHM']} is close to lower bound {bounds['FWHM'][0]}")
-            flag2 += 't'
-
-        # Check to see if it's peak-dominated
-        amplitude2 = param_dict['FLUX2'] / (param_dict['FWHM'] * (np.sqrt(2 * np.pi) / 2.355))
-        peak_channel_idx2 = np.argmin(np.abs(wl_fit - lpeak_secondary))
-        peak_channel_err2 = err_fit[peak_channel_idx2]
-        amplitude2_snr = np.abs(amplitude2) / peak_channel_err2
-        peak_dominated_2 = amplitude2_snr > np.abs(param_dict['FLUX2']) / error_dict['FLUX2']
-
-        if peak_dominated_2:
-            print(f"Peak-dominated {secondary_name} fit detected: Amplitude SNR={amplitude2_snr:.3f} is greater than integrated flux SNR={np.abs(param_dict['FLUX2']) / error_dict['FLUX2']:.3f}")
-            flag2 += 'p'
-
-        return flag1, flag2
-
-    return flag1
-
-
-from . import catalogue_operations as catops
+# flag_fit_result has been superseded by the version in quality_control.py,
+# which takes the full fit_results_dict and is better integrated with the pipeline.
+# Kept here (commented out) for reference until the quality_control version is confirmed stable.
+#
+# def flag_fit_result(param_dict: dict, error_dict: dict, bounds: dict,
+#                     wl_fit: np.ndarray, err_fit: np.ndarray, linename: str,
+#                     doublet: bool = False, mf_sigma: float | None = None,
+#                     mf_sigma_threshold: float = 3.0) -> Union[str, Tuple[str, str]]:
+#     flag1 = ''
+#     thin = param_dict['FWHM'] <= bounds['FWHM'][0] * 1.01
+#     if thin:
+#         flag1 += 't'
+#     amplitude = param_dict['FLUX'] / (param_dict['FWHM'] * (np.sqrt(2 * np.pi) / 2.355))
+#     peak_channel_idx = np.argmin(np.abs(wl_fit - param_dict['LPEAK']))
+#     peak_channel_err = err_fit[peak_channel_idx]
+#     amplitude_snr = np.abs(amplitude) / peak_channel_err
+#     peak_dominated = amplitude_snr > np.abs(param_dict['FLUX']) / error_dict['FLUX']
+#     if peak_dominated:
+#         flag1 += 'p'
+#     mf_flag = ''
+#     if mf_sigma is not None and np.isfinite(mf_sigma) and mf_sigma < mf_sigma_threshold:
+#         mf_flag = 'm'
+#     flag1 += mf_flag
+#     if doublet:
+#         snr1 = np.abs(param_dict['FLUX']) / error_dict['FLUX']
+#         snr2 = np.abs(param_dict['FLUX2']) / error_dict['FLUX2']
+#         if snr1 > 3 and snr2 > 3:
+#             return mf_flag, mf_flag
+#         secondary_name = doubletdict[linename][1]
+#         wave_ratio = wavedict[secondary_name] / wavedict[linename]
+#         lpeak_secondary = wave_ratio * param_dict['LPEAK']
+#         flag2 = ''
+#         if thin:
+#             flag2 += 't'
+#         amplitude2 = param_dict['FLUX2'] / (param_dict['FWHM'] * (np.sqrt(2 * np.pi) / 2.355))
+#         peak_channel_idx2 = np.argmin(np.abs(wl_fit - lpeak_secondary))
+#         peak_channel_err2 = err_fit[peak_channel_idx2]
+#         amplitude2_snr = np.abs(amplitude2) / peak_channel_err2
+#         peak_dominated_2 = amplitude2_snr > np.abs(param_dict['FLUX2']) / error_dict['FLUX2']
+#         if peak_dominated_2:
+#             flag2 += 'p'
+#         flag2 += mf_flag
+#         return flag1, flag2
+#     return flag1
 
 
 def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
              bounds = {}, continuum_buffer = 25., plot_result = True, 
              ax_in = None, bootstrap_params: Optional[BootstrapParams] = None, 
              save_plots=False, plot_dir=None, cluster='', full_iden='',
-             spec_type='aper', lya_z=None):
+             spec_type='aper', lya_z=None,
+             mf_exclude_regions: list[tuple[float, float]] | None = None):
     """
     Fit a single or double Gaussian profile to a spectral line (plus its doublet partner if present).
     If the line is Lyman alpha, raises an error (use specialized function).
@@ -1418,7 +1554,7 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     cont_bounds = bounds['CONT']
     slope_bounds = bounds['SLOPE']
 
-    # If the secondary line is shofted out of the MUSE wavelength range, treat as a singlet
+    # If the secondary line is shifted out of the MUSE wavelength range, treat as a singlet
     if method == 'doublet':
         secondary = doubletdict[linename][1]
         secondary_rest = wavedict[secondary]
@@ -1426,6 +1562,10 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         secondary_lpeak = lpeak_init * wave_ratio
         if not (wavelength.min() < secondary_lpeak < wavelength.max()):
             print(f"Secondary line {secondary} of doublet is shifted out of wavelength range; fitting as single line.")
+            method = 'single'
+        elif not (wl_fit.min() < secondary_lpeak < wl_fit.max()):
+            print(f"Secondary line {secondary} of doublet at {secondary_lpeak:.2f} Å is outside the "
+                  f"masked fit region [{wl_fit.min():.2f}, {wl_fit.max():.2f}] Å; fitting as single line.")
             method = 'single'
 
     # Initialise fit result dictionary that the function will return
@@ -1601,12 +1741,12 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
         print(f'WARNING: HIGH REDUCED CHI SQUARED STATISTIC ({reduced_chisq:.2f})! REVIEW RESULT.')
     
     # Check for multiple comparable peaks in spectrum
-    residuals = spec_fit - model(wl_fit, *poptg)
-    fitted_stddev = poptg[2] / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to standard deviation
-    fitted_amplitude = poptg[0] / (fitted_stddev * np.sqrt(2 * np.pi))   # First parameter is always flux, so need to convert to amp
+    # residuals = spec_fit - model(wl_fit, *poptg)
+    # fitted_stddev = poptg[2] / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to standard deviation
+    # fitted_amplitude = poptg[0] / (fitted_stddev * np.sqrt(2 * np.pi))   # First parameter is always flux, so need to convert to amp
     fitted_center = poptg[1]     # Second parameter is always center
     fitted_fwhm = poptg[2]       # Third parameter is always FWHM
-    n_params = len(poptg)
+    # n_params = len(poptg)
 
     # Continuum-subtracted spectrum for peak detection (continuum = CONT + SLOPE * wave)
     cont_model = param_dict['CONT'] + param_dict['SLOPE'] * (wl_fit - fitted_center)
@@ -1619,22 +1759,89 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     else:
         excluded_centers = [fitted_center]
 
-    peak_check = check_multiple_peaks(
-        wl_fit, spec_cont_sub, residuals, err_fit,
-        fitted_center, fitted_amplitude, fitted_fwhm,
-        excluded_centers=excluded_centers,
-        n_fit_params=n_params,
-        chi2_threshold=3.0,
-        amplitude_ratio_threshold=1.0
-    )
+    # peak_check = check_multiple_peaks(
+    #     wl_fit, spec_cont_sub, residuals, err_fit,
+    #     fitted_center, fitted_amplitude, fitted_fwhm,
+    #     excluded_centers=excluded_centers,
+    #     n_fit_params=n_params,
+    #     chi2_threshold=3.0,
+    #     amplitude_ratio_threshold=1.0
+    # )
     
-    if peak_check['suspicious']:
-        print(f"WARNING: {peak_check['message']}")
-        for i, peak in enumerate(peak_check['peak_info']):
-            print(f"  Suspicious peak {i+1}: λ={peak['wavelength']:.2f}, "
-                  f"SNR={peak['snr']:.1f}, amp_ratio={peak['amplitude_ratio']:.2f}, "
-                  f"width ratio={peak['width_ratio']:.2f}")
-            
+    # if peak_check['suspicious']:
+    #     print(f"WARNING: {peak_check['message']}")
+    #     for i, peak in enumerate(peak_check['peak_info']):
+    #         print(f"  Suspicious peak {i+1}: λ={peak['wavelength']:.2f}, "
+    #               f"SNR={peak['snr']:.1f}, amp_ratio={peak['amplitude_ratio']:.2f}, "
+    #               f"width ratio={peak['width_ratio']:.2f}")
+
+    # Matched filter significance test.
+    # Build exclusion regions from three sources:
+    #   1. Any user-supplied regions (mf_exclude_regions).
+    #   2. Gaps in the fit window caused by generate_spec_mask (other lines, sky lines).
+    #      We detect these as contiguous runs of wavelengths that were masked out of the
+    #      full wavelength array but fall within the fit window's wavelength range.
+    #   3. For doublets, a guard window around the secondary line centre.
+    mf_exclude = list(mf_exclude_regions) if mf_exclude_regions is not None else []
+
+    # Derive excluded intervals from the fit_mask gaps within the fit window extent.
+    wl_min, wl_max = wl_fit[0], wl_fit[-1]
+    window_mask = (wavelength >= wl_min) & (wavelength <= wl_max)
+    masked_in_window = window_mask & ~fit_mask  # pixels in window that were masked out
+    if masked_in_window.any():
+        masked_wave = wavelength[masked_in_window]
+        # Group contiguous masked pixels into intervals.
+        gaps = np.where(np.diff(masked_wave) > 2 * np.median(np.diff(wavelength)))[0]
+        starts = np.concatenate([[0], gaps + 1])
+        ends   = np.concatenate([gaps, [len(masked_wave) - 1]])
+        delta  = np.median(np.diff(wavelength))
+        for s, e in zip(starts, ends):
+            mf_exclude.append((masked_wave[s] - delta, masked_wave[e] + delta))
+
+    # Run the matched filter at three FWHM values (nominal, +1σ, −1σ) and keep
+    # the most conservative result (lowest parametric_sigma) to guard against
+    # template-width mismatch causing comparable peaks to score falsely low.
+    fwhm_err = error_dict['FWHM']
+
+    def _mf_worst(center, amplitude, fwhm, exclude_regions):
+        """Run matched filter at fwhm, fwhm+err, fwhm-err; return worst result."""
+        fwhm_lo = max(fwhm - fwhm_err, fwhm * 0.1)  # floor at 10% of the fitted FWHM
+        fwhm_hi = fwhm + fwhm_err
+        results = [
+            matched_filter_significance(
+                wl_fit, spec_cont_sub, err_fit,
+                center, f, amplitude,
+                exclude_regions=exclude_regions if exclude_regions else None
+            )
+            for f in (fwhm, fwhm_hi, fwhm_lo)
+        ]
+        # Most conservative = lowest parametric_sigma
+        return min(results, key=lambda r: r['parametric_sigma'])
+
+    if method == 'doublet':
+        # Run MF independently for each doublet component, with the other excluded from
+        # the background. Both components are equally valid detections and must be treated
+        # symmetrically. Use the minimum sigma (most conservative) for flagging.
+        sec_center = excluded_centers[1]
+        sec_flux = poptg[3]  # FLUX2 is the fourth parameter for doublet models
+        guard_half = fitted_fwhm  # ±1 FWHM guard around the excluded component
+
+        mf_exclude_primary   = mf_exclude + [(sec_center - guard_half, sec_center + guard_half)]
+        mf_exclude_secondary = mf_exclude + [(fitted_center - guard_half, fitted_center + guard_half)]
+
+        mf_result_primary   = _mf_worst(fitted_center, poptg[0], fitted_fwhm, mf_exclude_primary)
+        mf_result_secondary = _mf_worst(sec_center,   sec_flux,  fitted_fwhm, mf_exclude_secondary)
+        print(f"Matched filter (primary):   {mf_result_primary['message']}")
+        print(f"Matched filter (secondary): {mf_result_secondary['message']}")
+
+        mf_result = [mf_result_primary, mf_result_secondary]
+        mf_sigma  = [mf_result_primary['parametric_sigma'],
+                     mf_result_secondary['parametric_sigma']]
+    else:
+        mf_result = [_mf_worst(fitted_center, poptg[0], fitted_fwhm, mf_exclude)]
+        print(f"Matched filter: {mf_result[0]['message']}")
+        mf_sigma = [mf_result[0]['parametric_sigma']]
+
     # Populate the fit_result dictionary
     fit_result['method'] = method
     fit_result['popt'] = poptg
@@ -1647,10 +1854,12 @@ def fit_line(wavelength, spectrum, errors, linename, initial_guesses,
     fit_result['param_dict'] = param_dict
     fit_result['error_dict'] = error_dict
     fit_result['model'] = model
-    fit_result['peak_check'] = peak_check  # Add multiple peaks check result
-    fit_result['multipeak_flag'] = peak_check['flag']  # Quick access to flag
-    # fit_result['flags'] = [peak_check['flag'] + flag1] if method == 'single' \
-    #                         else [peak_check['flag'] + flag1, peak_check['flag2'] + flag2]  # Add fit flags to result
+    # fit_result['peak_check'] = peak_check  # Add multiple peaks check result
+    # fit_result['multipeak_flag'] = peak_check['flag']  # Quick access to flag
+    fit_result['mf_result'] = mf_result  # dict with 'primary'/'secondary' keys for doublets
+    fit_result['mf_sigma'] = mf_sigma    # min(primary, secondary) for doublets; parametric_sigma for singlets
+
+    fit_result['flags'] = qc.flag_fit_result(fit_result, linename)
 
     # If requested, plot the fitting result
     if plot_result:

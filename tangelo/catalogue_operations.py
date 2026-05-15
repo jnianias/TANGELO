@@ -585,7 +585,7 @@ def is_candidate(tab, wavedict, sig=3.0, n=1, return_lines=False, type='emission
     """
     z_key = get_z_key(tab)
     tv = np.zeros(len(tab[z_key]) if isinstance(tab[z_key], (np.ndarray, aptb.Table.Column)) else 1).astype(int)
-    trulist = [[] for r in tv]
+    trulist = [[] for _ in tv]
     for line in wavedict:
         if type.lower() == 'emission':
             tv += (tab[f'SNR_{line}'] > sig).astype(int)
@@ -651,17 +651,20 @@ def is_true_emitter(tab, wavedict, sig=3.0, n=1, return_lines=False):
     """
     z_key = get_z_key(tab)
     tv = np.zeros(len(tab[z_key]) if isinstance(tab[z_key], (np.ndarray, aptb.Table.Column)) else 1).astype(int)
-    trulist = [[] for r in tv]
+    trulist = [[] for _ in tv]
+
     for line in wavedict:
         if line == 'LYALPHA':
             continue
         else:
+            # Find all indices where the line is detected above threshold and has valid flags
             tv += ((tab[f'SNR_{line}'] > sig) *
                        ((tab[f'FLAG_{line}'] == '') + (tab[f'FLAG_{line}'] == 'na'))).astype(int)
-            truidcs = np.where((tab[f'SNR_{line}'] > sig)
-                        * ((tab[f'FLAG_{line}'] == '') + (tab[f'FLAG_{line}'] == 'na')))
+            truidcs = np.where(np.atleast_1d((tab[f'SNR_{line}'] > sig)
+                        * ((tab[f'FLAG_{line}'] == '') + (tab[f'FLAG_{line}'] == 'na'))))
             for idx in truidcs[0]:
                 trulist[idx].append(line)
+    
     return (tv >= n, trulist) if return_lines else tv >= n
 
 

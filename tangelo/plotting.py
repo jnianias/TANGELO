@@ -19,14 +19,15 @@ unit_strings = {
     'VELOCITY': r"[km\,s$^{-1}$]",
     'WAVELENGTH': r"[\AA]",
     'ASYMMETRY': r"[\AA$^{-1}$]",
+    'LUMINOSITY': r"[erg\,s$^{-1}$]",
 }
 
 plot_names = {
     'LYA': r'Lyman-$\alpha$',
     'lya': r'Lyman-$\alpha$',
     'CIV1548': r'C IV $\lambda$1548',
-    'CIV1550': r'C IV $\lambda$1550',
-    'CIV': r'C IV $\lambda\lambda$1548,1550',
+    'CIV1551': r'C IV $\lambda$1551',
+    'CIV': r'C IV $\lambda\lambda$1548,1551',
     'OIII1660': r'O III] $\lambda$1660',
     'OIII1666': r'O III] $\lambda$1666',
     'OIII': r'O III] $\lambda\lambda$1660,1666',
@@ -41,11 +42,14 @@ plot_names = {
     'SiIV': r'Si IV $\lambda\lambda$1394,1403',
     'CII1334': r'C II $\lambda$1334',
     'NV1238': r'N V $\lambda$1238',
-    'NV1242': r'N V $\lambda$1242',
-    'NV': r'N V $\lambda\lambda$1238,1242',
+    'NV1243': r'N V $\lambda$1243',
+    'NV': r'N V $\lambda\lambda$1238,1243',
     'SiIII1883': r'Si III] $\lambda$1883',
     'SiIII1892': r'Si III] $\lambda$1892',
     'SiIII': r'Si III] $\lambda\lambda$1883,1892',
+    'LI_ABS': r'LI absorption',
+    'HI_ABS': r'HI absorption',
+    'TOT_ABS': r'Total absorption',
     'DISPR': r'$ d_{\text{red peak}} $ ' + unit_strings['WAVELENGTH'],
     'DISPB': r'$ d_{\text{blue peak}} $ ' + unit_strings['WAVELENGTH'],
     'LPEAKR': r'$\lambda_{c,\text{red peak}}$ ' + unit_strings['WAVELENGTH'],
@@ -69,12 +73,22 @@ plot_names = {
     'FLUX': r"Flux " + unit_strings['FLUX'],
     'VEXP_ZELDA': r'$v_{\text{exp, HTS}}$ ' + unit_strings['VELOCITY'],
     'CONT': r"f$_{\lambda, \text{cont}}$ " + unit_strings['FLUX DENSITY'],
-    'LYA_EW': r'Ly$\alpha$ EW ' + unit_strings['WAVELENGTH'],
+    'EW_LYA': r'Ly$\alpha$ EW ' + unit_strings['WAVELENGTH'],
+    'FCEN_LYA': r'$f_{\rm cen}$ (Ly$\alpha$ central flux fraction)',
+    'LUM_LYA': r'Ly$\alpha$ luminosity ' + unit_strings['LUMINOSITY'],
     'EW': r'EW ' + unit_strings['WAVELENGTH'],
     'LOGN_ZELDA': r'$\log(N_{\text{HI, HTS}})$ [cm$^{-2}$]',
     'LOGIEW_ZELDA': r'$\log(\text{Ly}\alpha\,EW_{\text{int, HTS}})$ '+ unit_strings['WAVELENGTH'],
     'WINT_ZELDA': r'$W_{\text{int, HTS}}$ ' + unit_strings['WAVELENGTH'],
-    'TDUST_ZELDA': r'$\tau_{\text{dust, HTS}}$',
+    'TDUST_ZELDA': r'$\tau_{\text{dust, HTS}}$ ',
+    'CONT_LUM_LYA': r'Ly$\alpha$ continuum luminosity ' + unit_strings['LUMINOSITY'] + r'\,' + unit_strings['WAVELENGTH'],
+    'OUTVEL': r'$ V_{\text{out}} $ ' + unit_strings['VELOCITY'],
+    'W': r'width ' + unit_strings['VELOCITY'],
+    'LUM': r'Luminosity ' + unit_strings['LUMINOSITY'],
+    'CONT_LUM': r'Continuum luminosity ' + unit_strings['LUMINOSITY'] + r'\,' + unit_strings['WAVELENGTH'],
+    'MU': r'$ \mu $',
+    'z': r'$ z $',
+    'SNRR': r'SNR of red Ly$\alpha$ peak',
 }
 
 def get_plot_name(param, unit=True):
@@ -232,7 +246,7 @@ def plotline(iden, clus, idfrom, wln, ax_in, spec_source = '2fwhm', width=100, m
     ax = ax_in
 
     # Find spectrum file and load it as a table
-    load_method = spectro.load_r21_spec if spec_source == 'R21' else spectro.load_aper_spec
+    load_method = io.load_r21_spec if spec_source == 'R21' else io.load_aper_spec
     spectab = load_method(clus, iden, idfrom, 'weight_skysub' if spec_source == 'R21' else '2fwhm')
 
     if spectab is None:
@@ -658,6 +672,114 @@ def plot_line_fit(wave, spec, spec_err, popt, func, line_name,
         safe_show()
         plt.close()
 
+def plot_mf_diagnostic(wl_fit, spec_cont_sub, err_fit, mf_results, fitted_center, fitted_fwhm,
+                       linename='', cluster='', full_iden='',
+                       save_plots=False, plot_dir=None, spec_type='aper', ax_in=None):
+    """
+    Diagnostic plot showing matched filter response as a function of wavelength.
+
+    Plots the continuum-subtracted spectrum alongside the MF response curve for
+    each FWHM trial (nominal, +1σ, −1σ), the target score at the fitted centre,
+    and the background distribution's mean ± std. Useful for understanding why a
+    particular feature does or does not achieve a given MF significance.
+
+    Parameters
+    ----------
+    wl_fit : array-like
+        Wavelength array of the continuum-subtracted spectrum.
+    spec_cont_sub : array-like
+        Continuum-subtracted flux array.
+    err_fit : array-like
+        Per-pixel 1-sigma error array.
+    mf_results : list of dict
+        List of MF result dicts as returned by `_mf_worst` (one per component
+        for doublets, one for single lines). Each dict must contain 'mf_response',
+        'target_score', 'background_mean', 'background_std', and 'parametric_sigma'.
+    fitted_center : float
+        Wavelength of the fitted line centre (Å).
+    fitted_fwhm : float
+        FWHM of the fitted line (Å).
+    linename : str, optional
+        Name of the line for the plot title.
+    cluster : str, optional
+        Cluster name for the title and filename.
+    full_iden : str, optional
+        Source identifier for the title and filename.
+    save_plots : bool, optional
+        If True, save the figure to disk. Default False.
+    plot_dir : str, optional
+        Directory to save the figure. Defaults to './'.
+    spec_type : str, optional
+        Spectrum type label used in the filename. Default 'aper'.
+    ax_in : matplotlib.axes.Axes or None, optional
+        If provided, plot into this axis (only the MF response panel). If None,
+        a two-panel figure (spectrum + MF response) is created.
+    """
+    standalone = ax_in is None
+    ax_spec = None
+    if standalone:
+        fig, axes = plt.subplots(2, 1, figsize=(9, 6), sharex=True,
+                                 facecolor='w', gridspec_kw={'hspace': 0.05})
+        ax_spec, ax_mf = axes
+    else:
+        ax_mf = ax_in
+
+    colours = ['tab:blue', 'tab:orange', 'tab:green']
+    labels  = ['MF response (nominal FWHM)', 'MF response (FWHM+err)', 'MF response (FWHM-err)']
+
+    # Top panel: continuum-subtracted spectrum
+    if standalone:
+        ax_spec.plot(wl_fit, spec_cont_sub, drawstyle='steps-mid', color='black', lw=0.8, label='Cont.-sub. spectrum')
+        ax_spec.fill_between(wl_fit, -err_fit, err_fit, color='grey', alpha=0.3, step='mid', edgecolor='none', label=r'$\pm 1\sigma$ errors')
+        ax_spec.axvline(fitted_center, color='red', ls='--', lw=1, label=f'Fitted centre (${fitted_center:.2f}$'+r'\AA)')
+        ax_spec.axvspan(fitted_center - fitted_fwhm / 2, fitted_center + fitted_fwhm / 2,
+                        alpha=0.12, color='red', label=f'FWHM = ${fitted_fwhm:.2f}$'+r'\AA')
+        ax_spec.set_ylabel('Flux density')
+        ax_spec.legend(fontsize=7, loc='upper right')
+        ax_spec.set_title(f'{cluster} {full_iden}  {linename} Matched filter diagnostic')
+
+    # For each MF result dict, plot the stored response curve
+    for j, mf_res in enumerate(mf_results):
+        mf_resp = np.asarray(mf_res['mf_response'])
+        colour  = colours[j % len(colours)]
+        sigma   = mf_res['parametric_sigma']
+        ax_mf.plot(wl_fit, mf_resp, color=colour, lw=1.0,
+                   label=f'{labels[j % len(labels)]} (${sigma:.2f}$' + r'$\sigma$)')
+
+        # Mark the target score
+        ax_mf.scatter([fitted_center], [mf_res['target_score']],
+                      color=colour, zorder=5, s=40, marker='D')
+
+        # Background mean ± std band
+        bg_mean = mf_res['background_mean']
+        bg_std  = mf_res['background_std']
+        if np.isfinite(bg_mean) and np.isfinite(bg_std):
+            ax_mf.axhline(bg_mean, color=colour, ls=':', lw=0.8, alpha=0.6)
+            ax_mf.axhspan(bg_mean - bg_std, bg_mean + bg_std,
+                          color=colour, alpha=0.06)
+            ax_mf.axhspan(bg_mean - 3 * bg_std, bg_mean + 3 * bg_std,
+                          color=colour, alpha=0.04)
+
+    ax_mf.axvline(fitted_center, color='red', ls='--', lw=1)
+    ax_mf.axhline(0, color='k', lw=0.5, ls='-')
+    ax_mf.set_xlabel(r'Wavelength (\AA)')
+    ax_mf.set_ylabel('MF response (SNR units)')
+    ax_mf.legend(fontsize=7, loc='upper right')
+
+    if standalone:
+        plt.tight_layout()
+        if save_plots:
+            if plot_dir is None:
+                plot_dir = './'
+            if not os.path.exists(plot_dir):
+                os.makedirs(plot_dir)
+            plot_path = os.path.join(plot_dir, f'{linename}_mf_diagnostic_{spec_type}.png')
+            plt.savefig(plot_path, dpi=200)
+            print(f'MF diagnostic plot saved to {plot_path}')
+        safe_show()
+        plt.close()
+
+
 def plot_lya_peak_detection(lya_nb_img, ra, dec, ra_opt, dec_opt, cluster, full_iden, peak_locs_world, save_plot=False):
     """
     Plot the Lyman-alpha narrowband image with detected peaks and source positions.
@@ -878,8 +1000,8 @@ def plot_2d_model(cutout, model, markers=[], iden=None, cluster=None, save_plot=
         a.set_xticks(ticks[0])
         a.set_yticklabels(ticks[3])
         a.set_xticklabels(ticks[2])
-        a.set_xlabel(r"$ \upDelta $R.A. ($''$)")
-        a.set_ylabel(r"$ \upDelta $Dec ($''$)")
+        a.set_xlabel(r"$ \Delta $R.A. ($''$)")
+        a.set_ylabel(r"$ \Delta $Dec ($''$)")
 
         # If an aperture was provided, plot it
         if isinstance(aperture, tuple):

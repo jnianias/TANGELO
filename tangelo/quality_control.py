@@ -6,7 +6,6 @@ from typing import Optional, Dict, List
 from . import io
 from . import image_processing as improc
 from . import plotting as plot
-from . import fitting
 from . import spectroscopy
 
 import astropy.table as aptb
@@ -614,6 +613,7 @@ def estimate_contaminating_spectrum(nearby_sources, img, target_clus, target_ide
         the aperture around the target.
 
     """
+    from . import fitting  # Local import to avoid circular dependency (fitting imports quality_control)
     contaminant = nearby_sources[0] # The most likely contaminant is the closest source in normalised distance
     other_sources = nearby_sources[1:] # The other nearby sources that are not the closest contaminant
 
@@ -1141,7 +1141,10 @@ def check_peak_dominant(wave: np.ndarray, spec: np.ndarray, spec_err: np.ndarray
     # Find the index of the maximum flux within ±1 FWHM of the line peak
     line_mask = (wave > lpeak - fwhm) & (wave < lpeak + fwhm)
     if np.sum(line_mask) == 0:
-        raise ValueError("No spectral channels found within ±1 FWHM of the line peak. Cannot check for peak dominance.")
+        # Print a warning -- this isn't worth raising an error over
+        print(f"Warning: No spectral channels found within ±1 FWHM of the line peak. Cannot check for peak domination.")
+        return False
+    
     peak_idx = np.argmax(np.sign(flux) * spec[line_mask] - cont) + np.where(line_mask)[0][0] # Get the index of the peak in the original spectrum
     
     chanwid = np.median(np.diff(wave)) # Get the channel width in Å
@@ -1161,7 +1164,7 @@ def check_peak_dominant(wave: np.ndarray, spec: np.ndarray, spec_err: np.ndarray
 
 def apply_flags(wave: np.ndarray, spec: np.ndarray, spec_err: np.ndarray, lpeak: float, lpeak_err: float, 
                 fwhm: float, fwhm_err: float, flux: float, flux_err: float, cont: float, 
-                linename: str, fwhm_threshold: float = 2.05) -> str:
+                linename: str, fwhm_threshold: float = 2.05, is_velocity_space: bool = False) -> str:
     """
     Apply flags to a fitted line based on various tests.
 
@@ -1200,16 +1203,17 @@ def apply_flags(wave: np.ndarray, spec: np.ndarray, spec_err: np.ndarray, lpeak:
         't', 'n', 'p', or a combination thereof. An empty string indicates no flags.
     """
     flagstring = ''
-    # Test 2: Sky line contamination
-    # Check if the line peak coincides with any known sky lines
-    if check_sky_contamination(lpeak, lpeak_err, flux):
-        flagstring += 's'
-        print(f"Line peak at {lpeak:.2f} Å may be contaminated by sky lines.")
-    
-    # Test 3: Line too thin (below spectral resolution)
-    if fwhm + fwhm_err < fwhm_threshold:
-        flagstring += 't'
-        print(f"Line FWHM at {fwhm:.2f} Å is below the threshold of {fwhm_threshold:.2f} Å.")
+    if not is_velocity_space:
+        # Test 2: Sky line contamination
+        # Check if the line peak coincides with any known sky lines
+        if check_sky_contamination(lpeak, lpeak_err, flux):
+            flagstring += 's'
+            print(f"Line peak at {lpeak:.2f} Å may be contaminated by sky lines.")
+        
+        # Test 3: Line too thin (below spectral resolution)
+        if fwhm + fwhm_err < fwhm_threshold:
+            flagstring += 't'
+            print(f"Line FWHM at {fwhm:.2f} Å is below the threshold of {fwhm_threshold:.2f} Å.")
     
     # Test 4: Negative flux domination
     # Check if the spectrum around the line is dominated by negative values
@@ -1230,7 +1234,8 @@ def apply_flags(wave: np.ndarray, spec: np.ndarray, spec_err: np.ndarray, lpeak:
 from .constants import wavedict, doublets
 
 
-def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float=2.05) -> List[str]:
+def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float=2.05,
+                    mf_sigma_threshold: float=3.0) -> List[str]:
     """
     This function performs several tests on a fitted spectral line to identify
     potentially problematic measurements. Flags are applied as single characters:
@@ -1238,15 +1243,20 @@ def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float
     - 't': Line too thin (FWHM below spectral resolution)
     - 'n': Negative flux domination (spectrum goes below zero in line region)
     - 'p': Peak-dominated (peak significance exceeds integrated flux SNR)
+    - 'm': Low matched filter significance (parametric sigma below threshold)
     
     Parameters    
     ----------
     fit_results_dict : dict
         Dictionary containing fit results for the spectral line.
     linename : str
-        Name of the spectral line (e.g., 'CIV1548', 'LYALPHA').
+        Name of the spectral line (e.g., CIV1548, LYALPHA).
     fwhm_threshold : float, optional
         Minimum FWHM threshold in Angstroms (default: 2.05, MUSE spectral resolution).
+    mf_sigma_threshold : float, optional
+        Matched filter significance threshold in sigma units. Lines with
+        ``mf_sigma < mf_sigma_threshold`` receive the ``'m'`` flag (default: 3.0).
+        If ``'mf_sigma'`` is absent from ``fit_results_dict``, no ``'m'`` flag is applied.
 
     Returns
     -------
@@ -1257,8 +1267,9 @@ def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float
     
     Notes:
     ------
-    - If the line has a doublet partner that is also detected (SNR > 3), all flags
-      are removed as the doublet provides confirmation of the detection.
+    - If the line has a doublet partner that is also detected (SNR > 3), all spectral
+      quality flags are removed as the doublet provides confirmation. The ``'m'`` flag
+      is still applied if matched filter significance is low.
     - Sky line contamination is checked against known sky line catalogs.
     - Peak amplitude uncertainty is computed using proper error propagation via the
       error_propagation package, accounting for uncertainties in both flux and FWHM.
@@ -1268,28 +1279,36 @@ def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float
     print(f"Flagging fit results for {linename} line...")
 
     # Extract line parameters with errors -- if any of these keys is missing, an error will be raised as desired.
+    lpeak_key = 'VPEAK' if linename == 'STACK' else 'LPEAK'
     fitted_params = fit_results_dict['param_dict']
-    lpeak = fitted_params['LPEAK']
+    lpeak = fitted_params[lpeak_key]
     flux = fitted_params['FLUX']
     fwhm = fitted_params['FWHM']
     cont = fitted_params['CONT']
     fitted_errors = fit_results_dict['error_dict']
-    lpeak_err = fitted_errors['LPEAK']
+    lpeak_err = fitted_errors[lpeak_key]
     flux_err = fitted_errors['FLUX']
     fwhm_err = fitted_errors['FWHM']
-    cont_err = fitted_errors['CONT']
 
     snr = flux / flux_err if flux_err != 0 else np.nan
     if np.isnan(snr):
         raise ValueError(f"SNR cannot be computed for line {linename} due to zero flux error. "
                          f"Please check the fit results.")
 
+    # Matched filter significance flag — evaluated once, applied to all components
+    mf_sigma = fit_results_dict.get('mf_sigma', [None])[0]
+    mf_flag = ''
+    if mf_sigma is not None and np.isfinite(mf_sigma) and mf_sigma < mf_sigma_threshold:
+        print(f"Low matched filter significance for {linename}: {mf_sigma:.2f}σ < {mf_sigma_threshold}σ threshold")
+        mf_flag = 'm'
+
     # Test 1: Check for multiple peaks in the line region raised by fitting routine
     # Check for multipeak flag in fit results (empty string indicates no flags, 'm' indicates multiple peaks detected)
-    flags = ''
-    if fit_results_dict['multipeak_flag'] == 'm':
+    flags = mf_flag
+    if fit_results_dict.get('multipeak_flag', '') == 'm':
         print(f"Multi-peak flag found.")
-        flags = 'm'
+        if 'm' not in flags:
+            flags += 'm'
     
     # Extract spectrum and wavelength for next tests
     spec = fit_results_dict['spec_fit']
@@ -1297,9 +1316,12 @@ def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float
     spec_err = fit_results_dict['err_fit']
 
     # Apply flags to the line
+    # For STACK lines the wavelength axis is in velocity space (km/s), so sky-contamination
+    # and FWHM-threshold checks (which are wavelength-based) are skipped inside apply_flags.
     flags += apply_flags(wave, spec, spec_err, lpeak, lpeak_err, 
                         fwhm, fwhm_err, flux, flux_err, cont, 
-                        linename, fwhm_threshold=fwhm_threshold)
+                        linename, fwhm_threshold=fwhm_threshold,
+                        is_velocity_space=(linename == 'STACK'))
 
     # Check if line is a doublet -- if so, flag the partner line.
     # A KeyError here means FLUX2 is present but linename is not in doublets, which
@@ -1314,9 +1336,10 @@ def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float
             raise ValueError(f"SNR cannot be computed for doublet partner line of {linename} due to zero flux error. "
                              f"Please check the fit results.")
         
-        # If the doublet partner is detected with SNR > 3, we consider the detection secure and remove all flags
-        if snr > 3 and snr2 > 3:
-            return ['', '']  # No flags for either line
+        # If the doublet partner is detected with SNR > 3 with the same sign, we consider 
+        # the detection secure and remove spectral quality flags
+        if np.abs(snr) > 3 and np.sign(snr) == np.sign(snr2) and np.abs(snr2) > 3:
+            return ['', '']
         else:
             # Independently flag the partner line using the same tests
             print(f"Flagging doublet partner line for {linename}...")
@@ -1326,11 +1349,21 @@ def flag_fit_result(fit_results_dict: dict, linename: str, fwhm_threshold: float
             fwhm2 = fwhm
             fwhm2_err = fwhm_err
             cont2 = cont
+
             flags2 = ''
-            if fit_results_dict['multipeak_flag'] == 'm':
-                flags2 = 'm'
+
+            mf_sigma2 = fit_results_dict.get('mf_sigma', [None, None])[1]
+            mf_flag2 = ''
+            if mf_sigma2 is not None and np.isfinite(mf_sigma2) and mf_sigma2 < mf_sigma_threshold:
+                print(f"Low matched filter significance for {partner_linename}: {mf_sigma2:.2f}σ < {mf_sigma_threshold}σ threshold")
+                mf_flag2 = 'm'
+            flags2 += mf_flag2
+            if fit_results_dict.get('multipeak_flag', '') == 'm':
+                if 'm' not in flags2:
+                    flags2 += 'm'
             flags2 += apply_flags(wave, spec, spec_err, lpeak2, lpeak_err, fwhm2, fwhm2_err, 
-                                 flux2, flux2_err, cont2, partner_linename, fwhm_threshold=fwhm_threshold)
+                                 flux2, flux2_err, cont2, partner_linename, fwhm_threshold=fwhm_threshold,
+                                 is_velocity_space=(linename == 'STACK'))
             return [flags, flags2]
 
     return [flags]

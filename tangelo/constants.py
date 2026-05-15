@@ -25,6 +25,19 @@ emlines = [
     'CIII1909'
 ]
 
+# Forbidden lines (can't be seen in absorption, can be used to determine systemic redshift)
+forbidlines = [
+    'HeII1640',
+    'OIII1660',
+    'OIII1666',
+    'CIII1907',
+    'CIII1909',
+    'SiIII1883',
+    'SiIII1892',
+    'NIV1483',
+    'NIV1487',
+]
+
 # Doublets (old)
 # doublets = {
 #     'OVI1032': ('OVI1032', 'OVI1038'),

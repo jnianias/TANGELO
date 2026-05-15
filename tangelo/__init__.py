@@ -16,6 +16,7 @@ from . import spectroscopy
 from . import ifs
 from . import lya_profile
 from . import lya_fitting
+from . import source_properties
 
 # Define what gets imported with "from tangelo import *"
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     'lya_profile',      
     'lya_fitting',      
     'ifs',
+    'source_properties',
 ]
 
 __version__ = '1.0.0'

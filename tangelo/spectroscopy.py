@@ -1,18 +1,8 @@
 import numpy as np
-from astropy.io import fits, ascii
-from astropy.table import Column, vstack
-from scipy.optimize import curve_fit
-from scipy import odr
-from scipy.interpolate import interp1d
-from astropy.stats import sigma_clipped_stats, sigma_clip
-from astropy.convolution import convolve_fft, Box1DKernel
-import warnings
-import glob
-import os
+from astropy.stats import sigma_clipped_stats, mad_std, sigma_clip
 import astropy.table as aptb
 import error_propagation as ep
 from mpdaf.MUSE import LSF
-from pathlib import Path
 
 # Import constants
 from .constants import c, wavedict, doublets, skylines, ztypes
@@ -678,8 +668,42 @@ def check_sky_contamination(lpeak, lpeak_err, flux, sig=5):
     return False
 
 
-def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60., 
-              lya=False, zelda_z=False, z=None, flags=False, spec_source='R21', spec_type='weight_skysub'):
+def _measured_noise_var(flux_arr):
+    """
+    Estimate noise variance from a flux array using iterative sigma-clipping
+    followed by the normalised median absolute deviation (NMAD).
+
+    Outlier pixels (spectral features, cosmic rays) are masked by two rounds
+    of sigma-clipping (sigma=2.5, 5 iterations) before the NMAD is computed,
+    making the estimate insensitive to line emission or absorption within the
+    window.
+
+    Parameters
+    ----------
+    flux_arr : array_like
+        1-D flux (or flux-density) array, possibly containing NaNs.
+
+    Returns
+    -------
+    float
+        Estimated noise variance (NMAD²).  Returns NaN if fewer than 3
+        unmasked pixels survive clipping.
+    """
+    finite_flux = np.asarray(flux_arr)
+    finite_flux = finite_flux[np.isfinite(finite_flux)]
+    if len(finite_flux) < 4:
+        return np.nan
+    clipped = sigma_clip(finite_flux, sigma=2.5, maxiters=5, masked=True)
+    unmasked = finite_flux[~clipped.mask]
+    if len(unmasked) < 3:
+        return np.nan
+    return mad_std(unmasked) ** 2
+
+
+def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.,
+              lya=False, zelda_z=False, z=None, flags: list[str] | None = None,
+              use_measured_var=False, spec_source='R21',
+              spec_type='weight_skysub'):
     """
     Average multiple spectral lines onto a common velocity scale.
     
@@ -702,8 +726,12 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
         If False, weight by inverse mean variance (better for emission). Default is False.
     velbounds : list of float, optional
         Velocity range [vmin, vmax] in km/s for the output spectrum. Default is [-2400, 2400].
-    velstep : float, optional
-        Velocity bin size in km/s for the output spectrum. Default is 60.
+    velstep : float or 'auto', optional
+        Velocity bin size in km/s for the output spectrum. If ``'auto'``, the step
+        is set to the native MUSE pixel size (1.25 Å) in velocity space for the
+        worst-sampled line in the list (i.e. the largest native step, which occurs
+        at the longest observed wavelength), rounded to the nearest 5 km/s. Falls
+        back to 60 km/s if no valid lines are within MUSE coverage. Default is 60.
     lya : bool, optional
         Reserved for Lyman alpha specific handling (currently unused). Default is False.
     zelda_z : bool, optional
@@ -712,9 +740,23 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
     z : float, optional
         Redshift to use for wavelength-to-velocity conversion. If None, uses
         row['LPEAKR'] / 1215.67 - 1 as default. Default is None.
-    flags : bool, optional
-        If True, skip lines with bad flags (FLAG_{line} != '') or invalid wavelengths.
-        Default is False.
+    flags : list[str] or None, optional
+        List of flag patterns to exclude. Each pattern is a string of characters.
+        A line is skipped if its FLAG_{line} column contains all characters in any
+        of the patterns. For example:
+        - flags=['c'] skips lines with flag 'c' anywhere in the string
+        - flags=['c', 'p'] skips lines with either 'c' or 'p'
+        - flags=['mp', 'c'] skips lines with (both 'm' and 'p') or 'c'
+        Default is None (no flag-based filtering).
+    use_measured_var : bool, optional
+        If True, estimate the noise variance directly from the data using
+        iterative sigma-clipping followed by NMAD, rather than from the
+        nominal spectral-uncertainty array.  This is useful when the
+        pipeline uncertainties are known to be unreliable (e.g. correlated
+        noise).  The emission-line weighting path uses 1/σ²_measured; the
+        absorption weighting path uses (median_flux/σ_measured)².  Lines
+        for which the variance estimate is NaN or non-positive fall back to
+        zero weight and are excluded from the average.  Default is False.
     spec_source : str, optional
         Source of the spectrum: 'R21' for Richard et al. (2021) spectra or 'APER' 
         for aperture-extracted spectra. Default is 'R21'.
@@ -755,29 +797,60 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
     >>> # Average absorption lines using aperture spectra with flag checking
     >>> abs_lines = ['SiII1260', 'CII1334', 'SiIV1394']
     >>> vel, flux, flux_err = auspec.avg_lines(
-    ...     catalog_row, abs_lines, absorption=True, flags=True,
+    ...     catalog_row, abs_lines, absorption=True, flags=['c', 'p'],
     ...     spec_source='APER', spec_type='2fwhm'
     ... )
     """
-    newvelax = np.arange(velbounds[0], velbounds[1] + velstep, velstep)
     clus = row['CLUSTER']
     iden = row['iden']
     clid = f"{clus}.{iden}"
-    
-    # Load spectrum using the appropriate function
-    idfrom = row['idfrom']
-    spectab = io.load_spec(clus=clus, iden=iden, idfrom=idfrom, spec_source=spec_source, spec_type=spec_type)
-    
-    if spectab is None:
-        return newvelax, np.zeros(np.size(newvelax)) * np.nan, np.zeros(np.size(newvelax)) * np.nan
-    
-    # Determine redshift
+
+    # Determine redshift before building the velocity axis so that 'auto' velstep can use it.
     if z is None:
         z = row['LPEAKR'] / 1215.67 - 1.
     if zelda_z:
         z = row['Z_ZELDA']
-        if not (z > 2.9):
-            return newvelax, None, None
+
+    # Resolve adaptive velocity step.
+    # Uses the native MUSE pixel step (1.25 Å) converted to km/s at the observed
+    # wavelength of each line; takes the maximum (worst-sampled line) to avoid
+    # under-sampling any member of the stack.
+    if velstep == 'auto':
+        _MUSE_DLAM = 1.25  # Å, native MUSE pixel step
+        dv_candidates = [
+            c * _MUSE_DLAM / (wavedict[_line] * (1 + z))
+            for _line in lines
+            if _line not in ('LYALPHA', 'SiII1527', 'DUST')
+            and 4750 < wavedict[_line] * (1 + z) < 9350
+        ]
+        velstep = round(max(dv_candidates) / 5.0) * 5.0 if dv_candidates else 60.0
+        print(f"Auto velstep for {clid}: {velstep:.0f} km/s")
+
+    newvelax = np.arange(velbounds[0], velbounds[1] + velstep, velstep)
+
+    # Load spectrum using the appropriate function
+    idfrom = row['idfrom']
+    spectab = io.load_spec(clus=clus, iden=iden, idfrom=idfrom, spec_source=spec_source, spec_type=spec_type)
+
+    if spectab is None:
+        return newvelax, np.zeros(np.size(newvelax)) * np.nan, np.zeros(np.size(newvelax)) * np.nan
+
+    if zelda_z and not (z > 2.9):
+        return newvelax, None, None
+    
+    # Helper function to check if a flag string matches any exclusion pattern
+    def _should_skip_line(flag_string, exclude_patterns):
+        """Check if flag_string matches any of the exclusion patterns.
+        
+        A flag_string matches a pattern if all characters in the pattern are present
+        in the flag_string.
+        """
+        if exclude_patterns is None:
+            return False
+        for pattern in exclude_patterns:
+            if all(c in flag_string for c in pattern):
+                return True
+        return False
     
     wave = spectab['wave'].data  # Generate wavelength axis
     spec = spectab['spec'].data
@@ -792,7 +865,8 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
         # Skip certain lines
         if line in ['LYALPHA', 'SiII1527', 'DUST']:
             pass
-        elif flags and ((row[f"FLAG_{line}"] not in ['']) or not (row[f"LBDA_REST_{line}"] > 0.)):
+        elif _should_skip_line(row[f"FLAG_{line}"], flags):
+            print(f"Skipping {line} for {clid} due to bad flags: {row[f'FLAG_{line}']}")
             continue
         
         rest_wl = wavedict[line]
@@ -824,7 +898,16 @@ def avg_lines(row, lines, absorption=False, velbounds=[-2400, 2400], velstep=60.
         flux_err_interper = np.interp(newvelax, vel_mini, spec_err_vel, left=np.nan, right=np.nan)
 
         # Calculate weight
-        if absorption:
+        if use_measured_var:
+            mvar = _measured_noise_var(flux_interper)
+            if not (np.isfinite(mvar) and mvar > 0):
+                print(f"Skipping {line} for {clid}: could not estimate measured variance")
+                continue
+            if absorption:
+                weight = (np.nanmedian(flux_interper) / np.sqrt(mvar)) ** 2.
+            else:
+                weight = 1.0 / mvar
+        elif absorption:
             # Weight by average SNR of the CONTINUUM for absorption features
             weight = np.nanmedian(flux_interper / flux_err_interper) ** 2.
         else:
@@ -1233,3 +1316,187 @@ def stack_entire_spectra(table, weighting = 'inverse variance', sigclip_weights=
     n_sources = len(spec_list)
 
     return common_wavelength, stacked_flux, stacked_error, n_sources
+
+
+def lya_central_flux_fraction(row, v_window=100.0, v_range=3000.0, n_grid=2000,
+                               n_mc=200, rng=None):
+    """
+    Fraction of total Lyα flux within ±v_window km/s of the systemic velocity.
+
+    Reconstructs the best-fit asymmetric Gaussian Lyα model from catalog fit
+    parameters, converts to a velocity frame centred on the systemic redshift
+    (derived from LPEAKR and DELTAV_LYA), and computes
+
+        f_central = F(|v| ≤ v_window) / F_total
+
+    This quantifies how much neutral gas sits near the systemic velocity relative
+    to all gas traced by the line, independent of the overall line width.
+
+    Parameters
+    ----------
+    row : dict-like
+        Catalog row containing Lyα fit parameters. Required keys:
+
+            AMPR, LPEAKR, DISPR, ASYMR  – red-peak asymmetric Gaussian parameters
+                                           (LPEAKR in observed Angstroms)
+            DELTAV_LYA                   – velocity offset of Lyα red peak from
+                                           systemic (km/s)
+
+        Optional keys for double-peak fits:
+
+            AMPB, LPEAKB, DISPB, ASYMB  – blue-peak asymmetric Gaussian parameters
+
+        Error columns (used for Monte Carlo uncertainty if present):
+
+            AMPR_ERR, LPEAKR_ERR, DISPR_ERR, ASYMR_ERR
+            AMPB_ERR, LPEAKB_ERR, DISPB_ERR, ASYMB_ERR
+
+    v_window : float, optional
+        Half-width of the central velocity window in km/s. Default 100.
+    v_range : float, optional
+        Half-width of the velocity range used for the total-flux integral.
+        Should comfortably span the full line profile. Default 3000.
+    n_grid : int, optional
+        Number of points on the integration velocity grid. Default 10 000.
+    n_mc : int, optional
+        Number of Monte Carlo draws for uncertainty estimation. Set to 0 to
+        skip error propagation and return NaN for the uncertainty. Default 500.
+    rng : numpy.random.Generator or None, optional
+        Random number generator for reproducibility. If None a new generator
+        is created internally.
+
+    Returns
+    -------
+    fraction : float
+        Fraction of total Lyα flux within ±v_window km/s of systemic velocity.
+    fraction_err : float
+        1-sigma uncertainty on fraction from Monte Carlo error propagation.
+        NaN if error columns are absent or n_mc == 0.
+
+    Notes
+    -----
+    The systemic redshift is derived from the red-peak observed wavelength and
+    the measured peak-to-systemic velocity offset::
+
+        z_lya = LPEAKR / 1215.67 - 1
+        z_sys = z_lya - DELTAV_LYA * (1 + z_lya) / c
+
+    The profile is evaluated on a velocity grid converted to observed wavelengths
+    via vel2wave, so the model naturally accounts for the (1+z) wavelength stretch.
+    Numerical integration uses numpy.trapz. Model flux is clipped at zero before
+    integration to avoid negative contributions from the tails of the asymmetric
+    Gaussian where the modified dispersion changes sign.
+    """
+    LYA_REST = 1215.67  # Å
+
+    # --- Derive systemic redshift from fit peak and velocity offset ---
+    lpeakr = float(row['LPEAKR'])
+    deltav  = float(row['DELTAV_LYA'])
+    z_lya   = lpeakr / LYA_REST - 1.0
+    z_sys   = z_lya - deltav * (1.0 + z_lya) / c
+
+    # --- Helper: test whether a key exists in row (works for both astropy Row and dict) ---
+    _keys = set(row.colnames) if hasattr(row, 'colnames') else set(row.keys())
+
+    # --- Detect double-peak fit: AMPB present, finite, and positive ---
+    def _present(key):
+        return key in _keys and np.isfinite(float(row[key])) and float(row[key]) > 0.0
+
+    double_peak = _present('AMPB')
+
+    # --- Velocity grid and corresponding observed wavelengths ---
+    vel_grid  = np.linspace(-v_range, v_range, n_grid)
+    wave_grid = vel2wave(vel_grid, LYA_REST, z_sys)
+
+    # --- Vectorised model evaluator ---
+    # Arguments may be scalars (best-fit) or 1-D arrays of length n_mc.
+    # Returns shape (n_grid,) for scalars or (n_mc, n_grid) for arrays.
+    def _eval_model(ampr_v, lpeakr_v, dispr_v, asymr_v,
+                    ampb_v=None, lpeakb_v=None, dispb_v=None, asymb_v=None):
+        scalar = np.ndim(ampr_v) == 0
+        if scalar:
+            wg = wave_grid
+        else:
+            # Broadcast parameter arrays (n_mc,) against grid (n_grid,)
+            ampr_v   = np.asarray(ampr_v)[:, None]
+            lpeakr_v = np.asarray(lpeakr_v)[:, None]
+            dispr_v  = np.asarray(dispr_v)[:, None]
+            asymr_v  = np.asarray(asymr_v)[:, None]
+            wg = wave_grid[None, :]  # (1, n_grid)
+
+        diff_r  = wg - lpeakr_v
+        mod_r   = dispr_v + asymr_v * diff_r
+        flux    = ampr_v * np.exp(-0.5 * (diff_r / mod_r) ** 2)
+
+        if double_peak and ampb_v is not None:
+            if not scalar:
+                ampb_v  = np.asarray(ampb_v)[:, None]
+                lpeakb_v = np.asarray(lpeakb_v)[:, None]
+                dispb_v = np.asarray(dispb_v)[:, None]
+                asymb_v = np.asarray(asymb_v)[:, None]
+            diff_b = wg - lpeakb_v
+            mod_b  = dispb_v + asymb_v * diff_b
+            flux   = flux + ampb_v * np.exp(-0.5 * (diff_b / mod_b) ** 2)
+
+        return np.clip(flux, 0.0, None)
+
+    # --- Helper: integrate to ratio; last axis is the velocity axis ---
+    window_mask = np.abs(vel_grid) <= v_window
+
+    def _ratio(flux):
+        f_total = np.trapezoid(flux,                      vel_grid,               axis=-1)
+        f_win   = np.trapezoid(flux[..., window_mask],    vel_grid[window_mask],  axis=-1)
+        with np.errstate(invalid='ignore', divide='ignore'):
+            return np.where(f_total > 0.0, f_win / f_total, np.nan)
+
+    # --- Best-fit parameters ---
+    ampr  = float(row['AMPR'])
+    dispr = float(row['DISPR'])
+    asymr = float(row['ASYMR'])
+
+    if double_peak:
+        ampb   = float(row['AMPB'])
+        lpeakb = float(row['LPEAKB'])
+        dispb  = float(row['DISPB'])
+        asymb  = float(row['ASYMB'])
+        flux_bf = _eval_model(ampr, lpeakr, dispr, asymr, ampb, lpeakb, dispb, asymb)
+    else:
+        flux_bf = _eval_model(ampr, lpeakr, dispr, asymr)
+
+    fraction = float(_ratio(flux_bf))
+
+    # --- Monte Carlo uncertainty via parameter error columns ---
+    fraction_err = np.nan
+
+    r_err_keys = ['AMPR_ERR', 'LPEAKR_ERR', 'DISPR_ERR', 'ASYMR_ERR']
+    if n_mc > 0 and all(k in _keys for k in r_err_keys):
+        if rng is None:
+            rng = np.random.default_rng()
+
+        ampr_s   = rng.normal(ampr,   float(row['AMPR_ERR']),   n_mc)
+        lpeakr_s = rng.normal(lpeakr, float(row['LPEAKR_ERR']), n_mc)
+        dispr_s  = rng.normal(dispr,  float(row['DISPR_ERR']),  n_mc)
+        asymr_s  = rng.normal(asymr,  float(row['ASYMR_ERR']),  n_mc)
+
+        if double_peak:
+            b_err_keys = ['AMPB_ERR', 'LPEAKB_ERR', 'DISPB_ERR', 'ASYMB_ERR']
+            if all(k in _keys for k in b_err_keys):
+                ampb_s   = rng.normal(ampb,   float(row['AMPB_ERR']),   n_mc)
+                lpeakb_s = rng.normal(lpeakb, float(row['LPEAKB_ERR']), n_mc)
+                dispb_s  = rng.normal(dispb,  float(row['DISPB_ERR']),  n_mc)
+                asymb_s  = rng.normal(asymb,  float(row['ASYMB_ERR']),  n_mc)
+            else:
+                # No blue-peak errors: hold blue parameters fixed
+                ampb_s   = np.full(n_mc, ampb)
+                lpeakb_s = np.full(n_mc, lpeakb)
+                dispb_s  = np.full(n_mc, dispb)
+                asymb_s  = np.full(n_mc, asymb)
+            flux_mc = _eval_model(ampr_s, lpeakr_s, dispr_s, asymr_s,
+                                  ampb_s, lpeakb_s, dispb_s, asymb_s)
+        else:
+            flux_mc = _eval_model(ampr_s, lpeakr_s, dispr_s, asymr_s)
+
+        mc_ratios    = _ratio(flux_mc)          # shape (n_mc,)
+        fraction_err = float(np.nanstd(mc_ratios))
+
+    return fraction, fraction_err

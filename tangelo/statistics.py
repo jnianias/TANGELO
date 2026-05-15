@@ -2,6 +2,8 @@
 Tools for performing statistical analysis on spectra and tables.
 """
 
+import matplotlib
+
 from .catalogue_operations import generate_source_mask
 from . import constants as const
 from . import spectroscopy as spectro
@@ -9,13 +11,16 @@ from . import models
 from . import fitting
 from . import plotting as plot
 
+import warnings
+import threading
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.optimize import curve_fit
 from scipy.stats import ks_2samp
 
-from typing import Optional
+from typing import Optional, Union
 
 def stack_and_plot_lines(
     megatab,
@@ -351,8 +356,10 @@ def make_scatter(colx: list, coly: list, ax: plt.Axes, mask: Optional[np.ndarray
         luminosity, S/N). Points with NaN or inf values in ``c`` are plotted in grey. Default is None 
         (uniform color).
     upper_bounds : np.ndarray, optional
-        Mask for points that are upper limits. Should have the same length as colx[0] and coly[0]. Default is 
-        None (no upper limits).
+        Boolean mask identifying which points are upper limits. Those points are
+        plotted as downward-pointing triangles at their face value (which should
+        already be the upper-limit value, e.g. from ``_insert_upper_limits``).
+        No y error bar manipulation is applied. Default is None (no upper limits).
     edgecolor : str, optional
         Color for the edges of the points. Default is 'black'.
     show_colorbar : bool, optional
@@ -445,13 +452,20 @@ def make_scatter(colx: list, coly: list, ax: plt.Axes, mask: Optional[np.ndarray
     ax.errorbar(xvals[~upper_bounds], yvals[~upper_bounds], xerr=[xerrsm[~upper_bounds], xerrsp[~upper_bounds]], 
                 yerr=[yerrsm[~upper_bounds], yerrsp[~upper_bounds]], marker='', color=edgecolor, 
                 zorder=0, alpha = alpha_e, linestyle='') # error bars
-    # Then upper limits
-    ax.errorbar(xvals[upper_bounds], yvals[upper_bounds], xerr=[xerrsm[upper_bounds], xerrsp[upper_bounds]], 
-                yerr=[3*yerrsm[upper_bounds], yerrsp[upper_bounds]], marker='v', color='red', zorder=0, 
-                alpha = alpha_ubs, linestyle='', uplims=upper_bounds[upper_bounds]) # upper limit arrows
+    # Upper limits: plot as downward-pointing triangles at the upper-bound value.
+    # The y value is already the upper limit; no y error bar manipulation is applied.
+    if np.any(upper_bounds):
+        ax.errorbar(xvals[upper_bounds], yvals[upper_bounds],
+                    xerr=[xerrsm[upper_bounds], xerrsp[upper_bounds]],
+                    yerr=np.zeros((2, np.sum(upper_bounds))),
+                    marker='v', color='red', zorder=0,
+                    alpha=alpha_ubs, linestyle='',
+                    uplims=np.ones(np.sum(upper_bounds), dtype=bool))
 
     if show_colorbar and np.any(valid_c_det):
-        cbar = plt.colorbar(sc, ax=ax)
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        cbar = plt.colorbar(sc, cax=cax)
         if clabel is not None:
             cbar.set_label(clabel)
     
@@ -547,396 +561,69 @@ def make_histo(cola, colb, ax, filtsa = [], filtsb = [], erra = None, errb = Non
                   label=f"{labb} median")
         
 
-
-from .spectroscopy import muse_lsf_fwhm_poly
-from .constants import wavedict
 from astropy.table import Table
-from astropy.cosmology import Planck18
-import astropy.units as u
+from .source_properties import (
+    get_line_property, get_lya_property, normalise_prop,
+    _log_quantities, _known_line_tokens, flux_to_luminosity,
+)
 
 
-# Helper functions to get line any lyman alpha properties that aren't directly in the megatable, and to apply rest-frame correction if needed.
-
-def flux_to_luminosity(flux: np.ndarray, flux_err: np.ndarray,
-                       z: np.ndarray, mu: np.ndarray,
-                       is_continuum: bool = False,
-                       cosmo=Planck18) -> tuple[np.ndarray, np.ndarray]:
+def _effective_snr(megatab: Table, line: str, abs_lines: list[str],
+                   line_prop: str = "EW", combine_doublets: bool = True) -> np.ndarray:
     """
-    Convert observed flux (or flux density) to intrinsic luminosity, correcting for
-    gravitational lensing magnification.
+    Return the signed effective SNR for each source for a given line.
 
-    Parameters
-    ----------
-    flux : np.ndarray
-        Observed flux in units of 1e-20 erg/s/cm². For continuum, flux density in
-        units of 1e-20 erg/s/cm²/Å.
-    flux_err : np.ndarray
-        Uncertainty on ``flux``, in the same units.
-    z : np.ndarray
-        Source redshifts.
-    mu : np.ndarray
-        Lensing magnification values. The intrinsic flux is flux / mu.
-    is_continuum : bool, optional
-        If True, treat ``flux`` as a flux density (per Å) and apply a (1+z)^{-1}
-        K-correction to convert from observed-frame to rest-frame bandwidth.
-        Default is False (line flux, integrated over wavelength).
-    cosmo : astropy cosmology, optional
-        Cosmology used to compute the luminosity distance. Default is Planck18.
+    For doublet lines when ``combine_doublets`` is True and ``line_prop`` is an
+    additive property (EW, FLUX, LUM), the quadrature-combined SNR of both
+    components is returned, signed according to the titular line's SNR sign.
+    For all other cases the titular line's SNR column is returned directly.
 
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        Luminosity and its propagated uncertainty, both in erg/s (line) or
-        erg/s/Å (continuum).
-    """
-    # Luminosity distance in cm
-    dl_cm = cosmo.luminosity_distance(z).to(u.cm).value  # shape matches z
+    The sign convention is: positive for emission detections, negative for
+    absorption detections.  A threshold test against ±sig_thresh on the
+    returned array is therefore always of the form::
 
-    # Guard against unphysical magnification values (≤ 0 signals missing/bad data)
-    mu = np.where(np.asarray(mu) > 0, mu, np.nan)
-
-    # Negative flux values are unphysical (e.g. calibration artefacts in continuum
-    # estimates); replace with NaN so they propagate cleanly rather than producing
-    # negative luminosities or sign-flipped errors
-    flux = np.array(flux, dtype=float)
-    flux_err = np.array(flux_err, dtype=float)
-    flux_err[flux < 0] = np.nan
-    flux[flux < 0] = np.nan
-
-    # Negative error values are unphysical — they are either sentinel flags or
-    # sign artefacts. NaN them rather than taking abs, so that a sentinel like
-    # -99 cannot become a catastrophically large error bar after scaling by 4πD_L².
-    flux_err[flux_err <= 0] = np.nan
-
-    # Lensing-corrected flux in physical units (erg/s/cm² or erg/s/cm²/Å)
-    f_intrinsic     = flux     / mu * 1e-20
-    f_intrinsic_err = flux_err / mu * 1e-20
-
-    # Luminosity: L = 4π D_L² f
-    factor = 4.0 * np.pi * dl_cm**2
-    lum     = factor * f_intrinsic
-    lum_err = factor * f_intrinsic_err
-
-    # For continuum (flux density per observed-frame Å), divide by (1+z) to
-    # convert to rest-frame bandwidth
-    if is_continuum:
-        lum     /= (1.0 + z)
-        lum_err /= (1.0 + z)
-
-    return lum, lum_err
-
-
-def get_line_property(megatab: Table, line: str, prop: str, 
-                      rest_frame: bool = True, correct_inst: bool = True,
-                      abs: bool = False) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Helper function to get the line property column from the megatable, handling parameters that aren't
-    directly in the megatable (e.g. LYA_EW, BRRATIO, DISPR, FWHMR) and applying rest-frame correction if needed.
-    Note that absorption lines have their equivalent widths flipped to maintain the convention of positive values 
-    indicating stronger absorption, which is important for interpreting correlations with Lyman alpha properties.
+        detected = snr > +sig_thresh   # emission
+        detected = snr < -sig_thresh   # absorption
 
     Parameters
     ----------
     megatab : astropy.table.Table
-        The megatable containing the data.
+        The megatable.
     line : str
-        The name of the line (e.g. 'CIV1548', 'SiII1260').
-    prop : str
-        The property to retrieve (e.g. 'EW', 'FWHM').
-    rest_frame : bool, optional
-        Whether to apply rest-frame correction for wavelength-based properties, by default True.
-    correct_inst : bool, optional
-        Whether to apply instrumental resolution correction for FWHM using the MUSE LSF polynomial,
-        by default True.
-    abs : bool, optional
-        Whether the line is an absorption line, which requires flipping the sign of the equivalent width
-        to be consistent with the convention that positive values indicate stronger absorption
+        Titular line name (e.g. ``'CIV1548'``, ``'SiII1260'``).
+    abs_lines : list[str]
+        Lines treated as absorption.
+    line_prop : str, optional
+        The property being analysed.  Only matters for deciding whether the
+        doublet quadrature path applies (additive properties). Default ``'EW'``.
+    combine_doublets : bool, optional
+        Whether doublet components are being combined. Default True.
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray]
-        The requested line property column and its associated error column.
+    np.ndarray
+        Signed effective SNR, one value per source.
     """
-    col_name = f"{prop}_{line}"
-    err_name = f"{prop}_ERR_{line}"
-    if line in ["LI_ABS", "HI_ABS", "TOT_ABS"]:
-        col_name = f"{prop}_{line}"
-        err_name = f"{prop}_{line}_ERR"
-        return megatab[col_name].copy(), megatab[err_name].copy()
-    if prop == "EW" and col_name not in megatab.colnames:
-        # Calculate EW from FLUX, FLUX_ERR, CONT and CONT_ERR if not directly available
-        flux_col = f"FLUX_{line}"
-        flux_err_col = f"FLUX_ERR_{line}"
-        cont_col = f"CONT_{line}"
-        cont_err_col = f"CONT_ERR_{line}"
-        if flux_col in megatab.colnames and flux_err_col in megatab.colnames and cont_col in megatab.colnames and cont_err_col in megatab.colnames:
-            flux = megatab[flux_col].copy()
-            flux_err = megatab[flux_err_col].copy()
-            cont = megatab[cont_col].copy()
-            cont_err = megatab[cont_err_col].copy()
-            ew = flux / cont
-            ew_err = np.abs(ew * np.sqrt((flux_err / flux)**2 + (cont_err / cont)**2))
-            if rest_frame:
-                ew /= (1 + megatab['z'])
-                ew_err /= (1 + megatab['z'])
-            if abs:
-                ew *= -1  # Flip sign for absorption lines to maintain convention of positive values 
-                            # indicating stronger absorption
-            return ew, ew_err
-        else:
-            raise ValueError(f"Required columns for calculating EW of {line} not found in megatable.")
-    elif prop == "FWHM":
-        # Calculate FWHM from FWHM_OPT and redshift if not directly available
-        fwhm_col = f"FWHM_{line}"
-        if fwhm_col in megatab.colnames and err_name in megatab.colnames:
-            fwhm = megatab[fwhm_col].copy()
-            fwhm_err = megatab[err_name].copy()
-            # Apply instrumental resolution correction using MUSE LSF polynomial if not already applied
-            if correct_inst:
-                fwhm, fwhm_err = correct_inst_res(fwhm, fwhm_err, megatab[f'LPEAK_{line}'], "FWHM")
-            if rest_frame:
-                fwhm /= (1 + megatab['z'])
-                fwhm_err /= (1 + megatab['z'])
-            return fwhm, fwhm_err
-        else:
-            raise ValueError(f"Required column for calculating FWHM of {line} not found in megatable.")
-    elif prop == "CVEL":
-        # Calculate velocity centroid of the line relative to the systemic redshift, which can
-        # be derived from the Lyman alpha peak redshift LPEAKR and the offset from systemic
-        # DELTAV_LYA
-        lya_z = megatab['LPEAKR'] / 1215.67 - 1
-        sys_z = lya_z - megatab['DELTAV_LYA'] / 299792.458 * (1 + lya_z)  # Convert velocity offset to redshift
-        line_peak_rest = megatab[f'LPEAK_{line}'] / (1 + sys_z)  # Convert observed line peak to rest-frame wavelength
-        line_peak_rest_err = megatab[f'LPEAK_ERR_{line}'].copy() / (1 + sys_z)  # Propagate error through rest-frame conversion
-        line_rest_wave = wavedict[line]  # Get rest-frame wavelength of the line from wavedict
-        cvel = (line_peak_rest - line_rest_wave) / line_rest_wave * 299792.458  # Convert to velocity offset from rest wavelength
-        cvel_err = line_peak_rest_err / line_rest_wave * 299792.458  # Propagate error through velocity conversion
-        return cvel, cvel_err
-    elif prop == "LUM":
-        # Emission line luminosity: L = 4π D_L² × (FLUX_{line} / MU) × 1e-20
-        flux_col = f"FLUX_{line}"
-        flux_err_col = f"FLUX_ERR_{line}"
-        if flux_col not in megatab.colnames:
-            raise ValueError(f"Column {flux_col} not found in megatable.")
-        return flux_to_luminosity(
-            megatab[flux_col].copy(), megatab[flux_err_col].copy(),
-            np.asarray(megatab['z']), np.asarray(megatab['MU']),
-            is_continuum=False,
-        )
-    elif prop == "CONT_LUM":
-        # Emission line continuum luminosity (rest-frame, per Å)
-        cont_col = f"CONT_{line}"
-        cont_err_col = f"CONT_ERR_{line}"
-        if cont_col not in megatab.colnames:
-            raise ValueError(f"Column {cont_col} not found in megatable.")
-        return flux_to_luminosity(
-            megatab[cont_col].copy(), megatab[cont_err_col].copy(),
-            np.asarray(megatab['z']), np.asarray(megatab['MU']),
-            is_continuum=True,
-        )
-    elif col_name in megatab.colnames and err_name in megatab.colnames:
-        return megatab[col_name].copy(), megatab[err_name].copy()
-    else:
-        raise ValueError(f"Column {col_name} not found in megatable.")
-    
-def correct_inst_res(col: np.ndarray, col_err: np.ndarray, 
-                     lpeakr: np.ndarray, prop: str) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Apply instrumental resolution correction for FWHM and DISP using the MUSE LSF polynomial,
-    with proper error propagation.
+    snr_col = f"SNR_{line}"
+    snr = np.asarray(megatab[snr_col], dtype=float)
 
-    Parameters
-    ----------
-    col : np.ndarray
-        The column to correct (FWHM or DISP).
-    col_err : np.ndarray
-        The error on the column to correct.
-    lpeakr : np.ndarray
-        The observed wavelength of the red peak of Lyman alpha, used to determine the 
-        instrumental resolution from the MUSE LSF polynomial.
-    prop : str
-        The property being corrected ('FWHM' or 'DISP').
+    _use_doublet_snr = (combine_doublets and line in const.doublets
+                        and line_prop in ("EW", "FLUX", "LUM", "FWHM", "CVEL"))
+    if _use_doublet_snr:
+        _line2 = const.doublets[line][1]
+        snr2_col = f"SNR_{_line2}"
+        if snr2_col in megatab.colnames:
+            snr2 = np.asarray(megatab[snr2_col], dtype=float)
+            snr = np.sign(snr) * np.sqrt(snr**2 + snr2**2)
 
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        The instrumentally corrected column and its propagated error.
-    """
-    lsf_fwhm = muse_lsf_fwhm_poly(lpeakr)
-    
-    if prop == "DISP":
-        lsf = lsf_fwhm / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to dispersion
-    elif prop == "FWHM":
-        lsf = lsf_fwhm
-    else:
-        raise ValueError("Invalid property for instrumental correction. Must be 'FWHM' or 'DISP'.")
-    
-    # Store original values for error propagation
-    col_obs = col.copy()
-    
-    # Quadrature subtraction: corrected = sqrt(obs^2 - lsf^2)
-    corrected_col = np.sqrt(np.maximum(col_obs**2 - lsf**2, 0))
-    
-    # Error propagation: d(corrected)/d(obs) = obs / corrected
-    # Handle cases where corrected_col is near zero to avoid division by zero
-    with np.errstate(divide='ignore', invalid='ignore'):
-        err_factor = col_obs / np.maximum(corrected_col, 1e-30)
-        corrected_err = col_err * err_factor
-    
-    # Set error to large value where correction was forced to zero (obs < lsf)
-    invalid_mask = (col_obs**2 - lsf**2) < 0
-    corrected_err[invalid_mask] = np.inf
-    
-    return corrected_col, corrected_err
-        
-def get_lya_property(megatab: Table, prop: str, rest_frame: bool = True,
-                     correct_inst: bool = True) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Helper function to get the Lyman alpha property column from the megatable, handling parameters that aren't
-    directly in the megatable (e.g. LYA_EW, BRRATIO, DISPR, FWHMR).
+    return snr
 
-    Parameters
-    ----------
-    megatab : astropy.table.Table
-        The megatable containing the data.
-    prop : str
-        The Lyman alpha property to retrieve (e.g. 'EW', 'BRRATIO', 'DISPR', 'FWHMR').
-    rest_frame : bool, optional
-        Whether to apply rest-frame correction for wavelength-based properties, by default True.
-    correct_inst : bool, optional
-        Whether to apply instrumental resolution correction for FWHMR and DISPR using the MUSE
-        LSF polynomial, by default True.
 
-    Returns
-    -------
-    tuple[np.ndarray, np.ndarray]
-        The requested Lyman alpha property column and its associated error column.
-    """
-    if prop in ["LYA_EW", "EW"]:
-        # Calculate Lya EW from FLUXR, FLUXR_ERR, CONT and CONT_ERR if not directly available
-        fluxr_col = "FLUXR"
-        fluxr_err_col = "FLUXR_ERR"
-        fluxb_col = "FLUXB"
-        fluxb_err_col = "FLUXB_ERR"
-        cont_col = "CONT"
-        cont_err_col = "CONT_ERR"
-        if fluxr_col in megatab.colnames and fluxr_err_col in megatab.colnames and fluxb_col in megatab.colnames and fluxb_err_col in megatab.colnames and cont_col in megatab.colnames and cont_err_col in megatab.colnames:
-            fluxr = megatab[fluxr_col].copy()
-            fluxr_err = megatab[fluxr_err_col].copy()
-            fluxb = megatab[fluxb_col].copy()
-            fluxb_err = megatab[fluxb_err_col].copy()
-            # replace any NaN fluxb and fluxb_err values with 0 to avoid issues in EW calculation for sources without significant blue peak detection
-            fluxb = np.nan_to_num(fluxb, nan=0.0)
-            fluxb_err = np.nan_to_num(fluxb_err, nan=0.0)
-            flux_total = fluxr + fluxb
-            flux_total_err = np.sqrt(fluxr_err**2 + fluxb_err**2)
-            cont = megatab[cont_col].copy()
-            cont_err = megatab[cont_err_col].copy()
-            ew = flux_total / cont
-            ew_err = np.abs(ew * np.sqrt((flux_total_err / flux_total)**2 + (cont_err / cont)**2))
-            if rest_frame:
-                ew /= (1 + megatab['z'])  # Rest-frame correction
-                ew_err /= (1 + megatab['z'])
-            return ew, ew_err
-        else:
-            raise ValueError("Required columns for calculating Lya EW not found in megatable.")
-    elif prop == "BRRATIO":
-        # Calculate blue-to-red flux ratio from FLUXB and FLUXR if not directly available
-        blue_flux_col = "FLUXB"
-        red_flux_col = "FLUXR"
-        if blue_flux_col in megatab.colnames and red_flux_col in megatab.colnames:
-            blue_flux = megatab[blue_flux_col].copy()
-            red_flux = megatab[red_flux_col].copy()
-            with np.errstate(divide='ignore', invalid='ignore'):
-                br_ratio = blue_flux / red_flux
-                br_ratio[red_flux == 0] = np.nan  # Avoid division by zero
-            br_ratio_err = br_ratio * np.sqrt((megatab["FLUXB_ERR"].copy() / blue_flux)**2 
-                                              + (megatab["FLUXR_ERR"].copy() / red_flux)**2)
-            return br_ratio, br_ratio_err
-        else:
-            raise ValueError("Required columns for calculating Lya blue-to-red flux ratio not found in megatable.")
-    elif prop == "BRSEP":
-        # Calculate blue-red peak separation from LPEAKR and LPEAKB if not directly available
-        red_peak_col = "LPEAKR"
-        blue_peak_col = "LPEAKB"
-        if red_peak_col in megatab.colnames and blue_peak_col in megatab.colnames:
-            red_peak = megatab[red_peak_col].copy()
-            blue_peak = megatab[blue_peak_col].copy()
-            if rest_frame:
-                br_sep = (red_peak - blue_peak) / (1 + megatab['z'])  # Rest-frame correction
-                br_sep_err = np.sqrt(megatab["LPEAKR_ERR"].copy()**2 + megatab["LPEAKB_ERR"].copy()**2) / (1 + megatab['z'])
-            else:
-                br_sep = red_peak - blue_peak
-                br_sep_err = np.sqrt(megatab["LPEAKR_ERR"].copy()**2 + megatab["LPEAKB_ERR"].copy()**2)
-            br_sep[(red_peak == 0) | (blue_peak == 0)] = np.nan  # Avoid invalid values
-            return br_sep, br_sep_err
-        else:
-            raise ValueError("Required columns for calculating Lya blue-red peak separation not found in megatable.")
-    elif prop[:-1] in ["DISP", "FWHM", "FWHM_AB"] and prop in megatab.colnames:
-        err_name = f"{prop}_ERR"
-        # For these parameters, just apply rest-frame correction to the existing column
-        col = megatab[prop].copy()
-        col_err = megatab[err_name].copy()
-        if correct_inst:
-            lpeakr_col = "LPEAKR"
-            if lpeakr_col in megatab.colnames:
-                lpeakr = megatab[lpeakr_col].copy()
-                lsf_fwhm = muse_lsf_fwhm_poly(lpeakr)
-                if prop[:-1] == "DISP":
-                    lsf_disp = lsf_fwhm / (2 * np.sqrt(2 * np.log(2)))  # Convert FWHM to dispersion
-                    col, col_err = correct_inst_res(col, col_err, lpeakr, "DISP")
-                else:  # FWHM or FWHM_AB
-                    col, col_err = correct_inst_res(col, col_err, lpeakr, "FWHM")
-            else:
-                raise ValueError("Required column for instrumental resolution correction not found in megatable.")
-        if rest_frame:
-            col /= (1 + megatab['z'])  # Rest-frame correction
-            col_err /= (1 + megatab['z'])
-        return col, col_err
-    elif "ZELDA" in prop and prop in megatab.colnames:
-        # for ZELDA parameters, no need to apply corrections; however, the error bars are
-        # stored in two separate columns (ERRM and ERRP) for negative and positive errors, 
-        # so we take the average of these for simplicity in plotting and correlation analysis
-        prop_base = prop.rsplit('_', 1)[0]  # Get the base property name without the ZELDA suffix
-        errm_name = f"{prop_base}_ERRM_ZELDA"
-        errp_name = f"{prop_base}_ERRP_ZELDA"
-        if errm_name in megatab.colnames and errp_name in megatab.colnames:
-            col_err = (megatab[errm_name].copy() + megatab[errp_name].copy()) / 2
-            return megatab[prop].copy(), col_err
-        else:
-            return megatab[prop].copy(), None
-    elif prop == "LUM_LYA":
-        # Total Lya line luminosity (red + blue peak)
-        fluxr = megatab['FLUXR'].copy()
-        fluxr_err = megatab['FLUXR_ERR'].copy()
-        fluxb = np.nan_to_num(megatab['FLUXB'].copy(), nan=0.0)
-        fluxb_err = np.nan_to_num(megatab['FLUXB_ERR'].copy(), nan=0.0)
-        flux_total = fluxr + fluxb
-        flux_total_err = np.sqrt(fluxr_err**2 + fluxb_err**2)
-        return flux_to_luminosity(
-            flux_total, flux_total_err,
-            np.asarray(megatab['z']), np.asarray(megatab['MU']),
-            is_continuum=False,
-        )
-    elif prop == "LUM_CONT_LYA":
-        # Lya continuum luminosity (rest-frame, per Å)
-        return flux_to_luminosity(
-            megatab['CONT'].copy(), megatab['CONT_ERR'].copy(),
-            np.asarray(megatab['z']), np.asarray(megatab['MU']),
-            is_continuum=True,
-        )
-    elif prop in megatab.colnames:
-        err_name = f"{prop}_ERR"
-        if err_name in megatab.colnames:
-            return megatab[prop].copy(), megatab[err_name].copy()
-        else:
-            return megatab[prop].copy(), None
-    else:
-        raise ValueError(f"Column {prop} not found in megatable.")
-    
-def prepare_scatter_mask(megatab: Table, line: str, line_col: np.ndarray, line_prop: str,
+def _prepare_scatter_mask(megatab: Table, line: str, line_col: np.ndarray, line_prop: str,
                          lya_col: np.ndarray, lya_prop: str, abs_lines: list[str],
-                         include_upper_limits: bool = False, sig_thresh: float = 3.0) -> np.ndarray:
+                         include_upper_limits: bool = False, sig_thresh: float = 3.0,
+                         combine_doublets: bool = True,
+                         delta: Optional[np.ndarray] = None) -> np.ndarray:
     """
     Prepare a mask for scatter plot analysis between a given line and Lyman alpha property.
 
@@ -947,20 +634,36 @@ def prepare_scatter_mask(megatab: Table, line: str, line_col: np.ndarray, line_p
     line : str
         The line to analyze (e.g., "SiII1260").
     line_col : np.ndarray
-        The column for the line property (e.g., equivalent width or FWHM).
+        The column for the line property (e.g., equivalent width or FWHM).  When
+        ``delta`` is supplied this should already be the upper-limit-substituted
+        array returned by ``_insert_upper_limits``.
     line_prop : str
         The line property being analyzed (e.g., "EW", "FWHM").
     lya_col : np.ndarray
         The Lyman alpha property column.
     lya_prop : str
-        The Lyman alpha property to analyze (e.g., "LYA_EW").
+        The Lyman alpha property to analyze (e.g., "EW_LYA").
     abs_lines : list[str]
         List of lines that should be treated as absorption.
     include_upper_limits : bool, optional
-        Whether to include upper limits for for non-detections. If True, sources with non-significant detections
-        are not masked.
+        Whether to include upper limits for non-detections. Ignored when
+        ``delta`` is provided (the presence of ``delta`` implies upper limits
+        are already handled). Default False.
     sig_thresh : float, optional
-        The significance threshold (in sigma) for including sources based on their SNR
+        The significance threshold (in sigma) for including sources based on
+        their SNR. Default 3.0.
+    combine_doublets : bool, optional
+        Whether doublet lines are being combined. When True and ``line`` is the
+        titular line of a doublet, the SNR threshold uses the
+        quadrature-combined SNR of both components and flags on *both*
+        components must be clear for additive properties (EW/FLUX/LUM).
+        Default True.
+    delta : np.ndarray of int, optional
+        Detection indicator array from ``_insert_upper_limits`` (1 = detected,
+        0 = upper limit).  When provided, the SNR cut is replaced by
+        ``delta == 1``, and sources with ``delta == 0`` (upper limits) are kept
+        in the mask provided they pass all other quality cuts (continuum SNR,
+        flags, Lya quality).  Default None.
 
     Returns
     -------
@@ -977,24 +680,50 @@ def prepare_scatter_mask(megatab: Table, line: str, line_col: np.ndarray, line_p
         mask &= -megatab[f"EW_{line}"] / megatab[f"EW_{line}_ERR"] > sig_thresh
         return mask
 
-    # Only include sources with significant line and continuum detection
-    if not include_upper_limits and not is_stacked_abs:
-        # For emission, require SNR > sig_thresh, for absorption, require < -sig_thresh
-        mask &= (megatab[f"SNR_{line}"] > sig_thresh) if line not in abs_lines else (megatab[f"SNR_{line}"] < -sig_thresh)
-    else:
-        # If including upper limits, only require that the line is not significantly detected in the opposite direction
-        mask &= (megatab[f"SNR_{line}"] > -sig_thresh) if line not in abs_lines else (megatab[f"SNR_{line}"] < sig_thresh)
-    
-    if line_prop in ["EW", "CONT_LUM"] and line_prop not in megatab.colnames:
+    is_abs = line in abs_lines
+
+    # SNR threshold — skip for sources already classified as upper limits by delta
+    if delta is not None:
+        # Upper-limit sources (delta==0) are admitted regardless of SNR; detections
+        # must still pass the SNR cut so we don't admit noisy non-upper-limit sources.
+        snr = _effective_snr(megatab, line, abs_lines,
+                             line_prop=line_prop, combine_doublets=combine_doublets)
+        snr_ok = (snr < -sig_thresh) if is_abs else (snr > sig_thresh)
+        mask &= snr_ok | (delta == 0)
+    elif not include_upper_limits:
+        snr = _effective_snr(megatab, line, abs_lines,
+                             line_prop=line_prop, combine_doublets=combine_doublets)
+        mask &= (snr < -sig_thresh) if is_abs else (snr > sig_thresh)
+
+    if line_prop in ["EW", "CONT_LUM", "CONT"] and line_prop not in megatab.colnames:
         # Always require significant continuum for EW and continuum luminosity measurements
-        mask &= (megatab[f"CONT_{line}"] / megatab[f"CONT_ERR_{line}"] > sig_thresh)
-    elif line_prop in ["FWHM", "CVEL"]:
-        mask &= line_col > 0  # Only consider positive FWHM and CVEL values to avoid unphysical results from poor fits
-    
-    # Only include unflagged lines
-    mask &= (megatab[f"FLAG_{line}"] == '')
+        mask &= (megatab[f"CONT_{line}"] / megatab[f"CONT_ERR_{line}"] > 3)
+    elif line_prop in ["FWHM"]:
+        mask &= line_col > 0  # Only consider positive FWHM values to avoid unphysical results from poor fits
+
+    # Flag quality: for doublets with combine_doublets, both component flags must be clear.
+    # Upper-limit sources (delta==0) bypass flag cuts — the fit flag reflects a poor
+    # detection fit, which is irrelevant when we are only using the source as a census point.
+    is_upper_limit = (delta == 0) if delta is not None else np.zeros(len(mask), dtype=bool)
+    flag_col = f"FLAG_{line}"
+    if flag_col in megatab.colnames:
+        mask &= (megatab[flag_col] == '') | is_upper_limit
+    if combine_doublets and line in const.doublets:
+        _line2_flag = f"FLAG_{const.doublets[line][1]}"
+        if _line2_flag in megatab.colnames:
+            mask &= (megatab[_line2_flag] == '') | is_upper_limit
+
+    # The remaining cuts are Lya-specific. Guard them so they don't fire when
+    # _prepare_scatter_mask is called from check_line_line_correlations with a
+    # non-Lya property name in the lya_prop slot.
+    _lya_props = {"EW_LYA", "CONT_LUM_LYA", "ASYMR", "DELTAV_LYA",
+                  "FWHMR", "DISPR", "VEXP_ZELDA", "BRRATIO", "FLUXB", "ASYMB",
+                  "FWHMB", "DISPB", "BRSEP"}
+    if lya_prop not in _lya_props:
+        return mask
+
     # If fitting Lya EW, CONT, or continuum luminosity, require significant continuum detection to ensure reliable measurement
-    if lya_prop in ["LYA_EW", "CONT", "EW", "LUM_CONT_LYA"]:
+    if lya_prop in ["EW_LYA", "CONT", "EW", "CONT_LUM_LYA"]:
         mask &= (megatab['CONT'] / megatab['CONT_ERR'] > sig_thresh)
     
     # Only take positive Lya ASYMR values to focus on sources with stronger red peaks, which are more likely to have reliable Lya EW measurements and be less affected by IGM absorption.
@@ -1007,11 +736,12 @@ def prepare_scatter_mask(megatab: Table, line: str, line_col: np.ndarray, line_p
     if lya_prop in ["BRRATIO", "FLUXB", "ASYMB", "FWHMB", "DISPB"]:
         # Mask insignificant blue peaks
         mask &= (megatab["FLUXB"] / megatab["FLUXB_ERR"] > sig_thresh)
+        mask &= megatab['z'] < 4 # At z>4, the blue peak is often completely absorbed by the IGM, so we exclude those sources when analyzing blue peak properties to avoid biasing the results with unreliable measurements.
 
     return mask
 
 
-from typing import Optional
+from typing import Optional, Union
 from linmix import LinMix
 from scipy.odr import ODR, Model, RealData
 from scipy import stats
@@ -1040,8 +770,8 @@ def get_mcmc_p_value(chain: np.ndarray) -> float:
 from matplotlib.axes import Axes
 
 def do_linregress(x: np.ndarray, y: np.ndarray, x_err: np.ndarray, y_err: np.ndarray,
-                  mcmc: bool = True, ax_in: Optional[Axes] = None, 
-                  delta: Optional[np.ndarray] = None, log_transformed: bool = False) -> tuple[float, float, float, float, float]:
+                  mcmc: bool = True, ax_in: Optional[Axes] = None,
+                  niter: int = 5000, delta: Optional[np.ndarray] = None) -> tuple[float, float, float, float, float, float, float]:
     """
     Perform linear regression using either the LinMix MCMC method, which accounts for measurement errors in both x and y, 
     or a simple ODR regression if MCMC is disabled.
@@ -1061,52 +791,91 @@ def do_linregress(x: np.ndarray, y: np.ndarray, x_err: np.ndarray, y_err: np.nda
         perform a simple ODR regression.
     ax_in : matplotlib.axes.Axes, optional
         An optional matplotlib Axes object to plot the regression line and confidence interval on, by default None.
+    niter : int, optional
+        The minimum number of MCMC iterations per chain to run in LinMix, by default 5000. The posterior
+        chain stored after convergence contains approximately ``nchains * niter / 2`` samples (4 chains
+        by default, so ~10,000 samples at the default). Increase this value to obtain a denser posterior
+        for reliable detection of weak signals (e.g. use 25000 for ~50,000 samples).
     delta : np.ndarray, optional
-        An optional array indicating upper limits (1 for DETECTION, 0 for upper limit) to
-        be passed to LinMix for proper handling of censored data, by default None.
-    log_transformed : bool, optional
-        Whether the data has been log-transformed, which affects how upper limits should be handled in
-            LinMix, by default False.
+        Optional array of 0/1 values indicating which data points are upper limits (1 for detections, 0 for upper limits)
+        Should have the same length as x and y. Default is None (no upper limits).
 
     Returns
     -------
-    tuple[float, float, float, float, float]
-        The slope, slope uncertainty, intercept, intercept uncertainty, and p-value of the fit.
+    tuple[float, float, float, float, float, float, float]
+        The slope, slope uncertainty, intercept, intercept uncertainty, LinMix/ODR p-value,
+        Spearman rho, and Spearman rho p-value.
     """
     if mcmc:
-        # If fitting with upper bounds in log-space, we need to translate all the y values up
-        # by an arbitrary amount (10, corresponding to 10 dex) to ensure that upper limits
-        # are properly handled in log-space without resulting in -inf values that can cause issues for LinMix
-        shift_up = log_transformed and delta is not None and np.any(delta == 0)
-        if shift_up:
-            print("Data is log-transformed with upper limits, shifting y values up by 10 dex for LinMix...")
-            y = y + 10  # Shift log-transformed values up by 10 dex to avoid -inf for upper limits
-        
-        lm = LinMix(x, y, xsig=x_err, ysig=y_err, delta=delta, K=2)
+        rho, rho_p = stats.spearmanr(x, y)
 
-        try:
-            lm.run_mcmc(silent=True)
+        lm = LinMix(x, y, xsig=x_err, ysig=y_err, K=2, delta=delta)
 
-            # Shift the intercept chain back down by 10 dex if log-transformed with upper limits to get the correct intercept values in log-space
-            if shift_up:
-                print("Shifting intercept chain back down by 10 dex for correct log-space values...")
-                lm.chain['alpha'] -= 10
-            
-            slope = np.mean(lm.chain['beta'])
-            sloperr = np.std(lm.chain['beta'])
-            inter = np.mean(lm.chain['alpha'])
-            intererr = np.std(lm.chain['alpha'])
+        _mcmc_exc: list[Optional[Exception]] = [None]
+        _done = threading.Event()
 
-            # Calculate p-value using the slope posterior distribution
-            p_value = get_mcmc_p_value(lm.chain)
-        except ValueError as e:
-            print(f"LinMix MCMC failed to converge: {e}")
-            return None, None, None, None, None
-        # Plot the result by taking a sample of the posterior distribution of slopes and intercepts to show the confidence interval
+        def _run_mcmc():
+            try:
+                lm.run_mcmc(miniter=niter, maxiter=max(niter, 100000), silent=True)
+            except Exception as e:
+                _mcmc_exc[0] = e
+            finally:
+                _done.set()
+
+        _thread = threading.Thread(target=_run_mcmc, daemon=True)
+        _thread.start()
+        _completed = _done.wait(timeout=600)
+
+        if not _completed:
+            warnings.warn(
+                "LinMix MCMC hung (likely due to numerical instability — overflow in "
+                "covariance matrix or NaN probabilities in multivariate sampling). "
+                "Returning None.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None, None, None, None, None, None, None
+
+        if _mcmc_exc[0] is not None:
+            warnings.warn(
+                f"LinMix MCMC failed: {_mcmc_exc[0]}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None, None, None, None, None, None, None
+
+        slope = np.mean(lm.chain['beta'])
+        sloperr = np.std(lm.chain['beta'])
+        slope_median = np.median(lm.chain['beta'])
+        slope_16th = np.percentile(lm.chain['beta'], 16)
+        slope_84th = np.percentile(lm.chain['beta'], 84)
+        inter = np.mean(lm.chain['alpha'])
+        intererr = np.std(lm.chain['alpha'])
+        inter_median = np.median(lm.chain['alpha'])
+        inter_16th = np.percentile(lm.chain['alpha'], 16)
+        inter_84th = np.percentile(lm.chain['alpha'], 84)
+
+        # Calculate posterior probability of positive/negative slope and convert to a two-tailed p-value
+        p_value = get_mcmc_p_value(lm.chain)
+        posterior_probability = 1 - p_value
+        # Plot the posterior predictive band: evaluate y = alpha + beta*x for every
+        # chain sample, then show the 16th–84th percentile envelope with fill_between.
         if ax_in is not None:
-            x_fit = np.linspace(np.min(x), np.max(x), 10, endpoint=True)
-            y_fit_samples = np.array([lm.chain[i]['alpha'] + lm.chain[i]['beta'] * x_fit for i in range(0, len(lm.chain), 25)])
-            ax_in.plot(x_fit, y_fit_samples.T, color='red', alpha=0.01)
+            x_fit = np.linspace(np.min(x - x_err), np.max(x + x_err), 200)
+            # Shape: (n_chain, n_x)
+            y_samples = lm.chain['alpha'][:, None] + lm.chain['beta'][:, None] * x_fit[None, :]
+            y_lo  = np.percentile(y_samples, 16, axis=0)
+            y_hi  = np.percentile(y_samples, 84, axis=0)
+            y_med = np.median(y_samples, axis=0)
+            ineq = '>' if slope > 0 else '<'
+            _fit_label = (f"slope $={slope_median:.4g}^{{+{slope_84th - slope_median:.4g}}}_{{-{slope_median - slope_16th:.4g}}}$\n"
+                        #   f"$\\alpha={inter_median:.2f}^{{+{inter_84th - inter_median:.2f}}}_{{-{inter_median - inter_16th:.2f}}}$\n"
+                          r"$ P(\mathrm{slope}"+f" {ineq} 0)={posterior_probability:.3f}$\n"
+                          f"Spearman $\\rho={rho:.3f}$")
+            ax_in.plot(x_fit, y_med, color='red', lw=1.5, alpha=0.75)
+            ax_in.fill_between(x_fit, y_lo, y_hi, color='red', alpha=0.25,
+                               label=_fit_label)
+            ax_in.legend(framealpha=0.6, fancybox=True, loc='upper right')
 
         # Quick check - create a new figure just for this (won't interfere with your main plot)
         fig_hist, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
@@ -1118,39 +887,977 @@ def do_linregress(x: np.ndarray, y: np.ndarray, x_err: np.ndarray, y_err: np.nda
         ax2.hist(lm.chain['alpha'], bins=50, density=True, alpha=0.7, color='steelblue', edgecolor='black')
         ax2.set_title('Intercept posterior')
         ax2.set_xlabel(r'$\alpha$')
-        
-        return slope, inter, sloperr, intererr, p_value  # Return order: slope, intercept, slope_err, intercept_err, p_value
+
+        return slope, inter, sloperr, intererr, p_value, rho, rho_p # Return order: slope, intercept, slope_err, intercept_err, p_value, rho, rho_p
 
     else:
         # Perform ODR regression as a fallback if MCMC is disabled
+        # Raise a warning and mask non-detections if delta is provided, since ODR does not natively handle upper limits
+        if delta is not None:
+            warnings.warn(
+                "ODR regression does not natively handle upper limits. Masking non-detections based on provided delta array.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            mask = delta == 1
+            x = x[mask]
+            y = y[mask]
+            x_err = x_err[mask]
+            y_err = y_err[mask]
         def linear_model(B, x):
             return B[0] * x + B[1]
         data = RealData(x, y, sx=x_err, sy=y_err)
         model = Model(linear_model)
         odr = ODR(data, model, beta0=[0., 1.])
         output = odr.run()
+        rho, rho_p = stats.spearmanr(x, y)
         slope, intercept = output.beta
         slope_err, intercept_err = output.sd_beta
         # Calculate p-value using the t-statistic for the slope
         t_stat = slope / slope_err if slope_err > 0 else 0
         p_value = 2 * (1 - stats.t.cdf(np.abs(t_stat), df=len(x) - 2))  # Two-tailed test
-        return slope, slope_err, intercept, intercept_err, p_value
+        if ax_in is not None:
+            x_fit = np.linspace(np.min(x), np.max(x), 200)
+            _fit_label = (f"Slope={slope:.2f}\u00b1{slope_err:.2f}\n"
+                          f"Intercept={intercept:.2f}\u00b1{intercept_err:.2f}\n"
+                          f"(p={p_value:.3e})\n"
+                          f"$\\rho_s={rho:.3f}$, $p_s={rho_p:.3e}$")
+            ax_in.plot(x_fit, slope * x_fit + intercept, color='red', lw=1.5,
+                       label=_fit_label)
+            ax_in.legend(framealpha=0.6, fancybox=True)
+        return slope, slope_err, intercept, intercept_err, p_value, rho, rho_p
 
 
-        
-_log_quantities = ["LYA_EW", "FWHMR", "DISPR", 
-                   "CONT", "EW", "FWHM", "DISP", 
-                   "VEXP_ZELDA", "BRSEP", "BRRATIO",
-                   "LUM", "CONT_LUM", "LUM_LYA", "LUM_CONT_LYA"]
 
-def check_line_correlations(line_property: str, lya_properties: list[str], lines: list[str],
-                       abs_lines: list[str], megatab: Table, min_points: int = 10,
-                       significance_thresh: float = 0.01, mcmc: bool = True, 
-                       fit_upper_limits: bool = False, upper_limit: float = 3.0,
-                       logify: bool = False, plot_upper_limits: bool = False,
-                       save_fig: bool = False, point_sig_thresh: float = 3.0,
-                       c: Optional[str] = 'z', clip_extreme_errors: Optional[float] = None,
-                       **scatter_kwargs) -> dict:
+
+def ks_test_distributions(groups: list[np.ndarray],
+                          labels: Optional[list[str]] = None) -> dict:
+    """
+    Perform pairwise two-sample Kolmogorov-Smirnov tests on a list of value arrays.
+
+    Parameters
+    ----------
+    groups : list of np.ndarray
+        Value arrays, one per group (NaN/inf already removed).
+    labels : list of str, optional
+        Names for each group. Defaults to ``'Group 0'``, ``'Group 1'``, …
+
+    Returns
+    -------
+    dict
+        Mapping ``(label_i, label_j)`` → ``{'statistic': float, 'p_value': float}``
+        for every unique pair ``i < j``.
+    """
+    from scipy.stats import ks_2samp
+
+    n = len(groups)
+    if labels is None:
+        labels = [f"Group {i}" for i in range(n)]
+    results = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            if len(groups[i]) == 0 or len(groups[j]) == 0:
+                results[(labels[i], labels[j])] = {'statistic': np.nan, 'p_value': np.nan}
+                continue
+            stat, p = ks_2samp(groups[i], groups[j])
+            results[(labels[i], labels[j])] = {'statistic': stat, 'p_value': p}
+    return results
+
+
+def ks_test_lya_mc(line: str, lya_prop: str, megatab: Table, line_property: str = "EW",
+                   abs_lines: Optional[list] = None, threshold: Union[float, str] = 'auto',
+                   significance_thresh: float = 3.0) -> tuple[float, float]:
+    """
+    Perform a KS test comparing the distribution of a Lyman alpha property
+    (e.g. DISPR, FWHMR, ASYMR) for sources with high vs low values of a given line property
+    (e.g. EW). Non-detections are included in the low-value group when their upper limit
+    falls below the threshold.
+
+    Parameters
+    ----------
+    line : str
+        The line to analyse (e.g. ``"SiII1260"``).
+    lya_prop : str
+        The Lyman alpha property to split on (e.g. ``"DISPR"``).
+    megatab : astropy.table.Table
+        The megatable containing the data.
+    line_property : str, optional
+        The line property used for splitting the sample (e.g. ``"EW"``), by default ``"EW"``.
+    abs_lines : list, optional
+        Lines that should be treated as absorption (SNR sign flipped). Default is ``[]``.
+    threshold : float or str, optional
+        Value used to split the sample into high/low groups. If ``'auto'``, the median
+        detection value is used, by default ``'auto'``.
+    significance_thresh : float, optional
+        SNR threshold (in sigma) for classifying a source as a detection, by default 3.0.
+
+    Returns
+    -------
+    tuple[float, float]
+        The KS statistic and p-value for the test.
+    """
+    from scipy.stats import ks_2samp
+
+    if abs_lines is None:
+        abs_lines = []
+
+    # Retrieve columns
+    line_col, line_err = get_line_property(megatab, line, line_property, abs=line in abs_lines)
+    lya_col, lya_col_err = get_lya_property(megatab, lya_prop)
+
+    # Valid-data mask (include upper limits so non-detections are retained)
+    mask = _prepare_scatter_mask(megatab, line, line_col, line_property, lya_col, lya_prop,
+                                 abs_lines, include_upper_limits=True,
+                                 sig_thresh=significance_thresh)
+
+    snr = np.asarray(megatab[f"SNR_{line}"], dtype=float)
+    if line in abs_lines:
+        significance_mask = snr < -significance_thresh
+    else:
+        significance_mask = snr > significance_thresh
+
+    detections   = mask & significance_mask
+    upper_limits = mask & ~significance_mask
+
+    # Replace non-detections with 3-sigma upper bounds
+    line_col = np.array(line_col, dtype=float)
+    line_col[upper_limits] = 3.0 * np.asarray(line_err, dtype=float)[upper_limits]
+
+    # Determine splitting threshold
+    if threshold == 'auto':
+        median_line = np.nanmedian(line_col[detections])
+        print(f"Using median {line} {line_property} value of {median_line:.2f} for splitting groups.")
+    else:
+        median_line = threshold
+
+    group_high = lya_col[detections & (line_col >= median_line)]
+    group_low  = lya_col[(detections & (line_col < median_line)) | (upper_limits & (line_col < median_line))]
+
+    # Log-transform if appropriate
+    if lya_prop in _log_quantities:
+        group_high = np.log10(group_high)
+        group_low  = np.log10(group_low)
+
+    if len(group_high) == 0 or len(group_low) == 0:
+        print(f"Warning: one of the groups for {line} {line_property} vs {lya_prop} is empty. "
+              "Cannot perform KS test.")
+        return np.nan, np.nan
+
+    ks_statistic, p_value = ks_2samp(group_high, group_low)
+
+    if p_value < 0.05:
+        print(f"Significant difference in {lya_prop} distribution for high vs low "
+              f"{line} {line_property} (KS p={p_value:.3e}).")
+    else:
+        print(f"No significant difference in {lya_prop} distribution for high vs low "
+              f"{line} {line_property} (KS p={p_value:.3e}).")
+        return ks_statistic, p_value
+
+    print(f"KS test for {line} {line_property} vs {lya_prop}: "
+          f"KS statistic={ks_statistic:.3f}, p-value={p_value:.3e}")
+
+    n_bins = 20
+    bins = np.linspace(min(np.min(group_high), np.min(group_low)),
+                       max(np.max(group_high), np.max(group_low)), n_bins)
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(group_high, bins=bins, alpha=0.7,
+             label=f"{line} {line_property} $\\geq {median_line:.2f}$",
+             color='steelblue', edgecolor='black')
+    plt.hist(group_low, bins=bins, alpha=0.7,
+             label=f"{line} {line_property} $< {median_line:.2f}$",
+             color='salmon', edgecolor='black')
+    plt.xlabel(plot.get_plot_name(lya_prop))
+    plt.ylabel("Number of sources")
+    plt.title(f"{line} {line_property} vs {lya_prop}\nKS p-value={p_value:.3e}")
+    plt.legend()
+    plt.savefig(f"plots/{line}_{line_property}_vs_{lya_prop}_KS_hist.png",
+                dpi=300, bbox_inches='tight')
+    plt.show()
+
+    return ks_statistic, p_value
+
+
+def generate_histogram(prop: str, megatab: Table, masks: Optional[list] = None,
+                       labels: Optional[list] = None, colors: Optional[list] = None,
+                       line: Optional[str] = None, ax: Optional[plt.Axes] = None,
+                       logify: bool = True, bins: Union[int, str, np.ndarray] = 'auto',
+                       density: bool = False, plot_median: bool = True,
+                       sig_thresh: float = 3.0, alpha: float = 0.6,
+                       combine_doublets: bool = True,
+                       abs_lines: Optional[list] = None,
+                       ks_test: bool = False,
+                       hist_kwargs: Union[dict, list, None] = None) -> plt.Axes:
+    """
+    Plot one or more overlaid histograms of a named property, handling derived
+    quantities (Lya properties, line properties, luminosities) automatically.
+
+    Parameters
+    ----------
+    prop : str
+        Property to histogram. Interpreted as follows:
+
+        - A Lya property recognised by :func:`get_lya_property` (e.g. ``'EW_LYA'``,
+          ``'DISPR'``, ``'LUM_LYA'``, ``'CONT_LUM_LYA'``).
+        - A line property recognised by :func:`get_line_property` when ``line`` is
+          also supplied (e.g. ``prop='EW'``, ``line='CIV1548'``).
+        - A combined ``"{param}_{line}"`` string (e.g. ``'EW_CIV1548'``,
+          ``'CONT_LUM_CIV1548'``). The line name is inferred automatically by trying
+          right-to-left splits on ``_``.
+        - Any column name present directly in ``megatab``.
+
+    megatab : astropy.table.Table
+        The source catalogue.
+    masks : list of array-like, optional
+        List of boolean masks, one per group to plot. Each mask selects a subset of
+        ``megatab``. If ``None``, a single group containing all finite, valid rows is used.
+    labels : list of str, optional
+        Legend labels, one per group. Defaults to ``None`` (no labels).
+    colors : list of str, optional
+        Colours, one per group. Defaults to the matplotlib colour cycle.
+    line : str, optional
+        Line name required when ``prop`` is a line property (e.g. ``'CIV1548'``).
+        Ignored for Lya properties and plain column names.
+    ax : matplotlib.axes.Axes, optional
+        Axes on which to draw. A new figure and axes are created if ``None``.
+    logify : bool, optional
+        If ``True`` (default) and ``prop`` is in ``_log_quantities``, apply a
+        log10 transform before binning. The x-axis label is prefixed with ``log ``.
+    bins : int, str, or array-like, optional
+        Number of bins, a numpy bin-selection string (e.g. ``'auto'``, ``'fd'``,
+        ``'scott'``), or explicit bin edges shared across all groups.
+        Default is ``'auto'`` (numpy Freedman-Diaconis / Sturges selector).
+    density : bool, optional
+        Normalise histograms to form a probability density. Default is ``False``.
+    plot_median : bool, optional
+        Draw a vertical dashed line at the median for each group. Default is ``True``.
+    sig_thresh : float, optional
+        SNR threshold for the base quality mask. For emission lines this requires
+        ``SNR > sig_thresh``; for absorption lines ``SNR < -sig_thresh``.
+        Continuum-dependent quantities additionally require ``CONT SNR > sig_thresh``.
+        Default is 3.0.
+    alpha : float, optional
+        Transparency for the histogram bars. Default is 0.6.
+    combine_doublets : bool, optional
+        When ``True`` (default) and the resolved line is a doublet key, the two lines
+        are summed for ``FLUX``, ``EW``, and ``LUM`` properties.
+    abs_lines : list of str, optional
+        Lines to treat as absorption (SNR sign flipped). Defaults to ``[]``.
+    ks_test : bool, optional
+        When ``True`` and more than one mask is provided, run pairwise two-sample
+        KS tests via :func:`ks_test_distributions` and annotate the plot with the
+        resulting p-values. Default is ``False``.
+    hist_kwargs : dict or list of dict, optional
+        Extra keyword arguments forwarded to ``ax.hist``. Can be a single dictionary
+        (applied to all groups) or a list of dictionaries (one per group). Default is ``None``.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+        The axes on which the histograms were drawn.
+    """
+    if hist_kwargs is None:
+        hist_kwargs = {}
+    # Convert single dict to list of dicts for uniform processing
+    if isinstance(hist_kwargs, dict):
+        hist_kwargs = [hist_kwargs]  # Will be replicated to match n_groups below
+    if abs_lines is None:
+        abs_lines = []
+
+    prop = normalise_prop(prop)
+
+    # --- Step 1: Resolve line and param from prop name or explicit line= ---
+    # This is done BEFORE data retrieval so that SNR masking is always applied
+    # correctly regardless of which path retrieves the data.
+    _is_lya_prop = False
+    _is_line_prop = False
+    _resolved_param = prop   # updated below if a line suffix is found
+    _resolved_line = line    # from explicit parameter; may be updated by auto-parse
+
+    if _resolved_line is None and '_' in prop:
+        # Try right-to-left splits to find a known line token as the suffix
+        parts = prop.split('_')
+        for split_idx in range(len(parts) - 1, 0, -1):
+            candidate_line = '_'.join(parts[split_idx:])
+            if candidate_line in _known_line_tokens:
+                _resolved_line = candidate_line
+                _resolved_param = '_'.join(parts[:split_idx])
+                break
+    elif _resolved_line is not None:
+        # Explicit line= given — strip the line suffix from _resolved_param if present
+        if prop.endswith(f'_{_resolved_line}'):
+            _resolved_param = prop[:-(len(_resolved_line) + 1)]
+
+    # --- Step 2: Retrieve the raw column ---
+    # Resolution order:
+    #   1. Explicit line= or auto-parsed line → get_line_property
+    #   2. get_lya_property (Lya-specific props: EW_LYA, BRRATIO, FWHMR, etc.)
+    #      NOTE: get_lya_property has a catch-all for any megatab column, so it
+    #      must come AFTER the line-specific path to avoid bypassing SNR masking.
+    #   3. Direct column lookup (final fallback)
+    col = None
+    _is_abs = _resolved_line in abs_lines
+
+    if _resolved_line is not None:
+        try:
+            col, _ = get_line_property(megatab, _resolved_line, _resolved_param,
+                                       combine_doublets=combine_doublets,
+                                       abs=_is_abs)
+            _is_line_prop = True
+        except (ValueError, KeyError):
+            pass
+        # If get_line_property failed (e.g. column is pre-computed in megatab rather than
+        # being derivable from FLUX/CONT), fall back to direct column lookup.
+        if col is None and prop in megatab.colnames:
+            col = np.asarray(megatab[prop], dtype=float)
+
+    if col is None:
+        try:
+            col, _ = get_lya_property(megatab, prop)
+            _is_lya_prop = True
+        except (ValueError, KeyError):
+            pass
+
+    if col is None:
+        if prop in megatab.colnames:
+            col = np.asarray(megatab[prop], dtype=float)
+        else:
+            raise ValueError(
+                f"Property '{prop}' not recognised as a Lya property, line property, or "
+                f"column in megatab. If it is a line property, supply `line=` or use the "
+                f"'{{param}}_{{line}}' form (e.g. 'EW_CIV1548')."
+            )
+
+    col = np.asarray(col, dtype=float)
+
+    # --- Build a base quality mask (mirrors _prepare_scatter_mask logic) ---
+    base_mask = np.isfinite(col)
+
+    # Lya continuum quality: only for Lya-derived properties (not line-specific ones)
+    if _is_lya_prop and prop in ["EW_LYA", "EW", "CONT", "CONT_LUM_LYA"] \
+            and 'CONT' in megatab.colnames and 'CONT_ERR' in megatab.colnames:
+        base_mask &= (megatab['CONT'] / megatab['CONT_ERR'] > sig_thresh)
+
+    # Blue Lya peak quality: properties that depend on the blue peak require a
+    # significant blue detection (mirrors _prepare_scatter_mask / check_lya_correlations)
+    _blue_lya_props = {"BRRATIO", "BRSEP", "FLUXB", "ASYMB", "FWHMB", "DISPB"}
+    if _is_lya_prop and prop in _blue_lya_props \
+            and 'FLUXB' in megatab.colnames and 'FLUXB_ERR' in megatab.colnames:
+        base_mask &= (megatab['FLUXB'] / megatab['FLUXB_ERR'] > sig_thresh)
+
+    # Line SNR quality masking — applied for ANY property once a line is resolved,
+    # regardless of whether data came from get_line_property or a direct column.
+    if _resolved_line is not None:
+        # SNR cut — emission: > +thresh; absorption: < -thresh
+        # When combining doublets, use the quadrature-combined SNR of both components
+        # (sqrt(SNR1^2 + SNR2^2)), since we are testing the significance of the combined flux.
+        snr_col = f"SNR_{_resolved_line}"
+        if snr_col in megatab.colnames:
+            _use_doublet_snr = (combine_doublets
+                                and _resolved_line in const.doublets
+                                and _resolved_param in ("EW", "FLUX", "LUM"))
+            if _use_doublet_snr:
+                _line1, _line2 = const.doublets[_resolved_line]
+                _snr2_col = f"SNR_{_line2}"
+                if _snr2_col in megatab.colnames:
+                    _snr1 = np.asarray(megatab[snr_col], dtype=float)
+                    _snr2 = np.asarray(megatab[_snr2_col], dtype=float)
+                    _combined_snr = np.sqrt(_snr1**2 + _snr2**2)
+                    # Sign: negative combined SNR only makes sense for absorption — use titular-line sign
+                    _sign = np.sign(_snr1)
+                    _signed_combined_snr = _sign * _combined_snr
+                    if _is_abs:
+                        base_mask &= _signed_combined_snr < -sig_thresh
+                    else:
+                        base_mask &= _signed_combined_snr > sig_thresh
+                else:
+                    # Second component not in table — fall back to titular line
+                    if _is_abs:
+                        base_mask &= megatab[snr_col] < -sig_thresh
+                    else:
+                        base_mask &= megatab[snr_col] > sig_thresh
+            else:
+                if _is_abs:
+                    base_mask &= megatab[snr_col] < -sig_thresh
+                else:
+                    base_mask &= megatab[snr_col] > sig_thresh
+
+        # Line-continuum SNR for EW / CONT_LUM
+        if _resolved_param in ["EW", "CONT_LUM"] and f"CONT_{_resolved_line}" in megatab.colnames:
+            base_mask &= (megatab[f"CONT_{_resolved_line}"] / megatab[f"CONT_ERR_{_resolved_line}"] > sig_thresh)
+
+        # Quality flag — for doublets, both component flags must be clear
+        flag_col = f"FLAG_{_resolved_line}"
+        if flag_col in megatab.colnames:
+            base_mask &= (megatab[flag_col] == '')
+        if combine_doublets and _resolved_line in const.doublets:
+            _line2_flag = f"FLAG_{const.doublets[_resolved_line][1]}"
+            if _line2_flag in megatab.colnames:
+                base_mask &= (megatab[_line2_flag] == '')
+
+        # FWHM must be positive after instrumental correction
+        if _resolved_param in ["FWHM"]:
+            base_mask &= col > 0
+
+    # --- Optional log transform ---
+    do_log = logify and _resolved_param in _log_quantities
+    plot_col = np.log10(col) if do_log else col.copy()
+
+    # --- Default: single group with no extra masking ---
+    if masks is None:
+        masks = [base_mask]
+    else:
+        masks = [base_mask & np.asarray(m, dtype=bool) for m in masks]
+
+    n_groups = len(masks)
+    if labels is None:
+        labels = [None] * n_groups
+    if colors is None:
+        colors = [f"C{i}" for i in range(n_groups)]
+    # Replicate hist_kwargs if only a single dict was provided
+    if len(hist_kwargs) == 1 and n_groups > 1:
+        hist_kwargs = hist_kwargs * n_groups
+    elif len(hist_kwargs) != n_groups:
+        raise ValueError(
+            f"hist_kwargs must be either a single dict or a list of {n_groups} "
+            f"dict(s), got {len(hist_kwargs)}"
+        )
+
+    # --- Shared bin edges across all groups (auto-selected if bins is a string) ---
+    all_vals = np.concatenate([plot_col[m] for m in masks if np.any(m)])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    if len(all_vals) == 0:
+        raise ValueError(f"No finite values found for property '{prop}' after masking.")
+    if isinstance(bins, str):
+        # numpy auto-selector ('auto', 'fd', 'scott', etc.) — compute shared edges
+        bin_edges = np.histogram_bin_edges(all_vals, bins=bins)
+    elif isinstance(bins, int):
+        bin_edges = np.linspace(np.nanmin(all_vals), np.nanmax(all_vals), bins + 1)
+    else:
+        bin_edges = np.asarray(bins)
+
+    # --- Create axes if needed ---
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6, 4))
+
+    # --- Plot each group ---
+    for m, label, color, kws in zip(masks, labels, colors, hist_kwargs):
+        vals = plot_col[m]
+        vals = vals[np.isfinite(vals)]
+        if len(vals) == 0:
+            continue
+        ax.hist(vals, bins=bin_edges, density=density, label=label,
+                color=color, alpha=alpha, **kws)
+        if plot_median:
+            ax.axvline(np.nanmedian(vals), linestyle='--', color=color,
+                       alpha=0.8, linewidth=1.5,
+                       label=f"{label} median" if label else None)
+
+    # --- Axis labels — same pattern as check_line_correlations ---
+    if _resolved_line is not None:
+        # Try the full compound key first (e.g. 'EW_LYA' → nice Lya-specific label);
+        # fall back to composing from line + param parts for generic line properties.
+        compound_label = plot.get_plot_name(prop)
+        if compound_label == prop:  # not in plot_names — compose from parts
+            xlabel = f"{plot.get_plot_name(_resolved_line)} {plot.get_plot_name(_resolved_param)}"
+        else:
+            xlabel = compound_label
+    else:
+        xlabel = plot.get_plot_name(prop)
+    if do_log:
+        xlabel = f"log {xlabel}"
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Probability density" if density else "N")
+
+    if any(l is not None for l in labels):
+        ax.legend()
+
+    # --- Optional KS tests ---
+    if ks_test and n_groups > 1:
+        group_vals = []
+        for m in masks:
+            v = plot_col[m]
+            group_vals.append(v[np.isfinite(v)])
+        ks_results = ks_test_distributions(group_vals, labels=labels)
+        ks_lines = []
+        for (l1, l2), res in ks_results.items():
+            pair = f"{l1} vs {l2}" if (l1 is not None and l2 is not None) else "KS"
+            ks_lines.append(f"{pair}: D={res['statistic']:.3f}, p={res['p_value']:.3e}")
+        ax.text(0.98, 0.97, '\n'.join(ks_lines),
+                transform=ax.transAxes, ha='right', va='top',
+                fontsize=8, family='monospace',
+                bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.7))
+
+    return ax
+
+
+def _lya_quality_mask(megatab: Table, prop: str, col: np.ndarray, sig_thresh: float) -> np.ndarray:
+    """Build a quality mask for a single Lya property column."""
+    mask = np.isfinite(col)
+    if prop in ["EW_LYA", "CONT", "EW", "CONT_LUM_LYA"]:
+        mask &= (megatab['CONT'] / megatab['CONT_ERR'] > sig_thresh)
+    if prop in ["ASYMR", "DELTAV_LYA", "FWHMR", "DISPR", "VEXP_ZELDA"]:
+        mask &= col > 0
+    if prop == 'ASYMR':
+        mask &= col < 0.3
+    if prop in ["BRRATIO", "FLUXB", "ASYMB", "FWHMB", "DISPB", "BRSEP"]:
+        mask &= (megatab["FLUXB"] / megatab["FLUXB_ERR"] > sig_thresh)
+    if prop == "VEXP_ZELDA":
+        mask &= (megatab[prop] - 3 * megatab['VEXP_ERRM_ZELDA'] > 0)
+    return mask
+
+
+def _scatter_qc(
+    x_vals: np.ndarray, x_errs: np.ndarray,
+    y_vals: np.ndarray, y_errs: np.ndarray,
+    c_col: Optional[np.ndarray] = None,
+    delta: Optional[np.ndarray] = None,
+    sigma_clip: Optional[float] = None,
+    nn_clip: Optional[float] = None,
+    min_points: int = 10,
+    pair_label: str = '',
+) -> Optional[tuple]:
+    """
+    Apply quality-control filtering to a scatter dataset.
+
+    Applies sigma clipping and/or nearest-neighbour outlier rejection in
+    sequence, returning filtered copies of the input arrays.  Returns
+    ``None`` if fewer than ``min_points`` survive filtering.
+
+    Parameters
+    ----------
+    x_vals, x_errs : np.ndarray
+        X-axis values and uncertainties.
+    y_vals, y_errs : np.ndarray
+        Y-axis values and uncertainties.
+    c_col : np.ndarray, optional
+        Colour column to filter alongside the data arrays.
+    delta : np.ndarray, optional
+        Upper-limit flags (1 = detection, 0 = upper limit).
+    sigma_clip : float, optional
+        Remove points whose deviation from the sample median exceeds this
+        many sigma, computed in quadrature with the point's own uncertainty.
+        This avoids unfairly clipping points whose apparent deviation is
+        explained by a large error bar.
+    nn_clip : float, optional
+        Remove points whose mean distance to all other points in the normalised
+        (x / std_x, y / std_y) plane exceeds ``median_mean_dist + nn_clip * MAD_mean_dist``.
+        Because every point is compared against the whole sample, small clusters of
+        outliers cannot protect each other.  Applied after sigma clipping.
+        By default None.
+    min_points : int, optional
+        Minimum number of points required to survive filtering.
+    pair_label : str, optional
+        Identifier used in printed warning messages.
+
+    Returns
+    -------
+    tuple or None
+        ``(x_vals, x_errs, y_vals, y_errs, c_col, delta)`` — filtered
+        copies of the inputs — or ``None`` if too few points survive.
+    """
+    # --- Sigma clipping ---
+    if sigma_clip is not None:
+        # Clip in quadrature: a point is kept if its deviation from the sample
+        # median is within sigma_clip times the quadrature sum of the sample
+        # scatter and the point's own uncertainty.  This avoids unfairly
+        # clipping points whose apparent deviation is explained by a large
+        # error bar.
+        x_thresh = np.sqrt(np.std(x_vals) ** 2 + x_errs ** 2)
+        y_thresh = np.sqrt(np.std(y_vals) ** 2 + y_errs ** 2)
+        sc_mask = (
+            (np.abs(x_vals - np.median(x_vals)) <= sigma_clip * x_thresh) &
+            (np.abs(y_vals - np.median(y_vals)) <= sigma_clip * y_thresh)
+        )
+        if np.sum(sc_mask) < min_points:
+            print(f"Warning: Sigma clipping ({sigma_clip}\u03c3) leaves fewer than "
+                  f"{min_points} points for {pair_label}. Skipping.")
+            return None
+        n_clipped = len(x_vals) - np.sum(sc_mask)
+        x_vals, x_errs = x_vals[sc_mask], x_errs[sc_mask]
+        y_vals, y_errs = y_vals[sc_mask], y_errs[sc_mask]
+        c_col = c_col[sc_mask] if c_col is not None else None
+        delta = delta[sc_mask] if delta is not None else None
+        if n_clipped:
+            print(f"Sigma clipped {n_clipped} point(s) ({sigma_clip}\u03c3), leaving "
+                  f"{len(x_vals)} points for {pair_label}.")
+
+    # --- Mean-distance outlier rejection ---
+    if nn_clip is not None and len(x_vals) >= 2:
+        std_x = np.std(x_vals)
+        std_y = np.std(y_vals)
+        if std_x < 1e-10 or std_y < 1e-10:
+            print(f"Warning: Near-zero axis scatter prevents mean-distance clipping "
+                  f"for {pair_label}. Skipping.")
+        else:
+            xn = x_vals / std_x
+            yn = y_vals / std_y
+            coords = np.column_stack([xn, yn])
+            # Pairwise distances; exclude self via the diagonal
+            diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+            sq_dist = np.sum(diff ** 2, axis=-1)
+            np.fill_diagonal(sq_dist, 0.0)
+            mean_dist = np.sum(np.sqrt(sq_dist), axis=1) / (len(x_vals) - 1)
+            med_md = np.median(mean_dist)
+            mad_md = np.median(np.abs(mean_dist - med_md))
+            if mad_md < 1e-10:
+                mad_md = np.std(mean_dist) if np.std(mean_dist) > 1e-10 else 1.0
+            nn_mask = mean_dist <= med_md + nn_clip * mad_md
+            if np.sum(nn_mask) < min_points:
+                print(f"Warning: Mean-distance clipping ({nn_clip}\u03c3) leaves fewer than "
+                      f"{min_points} points for {pair_label}. Skipping.")
+                return None
+            n_nn_clipped = len(x_vals) - np.sum(nn_mask)
+            x_vals, x_errs = x_vals[nn_mask], x_errs[nn_mask]
+            y_vals, y_errs = y_vals[nn_mask], y_errs[nn_mask]
+            c_col = c_col[nn_mask] if c_col is not None else None
+            delta = delta[nn_mask] if delta is not None else None
+            if n_nn_clipped:
+                print(f"Mean-distance clipped {n_nn_clipped} point(s) ({nn_clip}\u03c3), "
+                      f"leaving {len(x_vals)} points for {pair_label}.")
+
+    return x_vals, x_errs, y_vals, y_errs, c_col, delta
+
+
+def _correlate_pair(
+    x_vals: np.ndarray, x_errs: np.ndarray,
+    y_vals: np.ndarray, y_errs: np.ndarray,
+    x_prop: str, y_prop: str,
+    x_label: str, y_label: str, title: str,
+    pair_label: str,
+    ax_in: Optional[plt.Axes] = None,
+    c_col: Optional[np.ndarray] = None,
+    c_label: Optional[str] = None,
+    logify: bool = False,
+    min_points: int = 10,
+    significance_thresh: float = 0.01,
+    delta: Optional[np.ndarray] = None,
+    clip_extreme_errors: Optional[float] = None,
+    sigma_clip: Optional[float] = None,
+    nn_clip: Optional[float] = None,
+    mcmc: bool = True,
+    niter: int = 5000,
+    save_fig: bool = False,
+    fig_path: Optional[str] = None,
+    plot_all: bool = False,
+    **scatter_kwargs,
+) -> Optional[dict]:
+    """
+    Shared inner loop for all correlation-analysis functions.
+
+    Handles log-transform, error-bar clipping, scatter plot, OLS pre-screen,
+    MCMC/ODR fit, axis labelling, and returns a result summary dict.
+    Returns ``None`` when the pair is skipped.
+
+    Parameters
+    ----------
+    x_vals, x_errs : np.ndarray
+        X-axis values and 1-sigma uncertainties (already quality-masked).
+    y_vals, y_errs : np.ndarray
+        Y-axis values and 1-sigma uncertainties (already quality-masked).
+    x_prop, y_prop : str
+        Property token used to determine whether log-transform applies
+        (checked against ``_log_quantities``).
+    x_label, y_label : str
+        Base axis label strings (``"log "`` prefix added automatically when
+        logified).
+    title : str
+        Plot title.
+    pair_label : str
+        Human-readable description for print messages
+        (e.g. ``"SiII1260 EW vs DISPR"``).
+    ax_in : matplotlib.axes.Axes, optional
+        Axes on which to draw the scatter plot. A new figure and axes are created
+        if ``None``. Default is ``None``.
+    c_col : np.ndarray, optional
+        Colour values for scatter plot points (already masked), by default None.
+    logify : bool, optional
+        Log-transform axes whose property is listed in ``_log_quantities``,
+        by default False.
+    min_points : int, optional
+        Minimum points required to attempt a fit, by default 10.
+    significance_thresh : float, optional
+        OLS pre-screening p-value threshold; pairs above this are skipped,
+        by default 0.01.
+    delta : np.ndarray, optional
+        Optional boolean array indicating upper limits (1 detection, 0 for upper limit) to be used
+        by LinMix MCMC fitting
+    clip_extreme_errors : float, optional
+        Clip points whose error exceeds this multiple of the data scatter,
+        by default None.
+    sigma_clip : float, optional
+        If given, remove points whose deviation from the sample median exceeds
+        ``sigma_clip`` times the quadrature sum of the sample standard deviation
+        and the point's own uncertainty (applied independently on each axis).
+        This avoids clipping points whose apparent deviation is explained by a
+        large error bar. By default None.
+    nn_clip : float, optional
+        If given, remove points whose mean distance to all other points in the
+        normalised (x / std_x, y / std_y) plane exceeds
+        ``median_mean_dist + nn_clip * MAD_mean_dist``.  Applied after sigma
+        clipping.  By default None.
+    mcmc : bool, optional
+        Use LinMix MCMC; falls back to ODR if False, by default True.
+    niter : int, optional
+        Minimum MCMC iterations per chain, by default 5000.
+    save_fig : bool, optional
+        Save the figure to ``fig_path``, by default False.
+    fig_path : str, optional
+        File path for saving; required when ``save_fig=True``.
+    plot_all : bool, optional
+        Whether to plot regardless of whether the pair passes the significance threshold. 
+        Default is False (only plot significant pairs).
+    **scatter_kwargs
+        Forwarded to :func:`make_scatter`.
+
+    Returns
+    -------
+    dict or None
+        Keys: ``slope``, ``slope_err``, ``intercept``, ``intercept_err``,
+        ``p_value``, ``n_points``. ``None`` if the pair was skipped.
+    """
+    from scipy.stats import linregress
+
+    x_vals = np.array(x_vals, dtype=float)
+    y_vals = np.array(y_vals, dtype=float)
+    x_errs = np.array(x_errs, dtype=float)
+    y_errs = np.array(y_errs, dtype=float)
+
+    # --- Log transform ---
+    plot_log_x = logify and x_prop in _log_quantities
+    plot_log_y = logify and y_prop in _log_quantities
+    if plot_log_x:
+        x_orig = x_vals.copy()
+        x_vals = np.log10(x_orig)
+        x_errs = x_errs / (x_orig * np.log(10))
+    if plot_log_y:
+        y_orig = y_vals.copy()
+        y_vals = np.log10(y_orig)
+        y_errs = y_errs / (y_orig * np.log(10))
+
+    # --- Clip extreme errors ---
+    if clip_extreme_errors is not None:
+        err_mask = ((x_errs < clip_extreme_errors * np.std(x_vals)) &
+                    (y_errs < clip_extreme_errors * np.std(y_vals)))
+        x_vals, x_errs = x_vals[err_mask], x_errs[err_mask]
+        y_vals, y_errs = y_vals[err_mask], y_errs[err_mask]
+        c_col = c_col[err_mask] if c_col is not None else None
+        delta = delta[err_mask] if delta is not None else None
+        print(f"Clipped extreme errors ({clip_extreme_errors}\u03c3), leaving {len(x_vals)} points "
+              f"for {pair_label}.")
+
+    # --- Sigma clipping and nearest-neighbour outlier rejection ---
+    qc_result = _scatter_qc(
+        x_vals, x_errs, y_vals, y_errs,
+        c_col=c_col, delta=delta,
+        sigma_clip=sigma_clip, nn_clip=nn_clip,
+        min_points=min_points, pair_label=pair_label,
+    )
+    if qc_result is None:
+        return None
+    x_vals, x_errs, y_vals, y_errs, c_col, delta = qc_result
+
+    # --- Sanity checks ---
+    if np.any(x_errs < 0) or np.any(y_errs < 0):
+        print(f"Warning: Negative error bars for {pair_label}. Skipping.")
+        return None
+
+    # --- Scatter plot ---
+    if ax_in is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        ax = ax_in
+    _scatter_kw: dict = {}
+    if c_col is not None:
+        _scatter_kw['show_colorbar'] = True
+        if c_label is not None:
+            _scatter_kw['clabel'] = c_label
+    _scatter_kw.update(scatter_kwargs)
+    upper_bounds = (delta == 0) if delta is not None else None
+    make_scatter([x_vals, x_errs], [y_vals, y_errs], ax=ax, c=c_col,
+                 upper_bounds=upper_bounds, **_scatter_kw)
+
+    n_pts = len(x_vals)
+    if n_pts < min_points:
+        print(f"Not enough points to fit for {pair_label} (n={n_pts}).")
+        if ax_in is None:
+            plt.close(fig)
+        return None
+
+    for arr_name, arr in [("x_vals", x_vals), ("y_vals", y_vals),
+                          ("x_errs", x_errs), ("y_errs", y_errs)]:
+        if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+            print(f"Warning: Non-finite values in {arr_name} for {pair_label}. Skipping.")
+            if ax_in is None:
+                plt.close(fig)
+            return None
+
+    # --- OLS pre-screen ---
+    _, _, _, prelim_p, _ = linregress(x_vals, y_vals)
+    if prelim_p >= significance_thresh:
+        print(f"No significant correlation for {pair_label} (prelim p={prelim_p:.3e}). Skipping.")
+        if plot_all:
+            if save_fig and fig_path:
+                fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+            plt.show()
+        if ax_in is None:
+            plt.close(fig)
+        return None
+    print(f"Preliminary fit suggests significant correlation for {pair_label} "
+          f"(prelim p={prelim_p:.3e}). Proceeding with {'MCMC' if mcmc else 'ODR'} fit.")
+
+    # --- MCMC / ODR fit ---
+    slope, intercept, slope_err, intercept_err, p_value, rho, rho_p = do_linregress(
+        x_vals, y_vals, x_errs, y_errs, mcmc=mcmc, ax_in=ax, niter=niter, delta=delta
+    )
+    print(f"Correlation for {pair_label}: slope={slope:.2f}±{slope_err:.2f}, "
+          f"intercept={intercept:.2f}±{intercept_err:.2f}, p={p_value:.3e}, "
+          f"Spearman ρ={rho:.3f} (p={rho_p:.3e})")
+
+    ax.set_xlabel(f"{'log ' if plot_log_x else ''}{x_label}")
+    ax.set_ylabel(f"{'log ' if plot_log_y else ''}{y_label}")
+    ax.set_title(title)
+
+    if save_fig and fig_path and ax_in is None:
+        fig.savefig(fig_path, dpi=300, bbox_inches='tight')
+        plt.show()
+
+    return {
+        'slope': slope,
+        'slope_err': slope_err,
+        'intercept': intercept,
+        'intercept_err': intercept_err,
+        'p_value': p_value,
+        'spearman_rho': rho,
+        'spearman_rho_p': rho_p,
+        'n_points': n_pts,
+    }
+
+
+def _insert_upper_limits(
+    megatab, line: str, line_col: np.ndarray, line_err: np.ndarray,
+    abs_lines: list[str], line_prop: str = 'EW',
+    sig_thresh: float = 3.0, combine_doublets: bool = True,
+    rest_frame: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Replace non-detected sources' line property values with upper limits, and
+    return a LinMix-compatible delta array marking detections vs. censored points.
+
+    For EW, bootstrapped 3-sigma flux upper bounds stored in ``FLUX_UB_{line}``
+    columns are used to derive the EW upper limit via ``FLUX_UB / CONT / (1+z)``.
+    This is preferred over ``3 * FLUX_ERR`` because the raw curve_fit errors
+    underestimate the true uncertainties. Falls back to ``3 * line_err`` if the
+    ``FLUX_UB`` column is absent or if ``line_prop != 'EW'``.
+
+    For doublets with ``combine_doublets=True``, both components' ``FLUX_UB``
+    columns are summed (if both are present) and divided by the first component's
+    continuum, matching the convention used by ``get_line_property``.
+
+    Parameters
+    ----------
+    megatab : astropy.table.Table
+        The megatable.
+    line : str
+        Titular line name (e.g. ``'CIV1548'``).
+    line_col : np.ndarray
+        Property values for all sources (output of ``get_line_property``).
+    line_err : np.ndarray
+        Property errors for all sources (output of ``get_line_property``).
+    abs_lines : list[str]
+        Lines treated as absorption.
+    line_prop : str, optional
+        The property being analysed. Controls whether the bootstrapped EW upper
+        limit path is taken. Default ``'EW'``.
+    sig_thresh : float, optional
+        Detection significance threshold in sigma. Default 3.0.
+    combine_doublets : bool, optional
+        Whether doublet components are combined. Default True.
+    rest_frame : bool, optional
+        Apply rest-frame ``1/(1+z)`` correction when computing EW upper limits.
+        Should match the setting used in ``get_line_property``. Default True.
+
+    Returns
+    -------
+    modified_col : np.ndarray
+        Copy of ``line_col`` with non-detection values replaced by upper limits.
+    delta : np.ndarray of int
+        1 for detected sources, 0 for censored (upper-limit) sources. Suitable
+        for passing directly to ``LinMix(..., delta=delta)``.
+    """
+    snr = _effective_snr(megatab, line, abs_lines,
+                         line_prop=line_prop, combine_doublets=combine_doublets)
+    is_abs = line in abs_lines
+    detected = (snr < -sig_thresh) if is_abs else (snr > sig_thresh)
+    delta = detected.astype(int)
+
+    modified_col = np.array(line_col, dtype=float)
+    ul_mask = ~detected
+
+    if not np.any(ul_mask):
+        return modified_col, delta
+
+    if line_prop == 'EW':
+        # --- Determine FLUX_UB and CONT columns ---
+        flux_ub: Optional[np.ndarray] = None
+        cont: Optional[np.ndarray] = None
+
+        if combine_doublets and line in const.doublets:
+            line1, line2 = const.doublets[line]
+            ub1_col  = f"FLUX_UB_{line1}"
+            ub2_col  = f"FLUX_UB_{line2}"
+            cont_col = f"CONT_{line1}"
+            if ub1_col in megatab.colnames and cont_col in megatab.colnames:
+                flux_ub = np.asarray(megatab[ub1_col], dtype=float)
+                if ub2_col in megatab.colnames:
+                    flux_ub = flux_ub + np.asarray(megatab[ub2_col], dtype=float)
+                else:
+                    print(f"Warning: Second component upper limit column '{ub2_col}' not found for doublet '{line}'. "
+                          f"Using only '{ub1_col}' for upper limits.")
+                cont = np.asarray(megatab[cont_col], dtype=float)
+        else:
+            ub_col   = f"FLUX_UB_{line}"
+            cont_col = f"CONT_{line}"
+            if ub_col in megatab.colnames and cont_col in megatab.colnames:
+                flux_ub = np.asarray(megatab[ub_col], dtype=float)
+                cont    = np.asarray(megatab[cont_col], dtype=float)
+
+        if flux_ub is not None and cont is not None:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                ew_ub = flux_ub / cont
+            if rest_frame:
+                ew_ub /= (1.0 + np.asarray(megatab['z'], dtype=float))
+            modified_col[ul_mask] = ew_ub[ul_mask]
+            return modified_col, delta
+        # else fall through to the generic fallback below
+
+    # Fallback for non-EW properties or missing FLUX_UB columns
+    print(f"Warning: Using fallback upper limit for {line_prop} of '{line}' due to missing FLUX_UB or non-EW property.")
+    modified_col[ul_mask] = 3.0 * np.asarray(line_err, dtype=float)[ul_mask]
+    return modified_col, delta
+
+
+def check_line_correlations(
+        line_property: str, lya_properties: list[str], 
+        lines: list[str], abs_lines: list[str], 
+        megatab: Table,
+        ax_in: Optional[plt.Axes] = None,
+        min_points: int = 10, 
+        significance_thresh: float = 0.01, 
+        mcmc: bool = True,
+        logify: bool = False, 
+        save_fig: bool = False,
+        point_sig_thresh: float = 3.0, 
+        fit_upper_limits: bool = False,
+        c: Optional[str] = 'z', 
+        clip_extreme_errors: Optional[float] = None,
+        sigma_clip: Optional[float] = None,
+        nn_clip: Optional[float] = None,
+        combine_doublets: bool = True, 
+        niter: int = 5000,
+        plot_all: bool = False, 
+        **scatter_kwargs
+        ) -> dict:
     """
     Check for correlations between a given line property (e.g. EW, FWHM) and a list of Lyman alpha properties.
 
@@ -1159,7 +1866,7 @@ def check_line_correlations(line_property: str, lya_properties: list[str], lines
     line_property : str
         The line property to check (e.g. "EW", "FWHM").
     lya_properties : list[str]
-        List of Lyman alpha properties to check against (e.g. ["LYA_EW", "DISPR", "CONT", "ASYMR", 
+        List of Lyman alpha properties to check against (e.g. ["EW_LYA", "DISPR", "CONT", "ASYMR", 
         "FWHMR", "BRRATIO", "BRSEP"]).
     lines : list[str]
         List of lines to check (e.g. ["SiII1260", "CII1334", "SiIV1394", "SiIV1403", "CIV1548", 
@@ -1169,30 +1876,42 @@ def check_line_correlations(line_property: str, lya_properties: list[str], lines
         "SiIV1394", "SiIV1403"]).
     megatab : astropy.table.Table
         The megatable containing the data.
+    ax_in : matplotlib.axes.Axes, optional
+        An existing Axes object to plot on. If None, a new figure and axes will be created.
     min_points : int, optional
         Minimum number of points required to attempt fitting a correlation, by default 10.
     significance_thresh : float, optional
         P-value (or Bayesian equivalent) threshold for determining significant correlations, by default 0.01.
     mcmc : bool, optional
         Whether to use MCMC regression for fitting the correlation, by default True.
-    fit_upper_limits : bool, optional
-        Whether to attempt to fit upper limits for non-detections, by default False.
-    upper_limit : float, optional
-        The sigma level to use for upper limits, by default 3.0.
     logify : bool, optional
         Whether to log-transform the line property for fitting, by default False.
-    plot_upper_limits : bool, optional
-        Whether to plot upper limits for non-detections, by default False.
     save_fig : bool, optional
         Whether to save the figure, by default False.
     point_sig_thresh : float, optional
         The significance threshold (in sigma) for plotting individual points, by default 3.0
+    fit_upper_limits : bool, optional
+        Whether to include upper limits (in y values) in the fit. Default is False (only use detections).
     c : str, optional
         Name of the ``megatab`` column used to colour scatter-plot points. Default is ``'z'``
         (redshift). Pass ``None`` to disable point colouring.
     clip_extreme_errors : Optional[float], optional
         The threshold for clipping extreme error values in terms of the standard deviation of
         the corresponding data, by default None (no clipping).
+    sigma_clip : float, optional
+        If given, remove points more than this many standard deviations from the median along
+        either axis before fitting, by default None.
+    nn_clip : float, optional
+        If given, remove points whose mean distance to all other points in the
+        normalised (x / std_x, y / std_y) plane exceeds
+        ``median_mean_dist + nn_clip * MAD_mean_dist``.  Applied after sigma
+        clipping. By default None.
+    niter : int, optional
+        Minimum number of MCMC iterations per chain passed to :func:`do_linregress`, by default 5000
+        (~10,000 posterior samples). Increase for more reliable detection of weak signals.
+    plot_all : bool, optional
+        Whether to plot all pairs regardless of significance, or only those that pass the
+        threshold. Default is False (only plot significant pairs).
     **scatter_kwargs
         Additional keyword arguments forwarded to :func:`make_scatter` (e.g. ``cnorm='log'``,
         ``cmap``, ``vmin``, ``vmax``, ``show_colorbar``, ``clabel``).
@@ -1206,176 +1925,82 @@ def check_line_correlations(line_property: str, lya_properties: list[str], lines
     for line in lines:
         summaries[line] = {}
         for lya_prop in lya_properties:
+            lya_prop = normalise_prop(lya_prop)
             lya_col, lya_col_err = get_lya_property(megatab, lya_prop)
-
-            # Prepare line EW column
-            line_col, line_err = get_line_property(megatab, line, line_property, abs=line in abs_lines)
-
-            # Prepare mask
-            mask = prepare_scatter_mask(megatab, line, line_col, line_property, lya_col, lya_prop,
-                                               abs_lines, include_upper_limits=fit_upper_limits,
-                                               sig_thresh=point_sig_thresh)
+            line_col_raw, line_err_raw = get_line_property(megatab, line, line_property,
+                                                           abs=line in abs_lines,
+                                                           combine_doublets=combine_doublets)
             
-            # x-axis is Lya property, y-axis is line property
-            x_vals = lya_col[mask]
-            y_vals = line_col[mask]
-            x_errs = lya_col_err[mask]
-            y_errs = line_err[mask]
+            line_col = np.array(line_col_raw, dtype=float)
+            line_err_arr = np.array(line_err_raw, dtype=float)
+            delta = None
 
-            # Optionally clip points with extreme error bars before log-transform
-            if clip_extreme_errors is not None:
-                x_scatter = np.std(x_vals)
-                y_scatter = np.std(y_vals)
-                error_mask = (x_errs < clip_extreme_errors * x_scatter) & (y_errs < clip_extreme_errors * y_scatter)
-                if np.sum(error_mask) < min_points:
-                    print(f"Warning: Clipping extreme errors with threshold {clip_extreme_errors}\u03c3 leaves fewer than "
-                          f"{min_points} points for {line} {line_property} vs {lya_prop}. Skipping correlation analysis.")
-                    continue
-                x_vals = x_vals[error_mask]
-                y_vals = y_vals[error_mask]
-                x_errs = x_errs[error_mask]
-                y_errs = y_errs[error_mask]
-                print(f"Clipped extreme errors with threshold {clip_extreme_errors}\u03c3, leaving {len(x_vals)} points "
-                      f"for {line} {line_property} vs {lya_prop}.")
-                mask[mask] = mask[mask] & error_mask
+            mask = _prepare_scatter_mask(megatab, line, line_col_raw, line_property,
+                                        lya_col, lya_prop,
+                                        abs_lines, sig_thresh=point_sig_thresh,
+                                        combine_doublets=combine_doublets)
 
-            # Re-initialise detection mask after any clipping so its length matches y_vals
-            det_mask = np.ones_like(y_vals, dtype=bool)
-            
-            # Generate a boolean array for the upper limits and replace any such values with 
-            # the specified sigma upper limit value
-            nondet_mask = np.zeros_like(y_vals, dtype=bool)
             if fit_upper_limits:
-                 # Identify non-detections based on the specified sigma threshold
-                nondet_mask = y_vals < upper_limit * y_errs
-                # Identify detections based on the specified sigma threshold
-                det_mask = y_vals >= upper_limit * y_errs
-                # Ensure that n_det + n_nondet = total number of points after masking
-                assert np.sum(det_mask) + np.sum(nondet_mask) == len(y_vals), \
-                        "Error in non-detection masking: number of detections + non-detections does not" \
-                        " equal total number of points after masking."
-                y_vals[~det_mask] = upper_limit * y_errs[~det_mask]  # Replace non-detections with specified sigma upper limit
- 
-            # Transform EWs and FWHMs/DISP into log space
-            plot_log_x = False
-            plot_log_y = False
-            if lya_prop in _log_quantities and logify:
-                x_vals_orig = x_vals.copy()  # Keep a copy of the original values for error transformation
-                x_vals = np.log10(x_vals)
-                x_errs = x_errs / (x_vals_orig * np.log(10))
-                plot_log_x = True
-            if line_property in _log_quantities and logify:
-                y_vals_orig = y_vals.copy()  # Keep a copy of the original values for error transformation
-                y_vals = np.log10(y_vals)
-                y_errs = y_errs / (y_vals_orig * np.log(10))
-                plot_log_y = True
+                line_col, delta = _insert_upper_limits(megatab, line, line_col_raw, line_err_raw,
+                                                       abs_lines, line_prop=line_property,
+                                                       sig_thresh=point_sig_thresh,
+                                                       combine_doublets=combine_doublets)
+                mask = _prepare_scatter_mask(megatab, line, line_col, line_property,
+                                            lya_col, lya_prop,
+                                            abs_lines, delta=delta,
+                                            sig_thresh=point_sig_thresh,
+                                            combine_doublets=combine_doublets)
 
-            # Raise error if there are negative error bars in log space, which can happen if there are negative 
-            # values or values consistent with zero.
-            if np.any(x_errs < 0) or np.any(y_errs < 0):
-                print(f"Warning: Negative error bars detected for {line} {line_property} vs {lya_prop}. Skipping"
-                    " correlation analysis.")
-                print(x_errs[x_errs < 0], y_errs[y_errs < 0])
-                continue
-
-            # Make scatter plot
-            fig, ax = plt.subplots(figsize=(6, 4))
-
-            make_scatter(
-                [x_vals, x_errs],
-                [y_vals, y_errs],
-                ax=ax,
-                c=megatab[c][mask] if c is not None else None,
-                upper_bounds = nondet_mask,
-                **scatter_kwargs
+            result = _correlate_pair(
+                lya_col[mask], lya_col_err[mask],
+                line_col[mask], line_err_arr[mask],
+                x_prop=lya_prop, y_prop=line_property,
+                x_label=plot.get_plot_name(lya_prop),
+                y_label=f"{plot.get_plot_name(line)} {plot.get_plot_name(line_property)}",
+                title=(f"{plot.get_plot_name(line, unit=False)} "
+                       f"{plot.get_plot_name(line_property, unit=False)} "
+                       f"vs {plot.get_plot_name(lya_prop, unit=False)}"),
+                pair_label=f"{line} {line_property} vs {lya_prop}",
+                ax_in=ax_in,
+                c_col=megatab[c][mask] if c is not None else None,
+                c_label=plot.get_plot_name(c) if c is not None else None,
+                delta=delta[mask] if delta is not None else None,
+                logify=logify,
+                min_points=min_points,
+                significance_thresh=significance_thresh,
+                clip_extreme_errors=clip_extreme_errors,
+                sigma_clip=sigma_clip,
+                nn_clip=nn_clip,
+                mcmc=mcmc,
+                niter=niter,
+                save_fig=save_fig,
+                fig_path=f"plots/{line}_{line_property}_vs_{lya_prop}.png",
+                plot_all=plot_all,
+                **scatter_kwargs,
             )
-
-            # Only attempt to fit a line if there are enough valid points after masking to avoid unreliable
-            #  fits and overinterpreting small number statistics
-            if np.sum(mask) >= min_points:
-
-                # Final check on data quality: look for NaNs, negative error bars, or infinite values
-                if any(np.any(np.isnan(arr)) for arr in [x_vals, y_vals, x_errs, y_errs]):
-                    print(f"Warning: NaN values detected in data for {line} {line_property} vs {lya_prop}. Skipping"
-                        " correlation analysis.")
-                    plt.close(fig)
-                    continue
-                if any(np.any(np.isinf(arr)) for arr in [x_vals, y_vals, x_errs, y_errs]):
-                    print(f"Warning: Infinite values detected in data for {line} {line_property} vs {lya_prop}. Skipping"
-                        " correlation analysis.")
-                    plt.close(fig)
-                    continue
-                if np.any(x_errs < 0) or np.any(y_errs < 0):
-                    print(f"Warning: Negative error bars detected for {line} {line_property} vs {lya_prop}. Skipping"
-                        " correlation analysis.")
-                    plt.close(fig)
-                    continue
-
-                # Do a preliminary fit to pre-screen for significant correlations before attempting the more computationally expensive MCMC fit
-                _, _, _, prelim_p_value, _ = linregress(x_vals[det_mask], y_vals[det_mask])
-                if prelim_p_value >= significance_thresh:
-                    print(f"No significant correlation found for {line} {line_property} vs {lya_prop} (prelim p={prelim_p_value:.3e}). Skipping MCMC fit.")
-                    plt.close(fig)  # Close the plot if not significant to avoid clutter
-                    continue
-                elif prelim_p_value < significance_thresh and mcmc:
-                    print(f"Preliminary fit suggests significant correlation for {line} {line_property} vs "
-                        f"{lya_prop} (prelim p={prelim_p_value:.3e}). Proceeding with MCMC fit.")
-                elif prelim_p_value < significance_thresh and not mcmc:
-                    print(f"Preliminary fit suggests significant correlation for {line} {line_property} vs "
-                        f"{lya_prop} (prelim p={prelim_p_value:.3e}). Proceeding with ODR fit.")
-
-                # Fit line to original data with MCMC: line_property (y) vs lya_property (x)
-                slope, intercept, slope_err, intercept_err, p_value = do_linregress(x_vals, y_vals, x_errs, y_errs, 
-                                                                                    delta=det_mask, mcmc=mcmc,
-                                                                                    ax_in=ax, log_transformed=plot_log_y)
-            
-                # Plot best-fit line
-                print(f"Correlation for {line} {line_property} vs {lya_prop}: slope={slope:.2f}±{slope_err:.2f}, "
-                    f"intercept={intercept:.2f}±{intercept_err:.2f}, p={p_value:.3e}")
-                x_fit = np.linspace(np.min(x_vals), np.max(x_vals), 100)
-                y_fit = slope * x_fit + intercept
-                ax.plot(x_fit, y_fit, color='red', 
-                        label=f"Slope={slope:.2f}±{slope_err:.2f}\n"
-                        f"Intercept={intercept:.2f}±{intercept_err:.2f}\n"
-                        f"(p={p_value:.3e})")
-                ax.legend()
-            else:
-                print(f"Not enough points to fit line for {line} {line_property} vs {lya_prop} (n={np.sum(mask)})")
-                plt.close(fig)  # Close the plot if not enough points to avoid clutter
-                continue
-
-
-            ax.set_xlabel(f"{'log ' if plot_log_x else ''}{plot.get_plot_name(lya_prop)}")
-            ax.set_ylabel(f"{'log ' if plot_log_y else ''}{plot.get_plot_name(line)} {plot.get_plot_name(line_property)}")
-            ax.set_title(f"{plot.get_plot_name(line, unit=False)} {plot.get_plot_name(line_property, unit=False)} "
-                         f"vs {plot.get_plot_name(lya_prop, unit=False)}")
-
-            # ax.set_xscale('log') if plot_log_x else ax.set_xscale('linear')
-            # if np.size(line_col[mask]) > 0:  # Only set yscale if there are valid points to avoid warnings
-            #     ax.set_yscale('log') if plot_log_y else ax.set_yscale('linear')
-
-            if save_fig:
-                fig.savefig(f"plots/{line}_{line_property}_vs_{lya_prop}.png", dpi=300, bbox_inches='tight')
-
-            plt.show()
-
-            summaries[line][lya_prop] = {
-                'slope': slope,
-                'slope_err': slope_err,
-                'intercept': intercept,
-                'intercept_err': intercept_err,
-                'p_value': p_value,
-                'n_points': np.sum(mask)
-            }
+            if result is not None:
+                summaries[line][lya_prop] = result
     return summaries
 
 
-def check_lya_correlations(lya_properties_y: list[str], lya_properties_x: list[str],
-                            megatab: Table, min_points: int = 10,
-                            significance_thresh: float = 0.01, mcmc: bool = True,
-                            logify: bool = False, save_fig: bool = False,
-                            point_sig_thresh: float = 3.0, clip_extreme_errors: Optional[float] = None,
-                            c: Optional[str] = 'z', **scatter_kwargs) -> dict:
+def check_lya_correlations(
+        lya_properties_y: list[str], lya_properties_x: list[str],
+        megatab: Table, 
+        min_points: int = 10,
+        significance_thresh: float = 0.01, 
+        mcmc: bool = True,
+        logify: bool = False, 
+        save_fig: bool = False,
+        point_sig_thresh: float = 3.0, 
+        clip_extreme_errors: Optional[float] = None,
+        sigma_clip: Optional[float] = None,
+        nn_clip: Optional[float] = None,
+        c: Optional[str] = 'z', 
+        niter: int = 5000, 
+        plot_all: bool = False, 
+        ax_in: Optional[matplotlib.axes.Axes] = None,
+        **scatter_kwargs
+    ) -> dict:
     """
     Check for correlations between pairs of Lyman alpha properties.
 
@@ -1387,7 +2012,7 @@ def check_lya_correlations(lya_properties_y: list[str], lya_properties_x: list[s
     lya_properties_y : list[str]
         Lyman alpha properties to place on the y-axis (e.g. ["FWHMR", "DISPR", "ASYMR"]).
     lya_properties_x : list[str]
-        Lyman alpha properties to place on the x-axis (e.g. ["LYA_EW", "CONT", "BRRATIO"]).
+        Lyman alpha properties to place on the x-axis (e.g. ["EW_LYA", "CONT", "BRRATIO"]).
     megatab : astropy.table.Table
         The megatable containing the data.
     min_points : int, optional
@@ -1405,9 +2030,25 @@ def check_lya_correlations(lya_properties_y: list[str], lya_properties_x: list[s
     clip_extreme_errors : Optional[float], optional
         The threshold for clipping extreme error values in terms of the standard deviation of
         the corresponding data, by default None (no clipping).
+    sigma_clip : float, optional
+        If given, remove points more than this many standard deviations from the median along
+        either axis before fitting, by default None.
+    nn_clip : float, optional
+        If given, remove points whose mean distance to all other points in the
+        normalised (x / std_x, y / std_y) plane exceeds
+        ``median_mean_dist + nn_clip * MAD_mean_dist``.  Applied after sigma
+        clipping. By default None.
     c : str, optional
         Name of the ``megatab`` column used to colour scatter-plot points. Default is ``'z'``
         (redshift). Pass ``None`` to disable point colouring.
+    niter : int, optional
+        Minimum number of MCMC iterations per chain passed to :func:`do_linregress`, by default 5000
+        (~10,000 posterior samples). Increase for more reliable detection of weak signals.
+    plot_all : bool, optional
+        Whether to plot all pairs regardless of significance, or only those that pass the 
+        threshold. Default is False (only plot significant pairs).
+    ax_in : matplotlib.axes.Axes, optional
+        An existing Axes object to plot on. If None, a new figure and axes will be created. Default is None.
     **scatter_kwargs
         Additional keyword arguments forwarded to :func:`make_scatter` (e.g. ``cnorm='log'``,
         ``cmap``, ``vmin``, ``vmax``, ``show_colorbar``, ``clabel``).
@@ -1418,31 +2059,16 @@ def check_lya_correlations(lya_properties_y: list[str], lya_properties_x: list[s
         A nested dictionary ``summaries[lya_prop_y][lya_prop_x]`` containing the correlation
         summaries (slope, intercept, errors, p-value, n_points) for each pair.
     """
-    def _lya_mask(megatab, prop, col, sig_thresh):
-        """Build a quality mask for a single Lya property column."""
-        mask = np.isfinite(col)
-        if prop in ["LYA_EW", "CONT", "EW", "LUM_CONT_LYA"]:
-            mask &= (megatab['CONT'] / megatab['CONT_ERR'] > sig_thresh)
-        if prop in ["ASYMR", "DELTAV_LYA", "FWHMR", "DISPR", "VEXP_ZELDA"]:
-            mask &= col > 0
-        if prop == 'ASYMR':
-            mask &= col < 0.3
-        if prop in ["BRRATIO", "FLUXB", "ASYMB", "FWHMB", "DISPB", "BRSEP"]:
-            mask &= (megatab["FLUXB"] / megatab["FLUXB_ERR"] > sig_thresh)
-        if prop in ["VEXP_ZELDA"]:
-            mask &= (megatab[prop] - 3 * megatab['VEXP_ERRM_ZELDA'] > 0)
-        return mask
-
     summaries = {}
     seen_pairs = set()
     for prop_y in lya_properties_y:
+        prop_y = normalise_prop(prop_y)
         summaries[prop_y] = {}
         for prop_x in lya_properties_x:
-            # Skip trivial self-correlations
+            prop_x = normalise_prop(prop_x)
             if prop_x == prop_y:
                 print(f"Skipping trivial self-correlation: {prop_y} vs {prop_x}.")
                 continue
-            # Skip duplicate pairs (e.g. (A, B) already computed as (B, A))
             pair = frozenset((prop_x, prop_y))
             if pair in seen_pairs:
                 print(f"Skipping duplicate pair: {prop_y} vs {prop_x}.")
@@ -1451,131 +2077,207 @@ def check_lya_correlations(lya_properties_y: list[str], lya_properties_x: list[s
 
             x_col, x_col_err = get_lya_property(megatab, prop_x)
             y_col, y_col_err = get_lya_property(megatab, prop_y)
+            mask = (_lya_quality_mask(megatab, prop_x, x_col, point_sig_thresh)
+                  & _lya_quality_mask(megatab, prop_y, y_col, point_sig_thresh)
+                  & np.isfinite(x_col) & np.isfinite(y_col)
+                  & np.isfinite(x_col_err) & np.isfinite(y_col_err))
 
-            mask = _lya_mask(megatab, prop_x, x_col, point_sig_thresh) \
-                 & _lya_mask(megatab, prop_y, y_col, point_sig_thresh)
-            
-            mask &= np.isfinite(x_col) & np.isfinite(y_col)  # Ensure both x and y are finite for valid points
-            mask &= np.isfinite(x_col_err) & np.isfinite(y_col_err)  # Ensure error bars are finite for valid points
-
-            x_vals = x_col[mask]
-            y_vals = y_col[mask]
-            x_errs = x_col_err[mask]
-            y_errs = y_col_err[mask]
-
-            # Optionally clip points which have error bars so large that it exceeds the scatter of the actual
-            # data itself, in which case they are not very informative for the correlation analysis and can cause issues for MCMC convergence
-            if clip_extreme_errors is not None:
-                x_scatter = np.std(x_vals)
-                y_scatter = np.std(y_vals)
-                error_mask = (x_errs < clip_extreme_errors * x_scatter) & (y_errs < clip_extreme_errors * y_scatter)
-                if np.sum(error_mask) < min_points:
-                    print(f"Warning: Clipping extreme errors with threshold {clip_extreme_errors}σ leaves fewer than {min_points} points for {prop_y} vs {prop_x}. Skipping correlation analysis.")
-                    continue
-                x_vals = x_vals[error_mask]
-                y_vals = y_vals[error_mask]
-                x_errs = x_errs[error_mask]
-                y_errs = y_errs[error_mask]
-                print(f"Clipped extreme errors with threshold {clip_extreme_errors}σ, leaving {len(x_vals)} points for {prop_y} vs {prop_x}.")
-                mask[mask] = mask[mask] & error_mask  # Update the original mask to reflect the clipping for accurate n_points count in summaries
-
-            # Transform into log space if requested
-            plot_log_x = False
-            plot_log_y = False
-            if prop_x in _log_quantities and logify:
-                x_vals_orig = x_vals.copy()
-                x_vals = np.log10(x_vals)
-                x_errs = x_errs / (x_vals_orig * np.log(10))
-                plot_log_x = True
-            if prop_y in _log_quantities and logify:
-                y_vals_orig = y_vals.copy()
-                y_vals = np.log10(y_vals)
-                y_errs = y_errs / (y_vals_orig * np.log(10))
-                plot_log_y = True
-
-            if np.any(x_errs < 0) or np.any(y_errs < 0):
-                print(f"Warning: Negative error bars detected for {prop_y} vs {prop_x}. Skipping"
-                      " correlation analysis.")
-                print(x_errs[x_errs < 0], y_errs[y_errs < 0])
-                continue
-
-            # Make scatter plot
-            fig, ax = plt.subplots(figsize=(6, 4))
-
-            make_scatter(
-                [x_vals, x_errs],
-                [y_vals, y_errs],
-                ax=ax,
-                c=megatab[c][mask] if c is not None else None,
-                **scatter_kwargs
+            result = _correlate_pair(
+                x_col[mask], x_col_err[mask],
+                y_col[mask], y_col_err[mask],
+                x_prop=prop_x, y_prop=prop_y,
+                x_label=plot.get_plot_name(prop_x),
+                y_label=plot.get_plot_name(prop_y),
+                title=(f"{plot.get_plot_name(prop_y, unit=False)} "
+                       f"vs {plot.get_plot_name(prop_x, unit=False)}"),
+                pair_label=f"{prop_y} vs {prop_x}",
+                c_col=megatab[c][mask] if c is not None else None,
+                c_label=plot.get_plot_name(c) if c is not None else None,
+                logify=logify,
+                min_points=min_points,
+                significance_thresh=significance_thresh,
+                clip_extreme_errors=clip_extreme_errors,
+                sigma_clip=sigma_clip,
+                nn_clip=nn_clip,
+                mcmc=mcmc,
+                niter=niter,
+                save_fig=save_fig,
+                fig_path=f"plots/{prop_y}_vs_{prop_x}.png",
+                plot_all=plot_all,
+                ax_in=ax_in,
+                **scatter_kwargs,
             )
+            if result is not None:
+                summaries[prop_y][prop_x] = result
+    return summaries
 
-            if np.sum(mask) >= min_points:
 
-                # Final check on data quality
-                if any(np.any(np.isnan(arr)) for arr in [x_vals, y_vals, x_errs, y_errs]):
-                    print(f"Warning: NaN values detected in data for {prop_y} vs {prop_x}. Skipping"
-                          " correlation analysis.")
-                    plt.close(fig)
-                    continue
-                if any(np.any(np.isinf(arr)) for arr in [x_vals, y_vals, x_errs, y_errs]):
-                    print(f"Warning: Infinite values detected in data for {prop_y} vs {prop_x}. Skipping"
-                          " correlation analysis.")
-                    plt.close(fig)
-                    continue
-                if np.any(x_errs < 0) or np.any(y_errs < 0):
-                    print(f"Warning: Negative error bars detected for {prop_y} vs {prop_x}. Skipping"
-                          " correlation analysis.")
-                    plt.close(fig)
-                    continue
+def check_line_line_correlations(
+        property_x: str, lines_x: list[str],
+        property_y: str, lines_y: list[str],
+        abs_lines: list[str], megatab: Table,
+        min_points: int = 10,
+        significance_thresh: float = 0.01,
+        mcmc: bool = True,
+        logify: bool = False,
+        save_fig: bool = False,
+        point_sig_thresh: float = 3.0,
+        c: Optional[str] = 'z',
+        clip_extreme_errors: Optional[float] = None,
+        combine_doublets: bool = True,
+        sigma_clip: Optional[float] = None,
+        nn_clip: Optional[float] = None,
+        niter: int = 5000,
+        plot_all: bool = False,
+        fit_upper_limits: bool = False,
+        ax_in: Optional[matplotlib.axes.Axes] = None,
+        **scatter_kwargs,
+) -> dict:
+    """
+    Check for correlations between a property of one set of lines and a property
+    of another set of lines.
 
-                # Preliminary OLS screen
-                _, _, _, prelim_p_value, _ = linregress(x_vals, y_vals)
-                if prelim_p_value >= significance_thresh:
-                    print(f"No significant correlation found for {prop_y} vs {prop_x} "
-                          f"(prelim p={prelim_p_value:.3e}). Skipping MCMC fit.")
-                    plt.close(fig)
-                    continue
-                elif prelim_p_value < significance_thresh and mcmc:
-                    print(f"Preliminary fit suggests significant correlation for {prop_y} vs "
-                          f"{prop_x} (prelim p={prelim_p_value:.3e}). Proceeding with MCMC fit.")
-                else:
-                    print(f"Preliminary fit suggests significant correlation for {prop_y} vs "
-                          f"{prop_x} (prelim p={prelim_p_value:.3e}). Proceeding with ODR fit.")
+    Parameters
+    ----------
+    property_x : str
+        Line property for the x-axis (e.g. ``"EW"``).
+    lines_x : list[str]
+        Lines to iterate over for the x-axis.
+    property_y : str
+        Line property for the y-axis (e.g. ``"FWHM"``).
+    lines_y : list[str]
+        Lines to iterate over for the y-axis.
+    abs_lines : list[str]
+        Lines treated as absorption (SNR sign-flipped for masking).
+    megatab : astropy.table.Table
+        The megatable.
+    min_points : int, optional
+        Minimum number of points required to attempt a fit, by default 10.
+    significance_thresh : float, optional
+        OLS pre-screening p-value threshold, by default 0.01.
+    mcmc : bool, optional
+        Use LinMix MCMC; falls back to ODR if False, by default True.
+    logify : bool, optional
+        Log-transform axes whose property appears in ``_log_quantities``,
+        by default False.
+    save_fig : bool, optional
+        Save each figure, by default False.
+    point_sig_thresh : float, optional
+        SNR threshold for quality masking, by default 3.0.
+    c : str, optional
+        Column name for scatter point colouring. Default ``'z'``; pass
+        ``None`` to disable.
+    clip_extreme_errors : float, optional
+        Clip points whose error exceeds this multiple of the scatter,
+        by default None.
+    combine_doublets : bool, optional
+        Combine doublet components for additive properties, by default True.
+    sigma_clip : float, optional
+        If given, remove points more than this many standard deviations from the median along
+        either axis before fitting, by default None.
+    nn_clip : float, optional
+        If given, remove points whose mean distance to all other points in the
+        normalised (x / std_x, y / std_y) plane exceeds
+        ``median_mean_dist + nn_clip * MAD_mean_dist``.  Applied after sigma
+        clipping. By default None.
+    niter : int, optional
+        Minimum MCMC iterations per chain, by default 5000
+        (~10,000 posterior samples).
+    plot_all : bool, optional
+        Whether to plot all pairs regardless of significance, or only those that pass the 
+        threshold. Default is False (only plot significant pairs).
+    fit_upper_limits : bool, optional
+        Whether to include upper limits for non-detections on the y-axis, using bootstrapped
+        ``FLUX_UB`` columns to derive EW upper limits. Only applies when ``property_y == 'EW'``
+        (or whichever property has ``FLUX_UB`` columns). The x-axis always requires detections.
+        Default False.
+    ax_in : matplotlib.axes.Axes, optional
+        An existing Axes object to plot on. If None, a new figure and axes will be created. Default is None.
+    **scatter_kwargs
+        Forwarded to :func:`make_scatter`.
 
-                slope, intercept, slope_err, intercept_err, p_value = do_linregress(
-                    x_vals, y_vals, x_errs, y_errs, mcmc=mcmc,
-                    ax_in=ax, log_transformed=plot_log_y)
-
-                print(f"Correlation for {prop_y} vs {prop_x}: slope={slope:.2f}±{slope_err:.2f}, "
-                      f"intercept={intercept:.2f}±{intercept_err:.2f}, p={p_value:.3e}")
-                x_fit = np.linspace(np.min(x_vals), np.max(x_vals), 100)
-                y_fit = slope * x_fit + intercept
-                ax.plot(x_fit, y_fit, color='red',
-                        label=f"Slope={slope:.2f}±{slope_err:.2f}\n"
-                              f"Intercept={intercept:.2f}±{intercept_err:.2f}\n"
-                              f"(p={p_value:.3e})")
-                ax.legend()
-            else:
-                print(f"Not enough points to fit line for {prop_y} vs {prop_x} (n={np.sum(mask)})")
-                plt.close(fig)
+    Returns
+    -------
+    dict
+        Nested ``summaries[line_y][line_x]`` containing slope, intercept,
+        errors, p-value, and n_points for each pair that passed the
+        pre-screen.
+    """
+    summaries = {}
+    for line_y in lines_y:
+        summaries[line_y] = {}
+        for line_x in lines_x:
+            if line_x == line_y and property_x == property_y:
+                print(f"Skipping trivial self-correlation: {line_y} {property_y}.")
                 continue
 
-            ax.set_xlabel(f"{'log ' if plot_log_x else ''}{plot.get_plot_name(prop_x)}")
-            ax.set_ylabel(f"{'log ' if plot_log_y else ''}{plot.get_plot_name(prop_y)}")
-            ax.set_title(f"{plot.get_plot_name(prop_y, unit=False)} vs {plot.get_plot_name(prop_x, unit=False)}")
+            x_col, x_err = get_line_property(megatab, line_x, property_x,
+                                              abs=line_x in abs_lines,
+                                              combine_doublets=combine_doublets)
+            y_col_raw, y_err_raw = get_line_property(megatab, line_y, property_y,
+                                                     abs=line_y in abs_lines,
+                                                     combine_doublets=combine_doublets)
 
-            if save_fig:
-                fig.savefig(f"plots/{prop_y}_vs_{prop_x}.png", dpi=300, bbox_inches='tight')
+            y_col = np.array(y_col_raw, dtype=float)
+            y_err = np.array(y_err_raw, dtype=float)
+            delta = None
 
-            plt.show()
+            # Build independent quality masks for each line then combine.
+            # Pass lya_prop='' so Lya-specific quality cuts in _prepare_scatter_mask
+            # (Lya continuum SNR, positivity, blue-peak) never fire here.
+            # x-axis always requires detections; y-axis optionally admits upper limits.
+            mask_x = _prepare_scatter_mask(megatab, line_x, x_col, property_x,
+                                           x_col, '',
+                                           abs_lines, include_upper_limits=False,
+                                           sig_thresh=point_sig_thresh,
+                                           combine_doublets=combine_doublets)
+            if fit_upper_limits:
+                y_col, delta = _insert_upper_limits(megatab, line_y, y_col_raw, y_err_raw,
+                                                    abs_lines, line_prop=property_y,
+                                                    sig_thresh=point_sig_thresh,
+                                                    combine_doublets=combine_doublets)
+                mask_y = _prepare_scatter_mask(megatab, line_y, y_col, property_y,
+                                               y_col, '',
+                                               abs_lines, delta=delta,
+                                               sig_thresh=point_sig_thresh,
+                                               combine_doublets=combine_doublets)
+            else:
+                mask_y = _prepare_scatter_mask(megatab, line_y, y_col, property_y,
+                                               y_col, '',
+                                               abs_lines, include_upper_limits=False,
+                                               sig_thresh=point_sig_thresh,
+                                               combine_doublets=combine_doublets)
 
-            summaries[prop_y][prop_x] = {
-                'slope': slope,
-                'slope_err': slope_err,
-                'intercept': intercept,
-                'intercept_err': intercept_err,
-                'p_value': p_value,
-                'n_points': np.sum(mask)
-            }
+            mask = mask_x & mask_y
+
+            result = _correlate_pair(
+                x_col[mask], x_err[mask],
+                y_col[mask], y_err[mask],
+                x_prop=property_x, y_prop=property_y,
+                x_label=f"{plot.get_plot_name(line_x)} {plot.get_plot_name(property_x)}",
+                y_label=f"{plot.get_plot_name(line_y)} {plot.get_plot_name(property_y)}",
+                title=(f"{plot.get_plot_name(line_y, unit=False)} "
+                       f"{plot.get_plot_name(property_y, unit=False)} "
+                       f"vs {plot.get_plot_name(line_x, unit=False)} "
+                       f"{plot.get_plot_name(property_x, unit=False)}"),
+                pair_label=f"{line_y} {property_y} vs {line_x} {property_x}",
+                c_col=megatab[c][mask] if c is not None else None,
+                c_label=plot.get_plot_name(c) if c is not None else None,
+                delta=delta[mask] if delta is not None else None,
+                logify=logify,
+                min_points=min_points,
+                significance_thresh=significance_thresh,
+                clip_extreme_errors=clip_extreme_errors,
+                sigma_clip=sigma_clip,
+                nn_clip=nn_clip,
+                mcmc=mcmc,
+                niter=niter,
+                save_fig=save_fig,
+                fig_path=f"plots/{line_y}_{property_y}_vs_{line_x}_{property_x}.png",
+                plot_all=plot_all,
+                ax_in=ax_in,
+                **scatter_kwargs,
+            )
+            if result is not None:
+                summaries[line_y][line_x] = result
     return summaries

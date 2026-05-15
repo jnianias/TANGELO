@@ -9,6 +9,11 @@ import os
 import glob
 import re
 import numpy as np
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 from astropy.io import fits
 import astropy.table as aptb
 from pathlib import Path

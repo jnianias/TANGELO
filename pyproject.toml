@@ -19,10 +19,11 @@ dependencies = [
     "beautifulsoup4",
     "linmix",
     "tqdm",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "ruff", "python-dotenv"]
+dev = ["pytest", "ruff"]
 
 [tool.uv.sources]
 linmix = { git = "https://github.com/jmeyers314/linmix.git" }
