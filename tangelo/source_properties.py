@@ -3,6 +3,7 @@ Tools for computing and retrieving physical source properties from the megatable
 """
 
 import numpy as np
+import re
 from astropy.table import Table
 from astropy.cosmology import Planck18
 import astropy.units as u
@@ -13,6 +14,7 @@ from .constants import wavedict, doublets
 
 def flux_to_luminosity(flux: np.ndarray, flux_err: np.ndarray,
                        z: np.ndarray, mu: np.ndarray,
+                       mu_err: np.ndarray | None = None,
                        is_continuum: bool = False,
                        cosmo=Planck18) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -30,6 +32,9 @@ def flux_to_luminosity(flux: np.ndarray, flux_err: np.ndarray,
         Source redshifts.
     mu : np.ndarray
         Lensing magnification values. The intrinsic flux is flux / mu.
+    mu_err : np.ndarray, optional
+        Uncertainty on ``mu``. When provided, it is propagated in quadrature
+        with ``flux_err`` into the intrinsic flux uncertainty.
     is_continuum : bool, optional
         If True, treat ``flux`` as a flux density (per Å) and apply a (1+z)^{-1}
         K-correction to convert from observed-frame to rest-frame bandwidth.
@@ -62,9 +67,24 @@ def flux_to_luminosity(flux: np.ndarray, flux_err: np.ndarray,
     # -99 cannot become a catastrophically large error bar after scaling by 4πD_L².
     flux_err[flux_err <= 0] = np.nan
 
+    if mu_err is None:
+        print("Warning: no magnification uncertainty provided; only flux uncertainty will be propagated.")
+        mu_err_arr = np.zeros_like(mu, dtype=float)
+    else:
+        mu_err_arr = np.array(mu_err, dtype=float)
+        # Unphysical mu uncertainties are treated as missing.
+        mu_err_arr[mu_err_arr < 0] = np.nan
+
     # Lensing-corrected flux in physical units (erg/s/cm² or erg/s/cm²/Å)
-    f_intrinsic     = flux     / mu * 1e-20
-    f_intrinsic_err = flux_err / mu * 1e-20
+    f_intrinsic = flux / mu * 1e-20
+
+    # Propagate both measurement uncertainty and magnification uncertainty:
+    #   f_int = f / mu
+    #   sigma_f_int^2 = (sigma_f / mu)^2 + (f * sigma_mu / mu^2)^2
+    with np.errstate(divide='ignore', invalid='ignore'):
+        f_term = flux_err / mu
+        mu_term = (flux * mu_err_arr) / (mu**2)
+    f_intrinsic_err = np.sqrt(f_term**2 + mu_term**2) * 1e-20
 
     # Luminosity: L = 4π D_L² f
     factor = 4.0 * np.pi * dl_cm**2
@@ -253,6 +273,7 @@ def _line_luminosity(megatab: Table, line: str, is_continuum: bool) -> tuple[np.
     return flux_to_luminosity(
         megatab[flux_col].copy(), megatab[flux_err_col].copy(),
         np.asarray(megatab['z']), np.asarray(megatab['MU']),
+        mu_err=np.asarray(megatab['MU_ERR']) if 'MU_ERR' in megatab.colnames else None,
         is_continuum=is_continuum,
     )
 
@@ -297,6 +318,12 @@ def get_line_property(megatab: Table, line: str, prop: str,
     col_name = f"{prop}_{line}"
     err_name = f"{prop}_ERR_{line}"
 
+    # Exception for SNR, which has no error column
+    if prop == "SNR":
+        if col_name not in megatab.colnames:
+            raise ValueError(f"Column {col_name} not found in megatable.")
+        return megatab[col_name].copy(), None
+
     # Stacked absorption composites use a different column naming convention
     if line in ["LI_ABS", "HI_ABS", "TOT_ABS"]:
         return _line_stacked_abs(megatab, line, prop)
@@ -310,6 +337,7 @@ def get_line_property(megatab: Table, line: str, prop: str,
             return flux_to_luminosity(
                 flux_total, err_total,
                 np.asarray(megatab['z']), np.asarray(megatab['MU']),
+                mu_err=np.asarray(megatab['MU_ERR']) if 'MU_ERR' in megatab.colnames else None,
                 is_continuum=False,
             )
         else:  # EW
@@ -446,6 +474,7 @@ def _lya_total_luminosity(megatab: Table) -> tuple[np.ndarray, np.ndarray]:
     return flux_to_luminosity(
         flux_total, flux_total_err,
         np.asarray(megatab['z']), np.asarray(megatab['MU']),
+        mu_err=np.asarray(megatab['MU_ERR']) if 'MU_ERR' in megatab.colnames else None,
         is_continuum=False,
     )
 
@@ -495,8 +524,14 @@ def get_lya_property(megatab: Table, prop: str, rest_frame: bool = True,
         return flux_to_luminosity(
             megatab['CONT'].copy(), megatab['CONT_ERR'].copy(),
             np.asarray(megatab['z']), np.asarray(megatab['MU']),
+            mu_err=np.asarray(megatab['MU_ERR']) if 'MU_ERR' in megatab.colnames else None,
             is_continuum=True,
         )
+    elif prop in ["Z_LYA", "LYA_Z"]:
+        lya_z = megatab['LPEAKR'].copy() / 1215.67 - 1
+        lya_z_err = megatab['LPEAKR_ERR'].copy() / 1215.67
+        print(lya_z, lya_z_err)
+        return lya_z, lya_z_err
     elif prop in megatab.colnames:
         err_name = f"{prop}_ERR"
         if err_name in megatab.colnames:
@@ -567,3 +602,126 @@ def normalise_prop(prop: str) -> str:
             )
             return corrected
     return prop
+
+
+# ---------------------------------------------------------------------------
+# Private helpers for get_phot_property
+# ---------------------------------------------------------------------------
+
+_FILTER_PIVOT_WAVELENGTH_ANGSTROM: dict[str, float] = {
+    # HST ACS/WFC
+    "HST_F435W": 4325.0,
+    "HST_F606W": 5921.0,
+    "HST_F814W": 8045.0,
+    # HST WFC3/IR
+    "HST_F105W": 10551.0,
+    "HST_F125W": 12486.0,
+    "HST_F140W": 13923.0,
+    "HST_F160W": 15369.0,
+}
+
+
+def _infer_filter_wavelength_angstrom(filter_name: str) -> float:
+    """
+    Infer a filter's effective wavelength in Angstrom.
+
+    Tries a lookup table first, then falls back to parsing tokens like
+    ``F160W`` or ``F606W`` as nanometres and converting to Angstrom.
+    """
+    if filter_name in _FILTER_PIVOT_WAVELENGTH_ANGSTROM:
+        return _FILTER_PIVOT_WAVELENGTH_ANGSTROM[filter_name]
+
+    token = filter_name.split('_')[-1].upper()
+    match = re.match(r"^F(\d{3,4})[A-Z]*$", token)
+    if match:
+        wavelength_nm = float(match.group(1))
+        return wavelength_nm * 10.0
+
+    raise ValueError(
+        f"Could not infer effective wavelength for filter '{filter_name}'. "
+        "Add it to _FILTER_PIVOT_WAVELENGTH_ANGSTROM or use a standard filter token like F160W."
+    )
+
+
+def _mag_to_flux(mag: np.ndarray, mag_err: np.ndarray,
+                 filter_name: str) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert AB magnitude to flux density in codebase units of
+    1e-20 erg/s/cm²/Angstrom.
+    """
+    # AB definition gives f_nu in erg/s/cm^2/Hz.
+    f_nu = 10**(-0.4 * (mag + 48.6))
+
+    # Convert to f_lambda in erg/s/cm^2/Angstrom using c in Angstrom/s.
+    c_ang_per_s = 2.99792458e18
+    lambda_ang = _infer_filter_wavelength_angstrom(filter_name)
+    f_lambda_cgs = f_nu * c_ang_per_s / (lambda_ang**2)
+
+    # flux_to_luminosity expects continuum flux in units of 1e-20 cgs.
+    flux = f_lambda_cgs / 1e-20
+    flux_err = flux * (np.log(10) / 2.5) * mag_err
+    return flux, flux_err
+
+def _mag_to_luminosity(mag: np.ndarray, mag_err: np.ndarray,
+                      z: np.ndarray, mu: np.ndarray,
+                      mu_err: np.ndarray | None,
+                      filter_name: str,
+                      cosmo=Planck18) -> tuple[np.ndarray, np.ndarray]:
+    """Convert AB magnitude to intrinsic luminosity in erg/s/Å."""
+    flux, flux_err = _mag_to_flux(mag, mag_err, filter_name)
+    return flux_to_luminosity(
+        flux, flux_err, z, mu,
+        mu_err=mu_err,
+        is_continuum=True,
+        cosmo=cosmo,
+    )
+
+def get_phot_property(megatab: Table, filter: str, prop: str, 
+                      mag_type: str = "AUTO") -> tuple[np.ndarray, np.ndarray]:
+    """
+    Retrieve a photometric property for a given filter from the megatable.
+
+    Parameters
+    ----------
+    megatab : astropy.table.Table
+        The megatable containing the data.
+    filter : str
+        The photometric filter name (e.g., 'HST_F606W', 'HST_F814W').
+    prop : str
+        The property to retrieve. Supported values: 'MAG', 'FLUX', 'LUM'.
+    mag_type : str, optional
+        The type of magnitude to retrieve (e.g., 'AUTO', 'APER'). Default is 'AUTO'.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        The requested property column and its associated error column.
+    """
+    mag_col = f"MAG_{mag_type}_{filter}"
+    mag_err_col = f"MAGERR_{mag_type}_{filter}"
+    
+    if mag_col not in megatab.colnames or mag_err_col not in megatab.colnames:
+        raise ValueError(f"Required columns for {prop} of {filter} not found in megatable.")
+    
+    mag = np.asarray(megatab[mag_col], dtype=float)
+    mag_err = np.asarray(megatab[mag_err_col], dtype=float)
+
+    # Convert to NaN any unphysical magnitude values (e.g., sentinel values like -99)
+    mag = np.where(mag < -90, np.nan, mag)
+    mag_err = np.where(mag < -90, np.nan, mag_err)
+    mag = np.where(mag_err < 0, np.nan, mag)
+    mag_err = np.where(mag_err < 0, np.nan, mag_err)
+    mag = np.where(mag_err > 90, np.nan, mag)
+    mag_err = np.where(mag_err > 90, np.nan, mag_err)
+    
+    if prop == "MAG":
+        return mag, mag_err
+    elif prop == "FLUX":
+        return _mag_to_flux(mag, mag_err, filter)
+    elif prop == "LUM":
+        z = np.asarray(megatab['z'], dtype=float)
+        mu = np.asarray(megatab['MU'], dtype=float)
+        mu_err = np.asarray(megatab['MU_ERR'], dtype=float) if 'MU_ERR' in megatab.colnames else None
+        return _mag_to_luminosity(mag, mag_err, z, mu, mu_err, filter)
+    else:
+        raise ValueError(f"Unsupported property '{prop}' for photometry. Supported: 'MAG', 'FLUX', 'LUM'.")

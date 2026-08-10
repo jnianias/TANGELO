@@ -89,6 +89,8 @@ plot_names = {
     'MU': r'$ \mu $',
     'z': r'$ z $',
     'SNRR': r'SNR of red Ly$\alpha$ peak',
+    'Z_LYA': r'$z_{\text{Ly}\alpha}$',
+    'HST_F160W': r'HST F160W',
 }
 
 def get_plot_name(param, unit=True):
@@ -424,13 +426,21 @@ def lya_mod_plot(row, axin, eml=False, width=40, snr_threshold=3.0, velocity=Tru
     # Convert wavelength to velocity
     hiresvel = spectro.wave2vel(hireswl, l_lya, redshift=row['LPEAKR'] / l_lya - 1)
     
-    # Apply velocity offset if requested
-    if eml and 'DELTAV_LYA' in row:
-        hiresvel += row['DELTAV_LYA']
-    
     # Convert flux from wavelength space to velocity space (dλ/dv)
     dldv = np.ediff1d(hireswl, to_end=np.ediff1d(hireswl)[-1]) / np.ediff1d(hiresvel, to_end=np.ediff1d(hiresvel)[-1])
     
+    # Apply velocity offset if requested.
+    # Avoid container membership checks on table-row types: they can test values,
+    # not column names, and silently skip a valid DELTAV_LYA column.
+    if eml:
+        try:
+            deltav_lya = row['DELTAV_LYA']
+        except (KeyError, IndexError, TypeError, ValueError):
+            deltav_lya = np.nan
+
+        if np.isfinite(deltav_lya):
+            hiresvel += float(deltav_lya)
+
     # Plot the model
     if velocity:
         axin.plot(hiresvel[1:-1], dldv[1:-1] * hiresmod[1:-1], 
@@ -529,8 +539,8 @@ def plot_lya_fit_result(fit_result, iden, cluster, save_plots=False, plot_dir='.
              label=f'{basenames[baseline]} Baseline')
     
     plt.xlim(lya_peak - 50, lya_peak + 50)
-    plt.xlabel('Wavelength [\AA]')
-    plt.ylabel('Flux Density [$10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$\,\AA$^{-1}$]')
+    plt.xlabel(r'Wavelength [\AA]')
+    plt.ylabel(r'Flux Density [$10^{-20}$\,erg\,s$^{-1}$\,cm$^{-2}$\,\AA$^{-1}$]')
     plt.title(f"{cluster} {iden} " + r"Lyman-$\alpha$ Fit")
     plt.legend()
     

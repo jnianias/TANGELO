@@ -563,7 +563,7 @@ def make_histo(cola, colb, ax, filtsa = [], filtsb = [], erra = None, errb = Non
 
 from astropy.table import Table
 from .source_properties import (
-    get_line_property, get_lya_property, normalise_prop,
+    get_line_property, get_lya_property, get_phot_property, normalise_prop,
     _log_quantities, _known_line_tokens, flux_to_luminosity,
 )
 
@@ -617,6 +617,65 @@ def _effective_snr(megatab: Table, line: str, abs_lines: list[str],
             snr = np.sign(snr) * np.sqrt(snr**2 + snr2**2)
 
     return snr
+
+def _make_lya_mask(megatab: Table, lya_col: np.ndarray, lya_prop: str,
+                   sig_thresh: float = 3.0) -> np.ndarray:
+    """
+    Prepare a mask for scatter plot analysis based on Lyman alpha property.
+
+    Parameters
+    ----------
+    megatab : astropy.table.Table
+        The megatable containing the data.
+    lya_col : np.ndarray
+        The Lyman alpha property column.
+    lya_prop : str
+        The Lyman alpha property to analyze (e.g., "EW_LYA").
+    sig_thresh : float, optional
+        The significance threshold (in sigma) for including sources based on
+        their SNR. Default 3.0.
+
+    Returns
+    -------
+    np.ndarray
+        A boolean mask indicating valid data points for scatter plot analysis.
+    """
+
+    lya_mask = np.isfinite(lya_col)
+
+    # The remaining cuts are Lya-specific. Guard them so they don't fire when
+    # _prepare_scatter_mask is called from check_line_line_correlations with a
+    # non-Lya property name in the lya_prop slot.
+    _lya_props = {"EW_LYA", "CONT_LUM_LYA", "ASYMR", "DELTAV_LYA",
+                  "FWHMR", "DISPR", "VEXP_ZELDA", "BRRATIO", "FLUXB", "ASYMB",
+                  "FWHMB", "DISPB", "BRSEP", "LYA_Z", "Z_LYA"}
+    if lya_prop not in _lya_props:
+        # If lya_prop isn't in our list, raise a warning and return an all-True mask so that no sources are excluded based on Lya quality cuts.
+        print(f"Warning: Lya property '{lya_prop}' not recognized. No Lya-specific quality cuts will be applied.")
+        return lya_mask
+
+    # If fitting Lya EW, CONT, or continuum luminosity, require significant continuum detection to ensure reliable measurement
+    if lya_prop in ["EW_LYA", "CONT", "EW", "CONT_LUM_LYA"]:
+        lya_mask &= (megatab['CONT'] / megatab['CONT_ERR'] > sig_thresh)
+    
+    # Only take positive Lya ASYMR values to focus on sources with stronger red peaks, which are more likely to have reliable Lya EW measurements and be less affected by IGM absorption.
+    if lya_prop in ["ASYMR", "DELTAV_LYA", "FWHMR", "DISPR", "VEXP_ZELDA"]:
+        lya_mask &= lya_col > 0
+    if lya_prop == 'ASYMR':
+        # Mask outlier values of asymmetry (above 0.3)
+        lya_mask &= lya_col < 0.5
+
+    if lya_prop in ["BRRATIO", "FLUXB", "ASYMB", "FWHMB", "DISPB"]:
+        # Mask insignificant blue peaks
+        lya_mask &= (megatab["FLUXB"] / megatab["FLUXB_ERR"] > sig_thresh)
+        lya_mask &= megatab['z'] < 4 # At z>4, the blue peak is often completely absorbed by the IGM, so we exclude those sources when analyzing blue peak properties to avoid biasing the results with unreliable measurements.
+
+    if lya_prop in ["Z_LYA", "LYA_Z"]:
+        # Mask sources with unreliable Lya redshift measurements
+        lya_mask &= (megatab['Z_LYA_ERR'] / megatab['Z_LYA'] < 0.1) # Require relative error on Z_LYA to be less than 1%
+        lya_mask &= (megatab['Z_LYA'] > 0) # Ensure Z_LYA is positive
+
+    return lya_mask
 
 
 def _prepare_scatter_mask(megatab: Table, line: str, line_col: np.ndarray, line_prop: str,
@@ -678,6 +737,9 @@ def _prepare_scatter_mask(megatab: Table, line: str, line_col: np.ndarray, line_
     if is_stacked_abs:
         # Calculate SNR based on EW and mask
         mask &= -megatab[f"EW_{line}"] / megatab[f"EW_{line}_ERR"] > sig_thresh
+        lya_mask = _make_lya_mask(megatab, lya_col, lya_prop,
+                                  sig_thresh=sig_thresh)
+        mask &= lya_mask
         return mask
 
     is_abs = line in abs_lines
@@ -713,31 +775,11 @@ def _prepare_scatter_mask(megatab: Table, line: str, line_col: np.ndarray, line_
         if _line2_flag in megatab.colnames:
             mask &= (megatab[_line2_flag] == '') | is_upper_limit
 
-    # The remaining cuts are Lya-specific. Guard them so they don't fire when
-    # _prepare_scatter_mask is called from check_line_line_correlations with a
-    # non-Lya property name in the lya_prop slot.
-    _lya_props = {"EW_LYA", "CONT_LUM_LYA", "ASYMR", "DELTAV_LYA",
-                  "FWHMR", "DISPR", "VEXP_ZELDA", "BRRATIO", "FLUXB", "ASYMB",
-                  "FWHMB", "DISPB", "BRSEP"}
-    if lya_prop not in _lya_props:
-        return mask
-
-    # If fitting Lya EW, CONT, or continuum luminosity, require significant continuum detection to ensure reliable measurement
-    if lya_prop in ["EW_LYA", "CONT", "EW", "CONT_LUM_LYA"]:
-        mask &= (megatab['CONT'] / megatab['CONT_ERR'] > sig_thresh)
+    # Do Lyman alpha masking
+    lya_mask = _make_lya_mask(megatab, lya_col, lya_prop,
+                              sig_thresh=sig_thresh)
+    mask &= lya_mask
     
-    # Only take positive Lya ASYMR values to focus on sources with stronger red peaks, which are more likely to have reliable Lya EW measurements and be less affected by IGM absorption.
-    if lya_prop in ["ASYMR", "DELTAV_LYA", "FWHMR", "DISPR", "VEXP_ZELDA"]:
-        mask &= lya_col > 0
-    if lya_prop == 'ASYMR':
-        # Mask outlier values of asymmetry (above 0.3)
-        mask &= lya_col < 0.3
-
-    if lya_prop in ["BRRATIO", "FLUXB", "ASYMB", "FWHMB", "DISPB"]:
-        # Mask insignificant blue peaks
-        mask &= (megatab["FLUXB"] / megatab["FLUXB_ERR"] > sig_thresh)
-        mask &= megatab['z'] < 4 # At z>4, the blue peak is often completely absorbed by the IGM, so we exclude those sources when analyzing blue peak properties to avoid biasing the results with unreliable measurements.
-
     return mask
 
 
@@ -755,8 +797,8 @@ def get_mcmc_p_value(chain: np.ndarray) -> float:
     prob_positive = np.mean(chain['beta'] > 0)
     prob_negative = 1 - prob_positive
 
-    # For two-tailed test, this is the probability of the opposite sign
-    p_value = 2 * min(prob_positive, prob_negative)
+    # For one-tailed test, the p-value is the smaller of the two probabilities
+    p_value = min(prob_positive, prob_negative)
 
     # Add a warning if p_value hits resolution limit
     min_possible_p = 2.0 / len(chain)
@@ -769,9 +811,31 @@ def get_mcmc_p_value(chain: np.ndarray) -> float:
 
 from matplotlib.axes import Axes
 
+def _get_ml_estimate(chain: np.ndarray, param: str) -> float:
+    """
+    Get the maximum-likelihood estimate from an MCMC posterior chain by finding the sample with the highest posterior probability.
+
+    Parameters
+    ----------
+    chain : np.ndarray
+        The MCMC posterior samples for a parameter (e.g., slope or intercept).
+    param : str
+        The name of the parameter to extract from the chain.
+
+    Returns
+    -------
+    float
+        The value of the parameter corresponding to the maximum posterior probability.
+    """
+    # In LinMix, the 'lnprob' key contains the log-posterior probabilities for each sample.
+    max_prob_index = np.argmax(chain['lnprob'])
+    ml_estimate = chain[param][max_prob_index]
+    return ml_estimate
+
 def do_linregress(x: np.ndarray, y: np.ndarray, x_err: np.ndarray, y_err: np.ndarray,
                   mcmc: bool = True, ax_in: Optional[Axes] = None,
-                  niter: int = 5000, delta: Optional[np.ndarray] = None) -> tuple[float, float, float, float, float, float, float]:
+                  niter: int = 5000, delta: Optional[np.ndarray] = None,
+                  legloc: str = 'upper left') -> tuple[float, float, float, float, float, float, float]:
     """
     Perform linear regression using either the LinMix MCMC method, which accounts for measurement errors in both x and y, 
     or a simple ODR regression if MCMC is disabled.
@@ -799,6 +863,8 @@ def do_linregress(x: np.ndarray, y: np.ndarray, x_err: np.ndarray, y_err: np.nda
     delta : np.ndarray, optional
         Optional array of 0/1 values indicating which data points are upper limits (1 for detections, 0 for upper limits)
         Should have the same length as x and y. Default is None (no upper limits).
+    legloc : str, optional
+        Legend location for the fit results, by default 'upper left'.
 
     Returns
     -------
@@ -844,14 +910,13 @@ def do_linregress(x: np.ndarray, y: np.ndarray, x_err: np.ndarray, y_err: np.nda
             )
             return None, None, None, None, None, None, None
 
-        slope = np.mean(lm.chain['beta'])
+        # Calculate slope and intercept ML estimates from posterior samples.
+        slope = np.median(lm.chain['beta'])
         sloperr = np.std(lm.chain['beta'])
-        slope_median = np.median(lm.chain['beta'])
         slope_16th = np.percentile(lm.chain['beta'], 16)
         slope_84th = np.percentile(lm.chain['beta'], 84)
-        inter = np.mean(lm.chain['alpha'])
+        inter = np.median(lm.chain['alpha'])
         intererr = np.std(lm.chain['alpha'])
-        inter_median = np.median(lm.chain['alpha'])
         inter_16th = np.percentile(lm.chain['alpha'], 16)
         inter_84th = np.percentile(lm.chain['alpha'], 84)
 
@@ -868,14 +933,14 @@ def do_linregress(x: np.ndarray, y: np.ndarray, x_err: np.ndarray, y_err: np.nda
             y_hi  = np.percentile(y_samples, 84, axis=0)
             y_med = np.median(y_samples, axis=0)
             ineq = '>' if slope > 0 else '<'
-            _fit_label = (f"slope $={slope_median:.4g}^{{+{slope_84th - slope_median:.4g}}}_{{-{slope_median - slope_16th:.4g}}}$\n"
+            _fit_label = (f"slope $={slope:.4g}^{{+{slope_84th - slope:.4g}}}_{{-{slope - slope_16th:.4g}}}$\n"
                         #   f"$\\alpha={inter_median:.2f}^{{+{inter_84th - inter_median:.2f}}}_{{-{inter_median - inter_16th:.2f}}}$\n"
                           r"$ P(\mathrm{slope}"+f" {ineq} 0)={posterior_probability:.3f}$\n"
                           f"Spearman $\\rho={rho:.3f}$")
             ax_in.plot(x_fit, y_med, color='red', lw=1.5, alpha=0.75)
             ax_in.fill_between(x_fit, y_lo, y_hi, color='red', alpha=0.25,
                                label=_fit_label)
-            ax_in.legend(framealpha=0.6, fancybox=True, loc='upper right')
+            ax_in.legend(framealpha=0.6, fancybox=True, loc=legloc)
 
         # Quick check - create a new figure just for this (won't interfere with your main plot)
         fig_hist, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
@@ -1402,8 +1467,8 @@ def _lya_quality_mask(megatab: Table, prop: str, col: np.ndarray, sig_thresh: fl
         mask &= col < 0.3
     if prop in ["BRRATIO", "FLUXB", "ASYMB", "FWHMB", "DISPB", "BRSEP"]:
         mask &= (megatab["FLUXB"] / megatab["FLUXB_ERR"] > sig_thresh)
-    if prop == "VEXP_ZELDA":
-        mask &= (megatab[prop] - 3 * megatab['VEXP_ERRM_ZELDA'] > 0)
+    # if prop == "VEXP_ZELDA":
+    #     mask &= (megatab[prop] - 3 * megatab['VEXP_ERRM_ZELDA'] > 0)
     return mask
 
 
@@ -1463,11 +1528,11 @@ def _scatter_qc(
         # scatter and the point's own uncertainty.  This avoids unfairly
         # clipping points whose apparent deviation is explained by a large
         # error bar.
-        x_thresh = np.sqrt(np.std(x_vals) ** 2 + x_errs ** 2)
-        y_thresh = np.sqrt(np.std(y_vals) ** 2 + y_errs ** 2)
+        x_thresh = np.sqrt(np.nanstd(x_vals) ** 2 + x_errs ** 2)
+        y_thresh = np.sqrt(np.nanstd(y_vals) ** 2 + y_errs ** 2)
         sc_mask = (
-            (np.abs(x_vals - np.median(x_vals)) <= sigma_clip * x_thresh) &
-            (np.abs(y_vals - np.median(y_vals)) <= sigma_clip * y_thresh)
+            (np.abs(x_vals - np.nanmedian(x_vals)) <= sigma_clip * x_thresh) &
+            (np.abs(y_vals - np.nanmedian(y_vals)) <= sigma_clip * y_thresh)
         )
         if np.sum(sc_mask) < min_points:
             print(f"Warning: Sigma clipping ({sigma_clip}\u03c3) leaves fewer than "
@@ -1484,8 +1549,8 @@ def _scatter_qc(
 
     # --- Mean-distance outlier rejection ---
     if nn_clip is not None and len(x_vals) >= 2:
-        std_x = np.std(x_vals)
-        std_y = np.std(y_vals)
+        std_x = np.nanstd(x_vals)
+        std_y = np.nanstd(y_vals)
         if std_x < 1e-10 or std_y < 1e-10:
             print(f"Warning: Near-zero axis scatter prevents mean-distance clipping "
                   f"for {pair_label}. Skipping.")
@@ -1495,13 +1560,13 @@ def _scatter_qc(
             coords = np.column_stack([xn, yn])
             # Pairwise distances; exclude self via the diagonal
             diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-            sq_dist = np.sum(diff ** 2, axis=-1)
+            sq_dist = np.nansum(diff ** 2, axis=-1)
             np.fill_diagonal(sq_dist, 0.0)
-            mean_dist = np.sum(np.sqrt(sq_dist), axis=1) / (len(x_vals) - 1)
-            med_md = np.median(mean_dist)
-            mad_md = np.median(np.abs(mean_dist - med_md))
+            mean_dist = np.nansum(np.sqrt(sq_dist), axis=1) / (len(x_vals) - 1)
+            med_md = np.nanmedian(mean_dist)
+            mad_md = np.nanmedian(np.abs(mean_dist - med_md))
             if mad_md < 1e-10:
-                mad_md = np.std(mean_dist) if np.std(mean_dist) > 1e-10 else 1.0
+                mad_md = np.nanstd(mean_dist) if np.nanstd(mean_dist) > 1e-10 else 1.0
             nn_mask = mean_dist <= med_md + nn_clip * mad_md
             if np.sum(nn_mask) < min_points:
                 print(f"Warning: Mean-distance clipping ({nn_clip}\u03c3) leaves fewer than "
@@ -1540,6 +1605,8 @@ def _correlate_pair(
     save_fig: bool = False,
     fig_path: Optional[str] = None,
     plot_all: bool = False,
+    colorbar: bool = True,
+    legloc: str = 'upper left',
     **scatter_kwargs,
 ) -> Optional[dict]:
     """
@@ -1607,6 +1674,10 @@ def _correlate_pair(
     plot_all : bool, optional
         Whether to plot regardless of whether the pair passes the significance threshold. 
         Default is False (only plot significant pairs).
+    colorbar : bool, optional
+        Whether to display the colorbar on the scatter plot, by default True.
+    legloc : str, optional
+        Legend location for the fit results, by default 'upper left'.
     **scatter_kwargs
         Forwarded to :func:`make_scatter`.
 
@@ -1635,10 +1706,18 @@ def _correlate_pair(
         y_vals = np.log10(y_orig)
         y_errs = y_errs / (y_orig * np.log(10))
 
+    # Debugging: report number of valid points after log transform and before clipping
+    n_valid = np.sum(np.isfinite(x_vals) & np.isfinite(y_vals))
+    print(f"Number of valid points for {pair_label} after log transform: {n_valid}")
+
     # --- Clip extreme errors ---
     if clip_extreme_errors is not None:
-        err_mask = ((x_errs < clip_extreme_errors * np.std(x_vals)) &
-                    (y_errs < clip_extreme_errors * np.std(y_vals)))
+        x_std = np.nanstd(x_vals)
+        y_std = np.nanstd(y_vals)
+        print(f"Clipping points with errors exceeding {clip_extreme_errors}σ of the data scatter "
+              f"for {pair_label}: x_std={x_std:.3e}, y_std={y_std:.3e}")
+        err_mask = ((x_errs < clip_extreme_errors * x_std) &
+                    (y_errs < clip_extreme_errors * y_std))
         x_vals, x_errs = x_vals[err_mask], x_errs[err_mask]
         y_vals, y_errs = y_vals[err_mask], y_errs[err_mask]
         c_col = c_col[err_mask] if c_col is not None else None
@@ -1669,13 +1748,19 @@ def _correlate_pair(
         ax = ax_in
     _scatter_kw: dict = {}
     if c_col is not None:
-        _scatter_kw['show_colorbar'] = True
+        _scatter_kw['show_colorbar'] = colorbar
         if c_label is not None:
             _scatter_kw['clabel'] = c_label
     _scatter_kw.update(scatter_kwargs)
     upper_bounds = (delta == 0) if delta is not None else None
     make_scatter([x_vals, x_errs], [y_vals, y_errs], ax=ax, c=c_col,
                  upper_bounds=upper_bounds, **_scatter_kw)
+
+    # Apply axis labels/title before significance gating so plots are still
+    # correctly annotated even when the fit is skipped.
+    ax.set_xlabel(f"{'log ' if plot_log_x else ''}{x_label}")
+    ax.set_ylabel(f"{'log ' if plot_log_y else ''}{y_label}")
+    ax.set_title(title)
 
     n_pts = len(x_vals)
     if n_pts < min_points:
@@ -1708,15 +1793,12 @@ def _correlate_pair(
 
     # --- MCMC / ODR fit ---
     slope, intercept, slope_err, intercept_err, p_value, rho, rho_p = do_linregress(
-        x_vals, y_vals, x_errs, y_errs, mcmc=mcmc, ax_in=ax, niter=niter, delta=delta
+        x_vals, y_vals, x_errs, y_errs, mcmc=mcmc, ax_in=ax, niter=niter, delta=delta,
+        legloc=legloc
     )
     print(f"Correlation for {pair_label}: slope={slope:.2f}±{slope_err:.2f}, "
           f"intercept={intercept:.2f}±{intercept_err:.2f}, p={p_value:.3e}, "
           f"Spearman ρ={rho:.3f} (p={rho_p:.3e})")
-
-    ax.set_xlabel(f"{'log ' if plot_log_x else ''}{x_label}")
-    ax.set_ylabel(f"{'log ' if plot_log_y else ''}{y_label}")
-    ax.set_title(title)
 
     if save_fig and fig_path and ax_in is None:
         fig.savefig(fig_path, dpi=300, bbox_inches='tight')
@@ -1855,7 +1937,9 @@ def check_line_correlations(
         nn_clip: Optional[float] = None,
         combine_doublets: bool = True, 
         niter: int = 5000,
-        plot_all: bool = False, 
+        plot_all: bool = False,
+        colorbar: bool = True,
+        legloc: str = 'upper left',
         **scatter_kwargs
         ) -> dict:
     """
@@ -1912,6 +1996,10 @@ def check_line_correlations(
     plot_all : bool, optional
         Whether to plot all pairs regardless of significance, or only those that pass the
         threshold. Default is False (only plot significant pairs).
+    colorbar : bool, optional
+        Whether to display the colorbar on the scatter plot, by default True.
+    legloc : str, optional
+        Legend location for the fit results, by default 'upper left'.
     **scatter_kwargs
         Additional keyword arguments forwarded to :func:`make_scatter` (e.g. ``cnorm='log'``,
         ``cmap``, ``vmin``, ``vmax``, ``show_colorbar``, ``clabel``).
@@ -1921,6 +2009,10 @@ def check_line_correlations(
     dict
         A dictionary containing the correlation summaries for each line and Lyman alpha property.
     """
+    if (line_property in ("LUM", "CONT_LUM") or any(lp in ("LUM_LYA", "CONT_LUM_LYA") for lp in lya_properties)) \
+            and 'MU_ERR' not in megatab.colnames:
+        print("Warning: MU_ERR column not found. Luminosity uncertainties will not include magnification uncertainty.")
+
     summaries = {}
     for line in lines:
         summaries[line] = {}
@@ -1950,7 +2042,7 @@ def check_line_correlations(
                                             abs_lines, delta=delta,
                                             sig_thresh=point_sig_thresh,
                                             combine_doublets=combine_doublets)
-
+        
             result = _correlate_pair(
                 lya_col[mask], lya_col_err[mask],
                 line_col[mask], line_err_arr[mask],
@@ -1976,6 +2068,8 @@ def check_line_correlations(
                 save_fig=save_fig,
                 fig_path=f"plots/{line}_{line_property}_vs_{lya_prop}.png",
                 plot_all=plot_all,
+                colorbar=colorbar,
+                legloc=legloc,
                 **scatter_kwargs,
             )
             if result is not None:
@@ -1999,6 +2093,8 @@ def check_lya_correlations(
         niter: int = 5000, 
         plot_all: bool = False, 
         ax_in: Optional[matplotlib.axes.Axes] = None,
+        colorbar: bool = True,
+        legloc: str = 'upper left',
         **scatter_kwargs
     ) -> dict:
     """
@@ -2049,6 +2145,10 @@ def check_lya_correlations(
         threshold. Default is False (only plot significant pairs).
     ax_in : matplotlib.axes.Axes, optional
         An existing Axes object to plot on. If None, a new figure and axes will be created. Default is None.
+    colorbar : bool, optional
+        Whether to display the colorbar on the scatter plot, by default True.
+    legloc : str, optional
+        Legend location for the fit results, by default 'upper left'.
     **scatter_kwargs
         Additional keyword arguments forwarded to :func:`make_scatter` (e.g. ``cnorm='log'``,
         ``cmap``, ``vmin``, ``vmax``, ``show_colorbar``, ``clabel``).
@@ -2059,6 +2159,10 @@ def check_lya_correlations(
         A nested dictionary ``summaries[lya_prop_y][lya_prop_x]`` containing the correlation
         summaries (slope, intercept, errors, p-value, n_points) for each pair.
     """
+    if any(p in ("LUM_LYA", "CONT_LUM_LYA") for p in (lya_properties_x + lya_properties_y)) \
+            and 'MU_ERR' not in megatab.colnames:
+        print("Warning: MU_ERR column not found. Luminosity uncertainties will not include magnification uncertainty.")
+
     summaries = {}
     seen_pairs = set()
     for prop_y in lya_properties_y:
@@ -2105,6 +2209,8 @@ def check_lya_correlations(
                 fig_path=f"plots/{prop_y}_vs_{prop_x}.png",
                 plot_all=plot_all,
                 ax_in=ax_in,
+                colorbar=colorbar,
+                legloc=legloc,
                 **scatter_kwargs,
             )
             if result is not None:
@@ -2131,6 +2237,8 @@ def check_line_line_correlations(
         plot_all: bool = False,
         fit_upper_limits: bool = False,
         ax_in: Optional[matplotlib.axes.Axes] = None,
+        colorbar: bool = True,
+        legloc: str = 'upper left',
         **scatter_kwargs,
 ) -> dict:
     """
@@ -2193,6 +2301,10 @@ def check_line_line_correlations(
         Default False.
     ax_in : matplotlib.axes.Axes, optional
         An existing Axes object to plot on. If None, a new figure and axes will be created. Default is None.
+    colorbar : bool, optional
+        Whether to display the colorbar on the scatter plot, by default True.
+    legloc : str, optional
+        Legend location for the fit results, by default 'upper left'.
     **scatter_kwargs
         Forwarded to :func:`make_scatter`.
 
@@ -2203,6 +2315,10 @@ def check_line_line_correlations(
         errors, p-value, and n_points for each pair that passed the
         pre-screen.
     """
+    if (property_x in ("LUM", "CONT_LUM") or property_y in ("LUM", "CONT_LUM")) \
+            and 'MU_ERR' not in megatab.colnames:
+        print("Warning: MU_ERR column not found. Luminosity uncertainties will not include magnification uncertainty.")
+
     summaries = {}
     for line_y in lines_y:
         summaries[line_y] = {}
@@ -2276,8 +2392,291 @@ def check_line_line_correlations(
                 fig_path=f"plots/{line_y}_{property_y}_vs_{line_x}_{property_x}.png",
                 plot_all=plot_all,
                 ax_in=ax_in,
+                colorbar=colorbar,
+                legloc=legloc,
                 **scatter_kwargs,
             )
             if result is not None:
                 summaries[line_y][line_x] = result
+    return summaries
+
+
+def check_spectral_phot_correlations(
+        spectral_properties: list[str],
+        phot_property: str,
+        filters: list[str],
+        megatab: Table,
+        spectral_kind: str = 'line',
+        lines: Optional[list[str]] = None,
+        abs_lines: Optional[list[str]] = None,
+        mag_type: str = 'AUTO',
+        min_points: int = 10,
+        significance_thresh: float = 0.01,
+        mcmc: bool = True,
+        logify: bool = False,
+        save_fig: bool = False,
+        point_sig_thresh: float = 3.0,
+        fit_upper_limits: bool = False,
+        c: Optional[str] = 'z',
+        clip_extreme_errors: Optional[float] = None,
+        sigma_clip: Optional[float] = None,
+        nn_clip: Optional[float] = None,
+        combine_doublets: bool = True,
+        niter: int = 5000,
+        plot_all: bool = False,
+        ax_in: Optional[matplotlib.axes.Axes] = None,
+        colorbar: bool = True,
+        legloc: str = 'upper left',
+        **scatter_kwargs,
+) -> dict:
+    """
+    Check for correlations between spectral properties (line or LyA) and a
+    photometric property for one or more filters.
+
+    Parameters
+    ----------
+    spectral_properties : list[str]
+        Spectral properties to test on the y-axis.
+        For ``spectral_kind='line'``, examples include ``'EW'``, ``'FWHM'``,
+        ``'LUM'``. For ``spectral_kind='lya'``, examples include ``'EW_LYA'``,
+        ``'DISPR'``, ``'BRRATIO'``, ``'LUM_LYA'``.
+    phot_property : str
+        Photometric property to use on the x-axis. Supported by
+        :func:`get_phot_property`: ``'MAG'``, ``'FLUX'``, ``'LUM'``.
+    filters : list[str]
+        Photometric filters to evaluate (e.g. ``['HST_F606W', 'HST_F814W']``).
+    megatab : astropy.table.Table
+        Source table.
+    spectral_kind : str, optional
+        Which spectral family to use: ``'line'`` or ``'lya'``. Default ``'line'``.
+    lines : list[str], optional
+        Required when ``spectral_kind='line'``. List of lines to test.
+    abs_lines : list[str], optional
+        Lines treated as absorption (SNR sign-flipped) for line mode.
+        Default ``[]``.
+    mag_type : str, optional
+        Magnitude flavour passed to :func:`get_phot_property`.
+        Default ``'AUTO'``.
+    min_points : int, optional
+        Minimum number of points required to attempt fitting, by default 10.
+    significance_thresh : float, optional
+        OLS pre-screen p-value threshold, by default 0.01.
+    mcmc : bool, optional
+        Use LinMix MCMC; falls back to ODR if False, by default True.
+    logify : bool, optional
+        Log-transform axes whose property appears in ``_log_quantities``,
+        by default False.
+    save_fig : bool, optional
+        Save each figure, by default False.
+    point_sig_thresh : float, optional
+        Source-level significance threshold used for quality cuts, by default 3.0.
+    fit_upper_limits : bool, optional
+        Include upper limits for non-detections for line mode via
+        :func:`_insert_upper_limits`. Ignored for ``spectral_kind='lya'``.
+        Default False.
+    c : str, optional
+        Column name for point colouring. Default ``'z'``; pass ``None`` to disable.
+    clip_extreme_errors : float, optional
+        Clip points whose error exceeds this multiple of sample scatter.
+        Default None.
+    sigma_clip : float, optional
+        Sigma-clipping threshold for outlier rejection. Default None.
+    nn_clip : float, optional
+        Mean-distance clipping threshold in normalised x-y space. Default None.
+    combine_doublets : bool, optional
+        Combine doublet components for additive line properties. Default True.
+    niter : int, optional
+        Minimum MCMC iterations per chain. Default 5000.
+    plot_all : bool, optional
+        Plot all attempted pairs (including non-significant). Default False.
+    ax_in : matplotlib.axes.Axes, optional
+        Existing axes to draw on. If None, create new axes.
+    colorbar : bool, optional
+        Show colorbar when ``c`` is provided. Default True.
+    legloc : str, optional
+        Legend location. Default ``'upper left'``.
+    **scatter_kwargs
+        Forwarded to :func:`make_scatter`.
+
+    Returns
+    -------
+    dict
+        Nested summary dictionary.
+
+        - For ``spectral_kind='line'``:
+          ``summaries[line][spectral_property][filter] -> fit summary``
+        - For ``spectral_kind='lya'``:
+          ``summaries[spectral_property][filter] -> fit summary``
+    """
+    _needs_lum_muerr = (phot_property == 'LUM' or any(p in ('LUM', 'CONT_LUM', 'LUM_LYA', 'CONT_LUM_LYA')
+                                                         for p in spectral_properties))
+    if _needs_lum_muerr and 'MU_ERR' not in megatab.colnames:
+        print("Warning: MU_ERR column not found. Luminosity uncertainties will not include magnification uncertainty.")
+
+    if abs_lines is None:
+        abs_lines = []
+
+    if spectral_kind not in ('line', 'lya'):
+        raise ValueError("spectral_kind must be either 'line' or 'lya'.")
+
+    if spectral_kind == 'line' and not lines:
+        raise ValueError("For spectral_kind='line', you must provide a non-empty `lines` list.")
+    line_list = lines if lines is not None else []
+
+    if fit_upper_limits and spectral_kind == 'lya':
+        print("Warning: fit_upper_limits is only supported for spectral_kind='line'. Ignoring it for Lya mode.")
+
+    phot_prop_for_log = 'LUM' if phot_property == 'LUM' else phot_property
+
+    def _phot_label(filter_name: str) -> str:
+        base = plot.get_plot_name(phot_property)
+        if base == phot_property:
+            if phot_property == 'MAG':
+                base = f"{mag_type} magnitude"
+            elif phot_property == 'FLUX':
+                base = "Flux"
+            elif phot_property == 'LUM':
+                base = "Luminosity"
+        return f"{filter_name} {base}"
+
+    summaries: dict = {}
+
+    if spectral_kind == 'line':
+        for line in line_list:
+            summaries[line] = {}
+            for spectral_prop in spectral_properties:
+                spectral_prop = normalise_prop(spectral_prop)
+                summaries[line][spectral_prop] = {}
+
+                y_raw, y_err_raw = get_line_property(
+                    megatab, line, spectral_prop,
+                    abs=line in abs_lines,
+                    combine_doublets=combine_doublets,
+                )
+                y = np.asarray(y_raw, dtype=float)
+                y_err = np.zeros_like(y) if y_err_raw is None else np.asarray(y_err_raw, dtype=float)
+
+                delta_full = None
+                if fit_upper_limits:
+                    y, delta_full = _insert_upper_limits(
+                        megatab, line, y_raw, y_err,
+                        abs_lines,
+                        line_prop=spectral_prop,
+                        sig_thresh=point_sig_thresh,
+                        combine_doublets=combine_doublets,
+                    )
+                    base_mask = _prepare_scatter_mask(
+                        megatab, line, y, spectral_prop,
+                        y, '',
+                        abs_lines,
+                        delta=delta_full,
+                        sig_thresh=point_sig_thresh,
+                        combine_doublets=combine_doublets,
+                    )
+                else:
+                    base_mask = _prepare_scatter_mask(
+                        megatab, line, y, spectral_prop,
+                        y, '',
+                        abs_lines,
+                        include_upper_limits=False,
+                        sig_thresh=point_sig_thresh,
+                        combine_doublets=combine_doublets,
+                    )
+
+                for filter_name in filters:
+                    x_raw, x_err_raw = get_phot_property(
+                        megatab, filter_name, phot_property, mag_type=mag_type,
+                    )
+                    x = np.asarray(x_raw, dtype=float)
+                    x_err = np.zeros_like(x) if x_err_raw is None else np.asarray(x_err_raw, dtype=float)
+
+                    mask = (base_mask
+                            & np.isfinite(x) & np.isfinite(y)
+                            & np.isfinite(x_err) & np.isfinite(y_err))
+
+                    result = _correlate_pair(
+                        x[mask], x_err[mask],
+                        y[mask], y_err[mask],
+                        x_prop=phot_prop_for_log,
+                        y_prop=spectral_prop,
+                        x_label=_phot_label(filter_name),
+                        y_label=f"{str(plot.get_plot_name(line))} {str(plot.get_plot_name(spectral_prop))}",
+                        title=(f"{plot.get_plot_name(line, unit=False)} "
+                               f"{plot.get_plot_name(spectral_prop, unit=False)} "
+                               f"vs {_phot_label(filter_name)}"),
+                        pair_label=f"{line} {spectral_prop} vs {phot_property}_{filter_name}",
+                        c_col=megatab[c][mask] if c is not None else None,
+                        c_label=plot.get_plot_name(c) if c is not None else None,
+                        delta=delta_full[mask] if delta_full is not None else None,
+                        logify=logify,
+                        min_points=min_points,
+                        significance_thresh=significance_thresh,
+                        clip_extreme_errors=clip_extreme_errors,
+                        sigma_clip=sigma_clip,
+                        nn_clip=nn_clip,
+                        mcmc=mcmc,
+                        niter=niter,
+                        save_fig=save_fig,
+                        fig_path=(f"plots/{line}_{spectral_prop}_vs_"
+                                  f"{phot_property}_{filter_name}_{mag_type}.png"),
+                        plot_all=plot_all,
+                        ax_in=ax_in,
+                        colorbar=colorbar,
+                        legloc=legloc,
+                        **scatter_kwargs,
+                    )
+                    if result is not None:
+                        summaries[line][spectral_prop][filter_name] = result
+    else:
+        for spectral_prop in spectral_properties:
+            spectral_prop = normalise_prop(spectral_prop)
+            summaries[spectral_prop] = {}
+
+            y_raw, y_err_raw = get_lya_property(megatab, spectral_prop)
+            y = np.asarray(y_raw, dtype=float)
+            y_err = np.zeros_like(y) if y_err_raw is None else np.asarray(y_err_raw, dtype=float)
+            lya_mask = (_lya_quality_mask(megatab, spectral_prop, y, point_sig_thresh)
+                        & np.isfinite(y) & np.isfinite(y_err))
+
+            for filter_name in filters:
+                x_raw, x_err_raw = get_phot_property(
+                    megatab, filter_name, phot_property, mag_type=mag_type,
+                )
+                x = np.asarray(x_raw, dtype=float)
+                x_err = np.zeros_like(x) if x_err_raw is None else np.asarray(x_err_raw, dtype=float)
+
+                mask = lya_mask & np.isfinite(x) & np.isfinite(x_err)
+
+                result = _correlate_pair(
+                    x[mask], x_err[mask],
+                    y[mask], y_err[mask],
+                    x_prop=phot_prop_for_log,
+                    y_prop=spectral_prop,
+                    x_label=_phot_label(filter_name),
+                    y_label=str(plot.get_plot_name(spectral_prop)),
+                    title=(f"{plot.get_plot_name(spectral_prop, unit=False)} "
+                           f"vs {_phot_label(filter_name)}"),
+                    pair_label=f"{spectral_prop} vs {phot_property}_{filter_name}",
+                    c_col=megatab[c][mask] if c is not None else None,
+                    c_label=plot.get_plot_name(c) if c is not None else None,
+                    logify=logify,
+                    min_points=min_points,
+                    significance_thresh=significance_thresh,
+                    clip_extreme_errors=clip_extreme_errors,
+                    sigma_clip=sigma_clip,
+                    nn_clip=nn_clip,
+                    mcmc=mcmc,
+                    niter=niter,
+                    save_fig=save_fig,
+                    fig_path=(f"plots/{spectral_prop}_vs_"
+                              f"{phot_property}_{filter_name}_{mag_type}.png"),
+                    plot_all=plot_all,
+                    ax_in=ax_in,
+                    colorbar=colorbar,
+                    legloc=legloc,
+                    **scatter_kwargs,
+                )
+                if result is not None:
+                    summaries[spectral_prop][filter_name] = result
+
     return summaries
