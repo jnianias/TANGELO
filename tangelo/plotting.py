@@ -159,9 +159,9 @@ def plot_muse_spectrum(wave, spec, spec_err=None, ax=None, label=None, color='sl
     step : str, optional
         Step style for plotting the spectrum (default is 'mid').
     y_label : str, optional
-        Label for the y-axis (default is r'f$_{\lambda}$ $[10^{-20}$ erg s$^{-1}$ cm$^{-2}$ \AA$^{-1}]$').
+        Label for the y-axis (default is r'f$_{\\lambda}$ $[10^{-20}$ erg s$^{-1}$ cm$^{-2}$ \\AA$^{-1}]$').
     x_label : str, optional
-        Label for the x-axis (default is r'$\lambda$ [\AA]').
+        Label for the x-axis (default is r'$\\lambda$ [\\AA]').
     
     Returns
     -------

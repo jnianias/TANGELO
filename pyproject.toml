@@ -20,6 +20,7 @@ dependencies = [
     "linmix",
     "tqdm",
     "python-dotenv",
+    "scikit-learn>=1.6.1",
 ]
 
 [project.optional-dependencies]
