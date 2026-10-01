@@ -4,8 +4,7 @@ This document describes the environment variables used by TANGELO for configurin
 
 ## Quick Start
 
-TANGELO needs to know where to look for the data that is to be used, namely MUSE data cubes, catalogues,
-sourc spectra etc. The quickest way to get started is to set the MUSE_DATA_DIR environment variable
+TANGELO needs to know where to look for the data that is to be used, namely MUSE data cubes, catalogues, source spectra etc. The quickest way to get started is to set the MUSE_DATA_DIR environment variable
 
 ```bash
 export MUSE_DATA_DIR="/path/to/your/data"

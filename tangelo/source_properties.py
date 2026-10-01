@@ -8,7 +8,7 @@ from astropy.table import Table
 from astropy.cosmology import Planck18
 import astropy.units as u
 
-from .spectroscopy import muse_lsf_fwhm_poly
+from .spectroscopy import muse_lsf_fwhm_poly, vel2wave
 from .constants import wavedict, doublets
 
 
